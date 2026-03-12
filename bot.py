@@ -23,6 +23,7 @@ MEMORY_FILE = "core_memories.json"
 MAX_HISTORY_LENGTH = 50 
 highest_token_count = 0
 global_lock = asyncio.Lock()
+memory_lock = asyncio.Lock()
 
 def load_json(filepath, default_val):
     if os.path.exists(filepath):
@@ -39,18 +40,19 @@ global_data = load_json(GLOBAL_DATA_FILE, {"history": [], "prompt": ""})
 
 async def send_help_menu(message, bot_name):
     help_text = (
-        "Here is how you can interact with me:\n\n"
-        f"• **`@{bot_name} [your message]`** - Tag me to ask a question, say hello, or attach an image!\n"
-        f"• **`@{bot_name} role [prompt]`** - Give me a custom personality. Note: This changes my behavior globally for everyone, but keeps the ongoing conversation history intact.\n"
-        f"• **`@{bot_name} role clear`** - Remove the custom personality and reset me to my default behavior. Conversation history is kept intact.\n"
-        f"• **`@{bot_name} clear`** - Wipe the current global conversation history (up to 50 messages) to start a completely fresh topic.\n"
-        f"• **`@{bot_name} memory`** - View the permanent facts I have learned about everyone! This displays a user-by-user breakdown of long-term memories (like names, preferences, and ongoing projects) that I secretly track and save for each individual person in the server.\n"
-        f"• **`@{bot_name} status`** - Show the bot's latency, currently loaded AI model, peak token usage, and how full the current history is.\n"
-        f"• **`@{bot_name} help`** - Show this list of commands.\n"
+        "**Here is how you can interact with me:**\n\n"
+        f"• **`@{bot_name} [message]`** - Tag me to ask a question, chat, or analyze an attached image/sticker!\n"
+        f"• **`@{bot_name} role`** - Show my currently active global personality.\n"
+        f"• **`@{bot_name} role [prompt]`** - Give me a custom personality. *(Wipes current history for a fresh start, but saves core memories first!)*\n"
+        f"• **`@{bot_name} role clear`** - Reset me to my default neutral behavior.\n"
+        f"• **`@{bot_name} clear`** - Wipe the global conversation history to start a fresh topic. *(Don't worry, core memories are saved before clearing!)*\n"
+        f"• **`@{bot_name} memory`** - View the permanent facts I have learned about everyone in the server.\n"
+        f"• **`@{bot_name} status`** - Show my latency, loaded AI model, history capacity, and token usage.\n"
+        f"• **`@{bot_name} help`** - Show this menu.\n\n"
         "**Good to know:**\n"
-        "• **Memory:** I remember our recent chat context of last 50 messages and continuously summarize older messages to build a permanent core memory of our interactions!\n"
-        "• **Replies:** You can **reply** to any message (text or image) and tag me to summarize it, roast it, or explain it!\n"
-        "• **Web Search:** If you ask me about current events, news, or anything I might not know, I'll automatically perform a web search to find the latest information for you!\n"
+        "> **Long-term Memory:** I remember the last 50 interactions in the channel. When history is cleared or naturally cycles out, I secretly extract and save permanent facts about you!\n"
+        "> **Contextual Replies:** You can **reply** to an old message or image and tag me to roast it, explain it, or continue that specific thought.\n"
+        "> **Live Web Search:** If you ask about current events or facts I don't know, I will autonomously search the web to find the answer!"
     )
     await message.reply(help_text)
 
@@ -117,16 +119,30 @@ async def update_user_memory(user_id, user_name, forgotten_messages):
         new_memory = response.choices[0].message.content.strip()
         
         if new_memory != existing_memory and new_memory:
-            user_data["facts"] = new_memory
-            user_data["name"] = user_name 
-            current_memories[str(user_id)] = user_data
-            save_json(MEMORY_FILE, current_memories)
+            # Grab the lock before reading/writing to prevent background collisions
+            async with memory_lock:
+                # Re-read the file just in case another task updated it while the LLM was thinking
+                current_memories = load_json(MEMORY_FILE, {})
+                user_data = current_memories.get(str(user_id), {"name": user_name, "facts": "No core memories yet."})
+                
+                user_data["facts"] = new_memory
+                user_data["name"] = user_name 
+                current_memories[str(user_id)] = user_data
+                save_json(MEMORY_FILE, current_memories)
+                
             print(f"[Memory] Core memory updated for {user_name}.")
         else:
             print(f"[Memory] Scanned old messages, no new permanent facts found for {user_name}.")
             
     except Exception as e:
         print(f"Failed to update core memory for {user_name}: {e}")
+
+async def process_memories_sequentially(users_dict, forgotten_messages):
+    """A background manager that feeds memory updates to LM Studio one at a time."""
+    for uid, uname in users_dict.items():
+        await update_user_memory(uid, uname, forgotten_messages)
+        # Give the GPU a 1-second breather between generations
+        await asyncio.sleep(1)
 
 tools_schema = [
     {
@@ -164,34 +180,64 @@ async def on_message(message):
     clean_message = message.content.replace(bot_mention, '').strip()
     user_name = f"{message.author.display_name}_{str(message.author.id)[-4:]}"
 
+    # NEW: Check current role
+    if clean_message.lower() == 'role':
+        current_role = global_data.get("prompt")
+        if current_role:
+            await message.reply(f"**Current Global Personality:**\n> *{current_role}*")
+        else:
+            await message.reply("**Current Global Personality:**\n> *(Default) You are a neutral, conversational AI.*")
+        return
+
+    # UPDATED: Change or clear role and wipe history (With Memory Saving!)
     if clean_message.lower().startswith('role '):
         new_prompt = clean_message[5:].strip() 
         
         if new_prompt.lower() == 'clear':
-            # Add lock here
             async with global_lock:
+                # 1. Save memories for EVERYONE in the chat before clearing
+                history_to_save = global_data.get("history", [])
+                if history_to_save:
+                    users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+                    asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
+
+                # 2. Wipe history and remove prompt
                 global_data["prompt"] = ""
+                global_data["history"] = [] 
                 save_json(GLOBAL_DATA_FILE, global_data)
-            await message.reply("✅ Global personality removed! The ongoing conversation history was kept intact.")
+            await message.reply("✅ Global personality removed and conversation history cleared! *(Recent memories were saved)*")
             return
 
         if not new_prompt:
             await message.reply(f"Please provide a prompt! Example: `@{client.user.name} role You are a pirate.`")
             return
             
-        # Add lock here
         async with global_lock:
+            # 1. Save memories for EVERYONE in the chat before clearing
+            history_to_save = global_data.get("history", [])
+            if history_to_save:
+                users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+                asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
+
+            # 2. Wipe history and set new prompt
             global_data["prompt"] = new_prompt
+            global_data["history"] = [] 
             save_json(GLOBAL_DATA_FILE, global_data)
-        await message.reply(f"✅ Saved global personality (ongoing conversation history was kept intact):\n> *{new_prompt}*")
+        await message.reply(f"✅ Saved global personality and cleared conversation history for a fresh start! *(Recent memories were saved)*\n> *{new_prompt}*")
         return
 
     if clean_message.lower() == 'clear':
-        # Add lock here
         async with global_lock:
+            # 1. Save memories for EVERYONE in the chat before clearing
+            history_to_save = global_data.get("history", [])
+            if history_to_save:
+                users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+                asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
+
+            # 2. Wipe history
             global_data["history"] = []
             save_json(GLOBAL_DATA_FILE, global_data)
-        await message.reply("🗑️ Global conversation history cleared!")
+        await message.reply("🗑️ Global conversation history cleared! *(Recent memories were saved)*")
         return
     
     if clean_message.lower() == 'help':
@@ -204,7 +250,7 @@ async def on_message(message):
         try:
             models_response = await lm_client.models.list()
             current_model = models_response.data[0].id if models_response.data else "None (No model loaded in LM Studio)"
-        except Exception as e:
+        except Exception:
             current_model = f"Offline / Unreachable"
             
         diagnostics = (
@@ -236,30 +282,42 @@ async def on_message(message):
             await message.reply(memory_text[:1990])
         return
 
+    # Extract images and valid stickers from the message
     image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+    valid_stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
     
     if message.reference and message.reference.message_id:
         try:
             replied_msg = await message.channel.fetch_message(message.reference.message_id)
             if replied_msg.content:
-                reply_context = f"\n\n[Context: {user_name} is replying to the following message by {replied_msg.author.display_name}: \"{replied_msg.content}\"]"
+                replied_user_name = f"{replied_msg.author.display_name}_{str(replied_msg.author.id)[-4:]}"
+                reply_context = f"\n\n[Context: {user_name} is replying to the following message by {replied_user_name}: \"{replied_msg.content}\"]"
                 clean_message += reply_context
                 if replied_msg.author == client.user:
                     clean_message += "\n[System Directive: If you need more specific facts to answer this follow-up, you MUST output a web_search tool call. Do not guess.]"
+            
+            # Extract images and stickers from the replied message
             replied_images = [att for att in replied_msg.attachments if att.content_type and att.content_type.startswith('image/')]
             image_attachments.extend(replied_images)
+            
+            replied_stickers = [s for s in replied_msg.stickers if s.format != discord.StickerFormatType.lottie]
+            valid_stickers.extend(replied_stickers)
+            
         except Exception as e:
             print(f"⚠️ Could not fetch the replied message: {e}")
 
-    if not clean_message.strip() and not image_attachments:
+    # Ensure bot ignores empty tags without attachments or stickers
+    if not clean_message.strip() and not image_attachments and not valid_stickers:
         await send_help_menu(message, client.user.name)
         return
 
     api_user_content = []
     text_part = f"{user_name}: {clean_message}" if clean_message else f"{user_name}: What is in this image?"
     
-    if image_attachments:
+    if image_attachments or valid_stickers:
         api_user_content.append({"type": "text", "text": text_part})
+        
+        # Process regular image attachments
         for img in image_attachments:
             img_bytes = await img.read()
             img_b64 = base64.b64encode(img_bytes).decode('utf-8')
@@ -267,21 +325,30 @@ async def on_message(message):
                 "type": "image_url",
                 "image_url": {"url": f"data:{img.content_type};base64,{img_b64}"}
             })
+            
+        # Process valid image stickers
+        for sticker in valid_stickers:
+            sticker_bytes = await sticker.read()
+            sticker_b64 = base64.b64encode(sticker_bytes).decode('utf-8')
+            mime_type = f"image/{sticker.format.name}" 
+            api_user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{sticker_b64}"}
+            })
     else:
         api_user_content = text_part
 
-    base_personality = global_data.get("prompt") or "You are a neutral, conversational AI."
-        
+    # 1. Start with the Date and Hardcoded Rules
     current_system_prompt = (
-        f"Today's date is {datetime.now().strftime('%B %d, %Y')}. {base_personality}\n"
+        f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\n"
         "CRITICAL INSTRUCTIONS:\n"
-        "1. EXTREME BREVITY: You must keep your responses short, concise, and straight to the point. Answer in 1-3 sentences unless the user explicitly asks for a detailed explanation, an essay, or a script.\n"
+        "1. EXTREME BREVITY: You must keep your responses short, concise, and straight to the point. Answer in 1-5 sentences unless the user explicitly asks for a detailed explanation, an essay, or a script.\n"
         "2. MULTI-USER CHAT: You are in a group chat with multiple users. Usernames are prepended to their messages. Address users by their names when appropriate.\n"
         "3. SEARCH DIRECTIVE: If asked about current events, real-time info, OR if the user asks a follow-up question related to it, you MUST use the web_search tool. NEVER guess. \n"
         "4. STRICT RULE: Do not use emojis unless your personality requires it."
     )
     
-    # Inject all known user memories into the system prompt
+    # 2. Inject all known user memories in the middle
     current_memories = load_json(MEMORY_FILE, {})
     user_context_str = ""
     for uid, m_data in current_memories.items():
@@ -290,12 +357,17 @@ async def on_message(message):
              
     if user_context_str:
          current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT CHANNEL USERS:\n{user_context_str}"
+
+    # 3. CRITICAL: Place the personality at the absolute end so the LLM prioritizes it!
+    base_personality = global_data.get("prompt") or "You are a neutral, conversational AI."
+    current_system_prompt += f"\n\nYOUR ASSIGNED PERSONA AND ROLE (CRITICAL: YOU MUST ADOPT THIS TONE, STYLE, AND BEHAVIOR FOR ALL RESPONSES):\n{base_personality}"
         
     system_message = {"role": "system", "content": current_system_prompt}
 
     history_text_save = text_part
-    if image_attachments:
-        history_text_save += f" [User attached {len(image_attachments)} image(s)]"
+    total_visuals = len(image_attachments) + len(valid_stickers)
+    if total_visuals > 0:
+        history_text_save += f" [User attached {total_visuals} visual(s)]"
 
     # Grab the lock to safely update the shared global history
     async with global_lock:
@@ -376,9 +448,9 @@ async def on_message(message):
                 if second_response.usage and second_response.usage.total_tokens > highest_token_count:
                     highest_token_count = second_response.usage.total_tokens
                     
-                final_reply = second_response.choices[0].message.content
+                final_reply = second_response.choices[0].message.content or "⚠️ *System error: The local model returned an empty response.*"
             else:
-                final_reply = response_message.content
+                final_reply = response_message.content or "⚠️ *System error: The local model returned an empty response.*"
             
             # Grab the lock again to safely save the AI's reply
             async with global_lock:
@@ -388,8 +460,14 @@ async def on_message(message):
                     forgotten_messages = global_data["history"][:2]
                     global_data["history"] = global_data["history"][-MAX_HISTORY_LENGTH:]
                     
-                    target_user_id = forgotten_messages[0].get("user_id")
-                    target_user_name = forgotten_messages[0].get("user_name")
+                    # Safely search the dropped messages for the actual user
+                    target_user_id = None
+                    target_user_name = None
+                    for msg in forgotten_messages:
+                        if msg.get("user_id"):
+                            target_user_id = msg.get("user_id")
+                            target_user_name = msg.get("user_name")
+                            break # Found the user, stop looking
                     
                     if target_user_id:
                         asyncio.create_task(update_user_memory(target_user_id, target_user_name, forgotten_messages))
