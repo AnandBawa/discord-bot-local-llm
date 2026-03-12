@@ -275,7 +275,7 @@ async def on_message(message):
     current_system_prompt = (
         f"Today's date is {datetime.now().strftime('%B %d, %Y')}. {base_personality}\n"
         "CRITICAL INSTRUCTIONS:\n"
-        "1. EXTREME BREVITY: You must keep your responses short, concise, and straight to the point. Answer in 1-5 sentences unless the user explicitly asks for a detailed explanation, an essay, or a script.\n"
+        "1. EXTREME BREVITY: You must keep your responses short, concise, and straight to the point. Answer in 1-3 sentences unless the user explicitly asks for a detailed explanation, an essay, or a script.\n"
         "2. MULTI-USER CHAT: You are in a group chat with multiple users. Usernames are prepended to their messages. Address users by their names when appropriate.\n"
         "3. SEARCH DIRECTIVE: If asked about current events, real-time info, OR if the user asks a follow-up question related to it, you MUST use the web_search tool. NEVER guess. \n"
         "4. STRICT RULE: Do not use emojis unless your personality requires it."
