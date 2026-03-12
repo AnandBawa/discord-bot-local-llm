@@ -36,7 +36,8 @@ def save_json(filepath, data):
     with open(filepath, "w") as f:
         json.dump(data, f, indent=4)
 
-global_data = load_json(GLOBAL_DATA_FILE, {"history": [], "prompt": ""})
+# Initialize as an empty dictionary since we now store data per server_id
+global_data = load_json(GLOBAL_DATA_FILE, {})
 
 @contextlib.asynccontextmanager
 async def safe_typing(channel):
@@ -57,6 +58,9 @@ async def safe_typing(channel):
                 await typing_ctx.__aexit__(None, None, None)
             except Exception:
                 pass
+
+async def resolve_tool_error(error_message):
+    return error_message
 
 async def send_help_menu(message, bot_name):
     help_text = (
@@ -116,49 +120,47 @@ async def perform_web_search(query):
         return f"Search error: {e}"
     
 async def update_user_memory(user_id, user_name, forgotten_messages):
-    current_memories = load_json(MEMORY_FILE, {})
-    user_data = current_memories.get(str(user_id), {"name": user_name, "facts": "No core memories yet."})
-    existing_memory = user_data["facts"]
-    
-    chat_log = ""
-    for msg in forgotten_messages:
-        chat_log += f"{msg['role'].capitalize()}: {msg['content']}\n"
+    # FIX: Lock the ENTIRE process so simultaneous memory queues don't overwrite each other
+    async with memory_lock:
+        current_memories = load_json(MEMORY_FILE, {})
+        user_data = current_memories.get(str(user_id), {"name": user_name, "facts": "No core memories yet."})
+        existing_memory = user_data["facts"]
         
-    memory_prompt = (
-        f"You are an AI memory manager. Extract long-term, permanent facts about the user '{user_name}' from the chat log below. "
-        "Update the existing memory with any new facts (preferences, tech stack, ongoing projects). "
-        "Keep it strictly concise and bulleted. If there are no new facts about this user, just return the EXISTING MEMORY exactly as is. "
-        "Do not include temporary conversational details.\n\n"
-        f"EXISTING MEMORY for {user_name}:\n{existing_memory}\n\n"
-        f"RECENT CHAT LOG:\n{chat_log}"
-    )
-    
-    try:
-        response = await lm_client.chat.completions.create(
-            model="local-model",
-            messages=[{"role": "user", "content": memory_prompt}],
-            temperature=0.3, 
-            max_tokens=300
+        chat_log = ""
+        for msg in forgotten_messages:
+            chat_log += f"{msg['role'].capitalize()}: {msg['content']}\n"
+            
+        memory_prompt = (
+            f"You are an AI memory manager. Extract long-term, permanent facts about the user '{user_name}' from the chat log below. "
+            "Update the existing memory with any new facts (preferences, tech stack, ongoing projects). "
+            "Keep it strictly concise and bulleted. If there are no new facts about this user, just return the EXISTING MEMORY exactly as is. "
+            "Do not include temporary conversational details.\n\n"
+            f"EXISTING MEMORY for {user_name}:\n{existing_memory}\n\n"
+            f"RECENT CHAT LOG:\n{chat_log}"
         )
         
-        new_memory = response.choices[0].message.content.strip()
-        
-        if new_memory != existing_memory and new_memory:
-            async with memory_lock:
-                current_memories = load_json(MEMORY_FILE, {})
-                user_data = current_memories.get(str(user_id), {"name": user_name, "facts": "No core memories yet."})
-                
+        try:
+            response = await lm_client.chat.completions.create(
+                model="local-model",
+                messages=[{"role": "user", "content": memory_prompt}],
+                temperature=0.3, 
+                max_tokens=300
+            )
+            
+            new_memory = response.choices[0].message.content.strip()
+            
+            if new_memory != existing_memory and new_memory:
+                # File is already safely locked from the top!
                 user_data["facts"] = new_memory
                 user_data["name"] = user_name 
                 current_memories[str(user_id)] = user_data
                 save_json(MEMORY_FILE, current_memories)
+                print(f"[Memory] Core memory updated for {user_name}.")
+            else:
+                print(f"[Memory] Scanned old messages, no new permanent facts found for {user_name}.")
                 
-            print(f"[Memory] Core memory updated for {user_name}.")
-        else:
-            print(f"[Memory] Scanned old messages, no new permanent facts found for {user_name}.")
-            
-    except Exception as e:
-        print(f"Failed to update core memory for {user_name}: {e}")
+        except Exception as e:
+            print(f"Failed to update core memory for {user_name}: {e}")
 
 async def process_memories_sequentially(users_dict, forgotten_messages):
     for uid, uname in users_dict.items():
@@ -197,6 +199,18 @@ async def on_message(message):
     if message.author == client.user or not client.user.mentioned_in(message):
         return
 
+    # IGNORE DMs: The bot must be used inside a Server (Guild) to track histories properly
+    if not message.guild:
+        return
+        
+    server_id = str(message.guild.id)
+    
+    # Initialize this specific server in the JSON if it's their first time talking
+    async with global_lock:
+        if server_id not in global_data:
+            global_data[server_id] = {"history": [], "prompt": ""}
+            save_json(GLOBAL_DATA_FILE, global_data)
+
     # Stripping logic that handles both @Name and @Nickname formats
     bot_mention = f'<@{client.user.id}>'
     bot_nickname_mention = f'<@!{client.user.id}>' 
@@ -211,29 +225,29 @@ async def on_message(message):
             clean_message = clean_message.replace(f"<@!{mentioned_user.id}>", f"@{memory_formatted_name}")
 
     if clean_message.lower() == 'role':
-        current_role = global_data.get("prompt")
+        current_role = global_data[server_id].get("prompt")
         if current_role:
-            await message.reply(f"**Current Global Personality:**\n> *{current_role}*")
+            await message.reply(f"**Current Server Personality:**\n> *{current_role}*")
         else:
-            await message.reply("**Current Global Personality:**\n> *(Default) You are a neutral, conversational AI.*")
+            await message.reply("**Current Server Personality:**\n> *(Default) You are a neutral, conversational AI.*")
         return
 
     if clean_message.lower().startswith('role '):
         new_prompt = clean_message[5:].strip() 
         if new_prompt.lower() == 'clear':
             async with global_lock:
-                history_to_save = global_data.get("history", [])
+                history_to_save = global_data[server_id].get("history", [])
                 if history_to_save:
                     users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
                     asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
                 
-                global_data["prompt"] = ""
-                global_data["history"] = [] 
+                global_data[server_id]["prompt"] = ""
+                global_data[server_id]["history"] = [] 
                 save_json(GLOBAL_DATA_FILE, global_data)
             
             default_persona = "You are a neutral, conversational AI."
             await message.reply(
-                f"✅ Global personality removed and conversation history cleared! *(Recent memories were saved)*\n\n"
+                f"✅ Server personality removed and conversation history cleared! *(Recent memories were saved)*\n\n"
                 f"**Current Personality:**\n> {default_persona}"
             )
             return
@@ -241,25 +255,25 @@ async def on_message(message):
             await message.reply(f"Please provide a prompt! Example: `@{client.user.name} role You are a pirate.`")
             return
         async with global_lock:
-            history_to_save = global_data.get("history", [])
+            history_to_save = global_data[server_id].get("history", [])
             if history_to_save:
                 users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
                 asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
-            global_data["prompt"] = new_prompt
-            global_data["history"] = [] 
+            global_data[server_id]["prompt"] = new_prompt
+            global_data[server_id]["history"] = [] 
             save_json(GLOBAL_DATA_FILE, global_data)
-        await message.reply(f"✅ Saved global personality and cleared conversation history for a fresh start! *(Recent memories were saved)*\n> *{new_prompt}*")
+        await message.reply(f"✅ Saved server personality and cleared conversation history for a fresh start! *(Recent memories were saved)*\n> *{new_prompt}*")
         return
 
     if clean_message.lower() == 'clear':
         async with global_lock:
-            history_to_save = global_data.get("history", [])
+            history_to_save = global_data[server_id].get("history", [])
             if history_to_save:
                 users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
                 asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
-            global_data["history"] = []
+            global_data[server_id]["history"] = []
             save_json(GLOBAL_DATA_FILE, global_data)
-        await message.reply("🗑️ Global conversation history cleared! *(Recent memories were saved)*")
+        await message.reply("🗑️ Server conversation history cleared! *(Recent memories were saved)*")
         return
     
     if clean_message.lower() == 'help':
@@ -279,7 +293,7 @@ async def on_message(message):
             f"• **Discord Ping:** `{ping_ms}ms`\n"
             f"• **Loaded AI Model:** `{current_model}`\n"
             f"• **Peak Context Used:** `{highest_token_count} tokens`\n"
-            f"• **Current History Length:** `{len(global_data['history'])}/{MAX_HISTORY_LENGTH} messages`"
+            f"• **Current History Length:** `{len(global_data[server_id]['history'])}/{MAX_HISTORY_LENGTH} messages`"
         )
         await status_msg.edit(content=diagnostics)
         return
@@ -293,20 +307,37 @@ async def on_message(message):
         command_parts = clean_message.split()
         if len(command_parts) > 1:
             target_name = " ".join(command_parts[1:]).lower()
+            
+            # FIX: Build the active users list for the targeted search
+            active_users = {str(message.author.id)}
+            for msg in global_data[server_id].get("history", []):
+                if "user_id" in msg: active_users.add(str(msg["user_id"]))
+                
             found_user = None
-            for uid, m_data in current_memories.items():
-                if target_name in m_data['name'].lower():
-                    found_user = m_data
+            # FIX: Only search for the name if they are in the active_users set
+            for uid in active_users:
+                if uid in current_memories and target_name in current_memories[uid]['name'].lower():
+                    found_user = current_memories[uid]
                     break
+                    
             if found_user:
                 memory_text = f"**Facts known about {found_user['name']}:**\n{found_user['facts']}"
             else:
-                memory_text = f"I couldn't find any memories for '{target_name}'. Use `@{client.user.name} memory` to see the full list of tracked users."
+                memory_text = f"I couldn't find any memories for '{target_name}' in this server's recent chat history."
         else:
-            memory_text = f"**Tracked Channel Memories**\nType `@{client.user.name} memory [name]` to see specific details.\n\n"
-            for uid, m_data in current_memories.items():
-                if m_data['facts'] and m_data['facts'] != "No core memories yet.":
-                    memory_text += f"• {m_data['name']}\n"
+            # FIX: Only list users active in the current server's history
+            active_users = {str(message.author.id)}
+            for msg in global_data[server_id].get("history", []):
+                if "user_id" in msg: active_users.add(str(msg["user_id"]))
+                
+            memory_text = f"**Tracked Active Users**\nType `@{client.user.name} memory [name]` to search all known users.\n\n"
+            found_any = False
+            for uid in active_users:
+                if uid in current_memories and current_memories[uid]['facts'] and current_memories[uid]['facts'] != "No core memories yet.":
+                    memory_text += f"• {current_memories[uid]['name']}\n"
+                    found_any = True
+            if not found_any:
+                memory_text += "*No core memories found for active users in this chat.*"
         
         chunk_size = 1990
         remaining_text = memory_text
@@ -378,10 +409,22 @@ async def on_message(message):
     )
     
     current_memories = load_json(MEMORY_FILE, {})
-    user_context_str = "".join([f"- {m['name']}: {m['facts']}\n" for m in current_memories.values() if m['facts'] != "No core memories yet."])
-    if user_context_str: current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT CHANNEL USERS (READ ONLY - DO NOT REPEAT):\n{user_context_str}"
+    
+    # FIX: Only inject memories of users actively participating in THIS server's conversation
+    active_users = {str(message.author.id)}
+    for msg in global_data[server_id].get("history", []):
+        if "user_id" in msg:
+            active_users.add(str(msg["user_id"]))
+            
+    user_context_str = ""
+    for uid in active_users:
+        if uid in current_memories and current_memories[uid]['facts'] != "No core memories yet.":
+            user_context_str += f"- {current_memories[uid]['name']}: {current_memories[uid]['facts']}\n"
+            
+    if user_context_str: 
+        current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT ACTIVE USERS (READ ONLY - DO NOT REPEAT):\n{user_context_str}"
 
-    base_personality = global_data.get("prompt") or "You are a neutral, conversational AI."
+    base_personality = global_data[server_id].get("prompt") or "You are a neutral, conversational AI."
     current_system_prompt += f"\n\nYOUR ASSIGNED PERSONA AND ROLE:\n{base_personality}"
     system_message = {"role": "system", "content": current_system_prompt}
 
@@ -392,7 +435,7 @@ async def on_message(message):
     # --- START OF CONCURRENCY FIX ---
     # 1. Grab a snapshot of current history WITHOUT locking or appending yet
     async with global_lock:
-        raw_history = list(global_data.get("history", []))
+        raw_history = list(global_data[server_id].get("history", []))
         
     api_history = [{"role": m["role"], "content": m["content"]} for m in raw_history]
         
@@ -417,56 +460,80 @@ async def on_message(message):
 
     async with safe_typing(message.channel):
         try:
-            # 2. Make API Call (Concurrency allowed! No arrays are locked here)
+            # 2. Make API Call with a Loop for chained tool calls
+            max_iterations = 3
+            current_iteration = 0
+            final_reply = ""
+            search_context_for_history = ""
+            
             response = await lm_client.chat.completions.create(model="local-model", messages=messages_to_send, tools=tools_schema, tool_choice="auto", temperature=1, max_tokens=1000)
             if response.usage and response.usage.total_tokens > highest_token_count: highest_token_count = response.usage.total_tokens
             response_message = response.choices[0].message
             
-            if response_message.tool_calls:
-                messages_to_send.append(response_message.model_dump(exclude_none=True))
-                search_tasks = []; tool_call_metadata = []
-                for tool_call in response_message.tool_calls:
-                    if tool_call.function.name == "web_search":
-                        try:
-                            args = json.loads(tool_call.function.arguments)
-                            search_tasks.append(perform_web_search(args.get("query")))
+            while current_iteration < max_iterations:
+                if response_message.tool_calls:
+                    messages_to_send.append(response_message.model_dump(exclude_none=True))
+                    search_tasks = []; tool_call_metadata = []
+                    
+                    for tool_call in response_message.tool_calls:
+                        if tool_call.function.name == "web_search":
+                            try:
+                                args = json.loads(tool_call.function.arguments)
+                                search_tasks.append(perform_web_search(args.get("query")))
+                                tool_call_metadata.append(tool_call)
+                            except json.JSONDecodeError:
+                                # FIX: Evaluated immediately, no closure traps
+                                search_tasks.append(resolve_tool_error("System error: Invalid JSON."))
+                                tool_call_metadata.append(tool_call)
+                        else:
+                            # FIX: Evaluated immediately
+                            error_str = f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
+                            search_tasks.append(resolve_tool_error(error_str))
                             tool_call_metadata.append(tool_call)
-                        except json.JSONDecodeError:
-                            async def return_error(): return "System error: Invalid JSON."
-                            search_tasks.append(return_error())
-                            tool_call_metadata.append(tool_call)
-                    else:
-                        # FIX: Catch hallucinated tools to prevent API crash
-                        async def return_unknown_tool(): return f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
-                        search_tasks.append(return_unknown_tool())
-                        tool_call_metadata.append(tool_call)
+                    
+                    if search_tasks:
+                        completed_results = await asyncio.gather(*search_tasks)
+                        search_context_for_history += "\n".join(completed_results) + "\n" # Accumulate history
+                        
+                        for tool_call, result_text in zip(tool_call_metadata, completed_results):
+                            messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
+                    
+                    # Request the next step from the model (NOW WITH TOOLS AND TRACKING!)
+                    response = await lm_client.chat.completions.create(
+                        model="local-model", 
+                        messages=messages_to_send, 
+                        tools=tools_schema, # FIX: Re-enable tools for chaining!
+                        tool_choice="auto", 
+                        temperature=1, 
+                        max_tokens=1000
+                    )
+                    
+                    # FIX: Accurately track the heavier chained requests
+                    if response.usage and response.usage.total_tokens > highest_token_count: 
+                        highest_token_count = response.usage.total_tokens
+                        
+                    response_message = response.choices[0].message
+                    current_iteration += 1
+                else:
+                    # The model returned a text response! Break the loop.
+                    final_reply = response_message.content
+                    break
+            
+            # Fallback if the model chained tools too many times or returned empty content
+            if not final_reply:
+                final_reply = response_message.content or "⚠️ *System error: Reached max tool iterations or empty response.*"
                 
-                search_context_for_history = ""
-                if search_tasks:
-                    completed_results = await asyncio.gather(*search_tasks)
-                    search_context_for_history = "\n".join(completed_results) # Save for history
-                    for tool_call, result_text in zip(tool_call_metadata, completed_results):
-                        messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
-                
-                second_response = await lm_client.chat.completions.create(model="local-model", messages=messages_to_send, temperature=1, max_tokens=1000)
-                final_reply = second_response.choices[0].message.content or "⚠️ *System error: empty response.*"
-                
-                # Combine the raw search data with the reply so the AI remembers what it read
-                history_save_text = f"[Internal Web Search Context:\n{search_context_for_history}]\n\n{final_reply}" if search_context_for_history else final_reply
-
-            else: 
-                final_reply = response_message.content or "⚠️ *System error: empty response.*"
-                history_save_text = final_reply
+            history_save_text = f"[Internal Web Search Context:\n{search_context_for_history.strip()}]\n\n{final_reply}" if search_context_for_history else final_reply
             
             # 3. ATOMIC PAIR INSERTION: Append User AND Assistant simultaneously to prevent scrambling
             async with global_lock:
-                global_data.setdefault("history", []).append({"role": "user", "content": history_text_save, "user_id": str(message.author.id), "user_name": user_name})
-                global_data["history"].append({"role": "assistant", "content": history_save_text})
+                global_data[server_id].setdefault("history", []).append({"role": "user", "content": history_text_save, "user_id": str(message.author.id), "user_name": user_name})
+                global_data[server_id]["history"].append({"role": "assistant", "content": history_save_text})
                 
-                if len(global_data["history"]) > MAX_HISTORY_LENGTH:
+                if len(global_data[server_id]["history"]) > MAX_HISTORY_LENGTH:
                     # Dynamic slice prevents Parity Overlap bugs
-                    forgotten = global_data["history"][:-MAX_HISTORY_LENGTH]
-                    global_data["history"] = global_data["history"][-MAX_HISTORY_LENGTH:]
+                    forgotten = global_data[server_id]["history"][:-MAX_HISTORY_LENGTH]
+                    global_data[server_id]["history"] = global_data[server_id]["history"][-MAX_HISTORY_LENGTH:]
                     
                     # Extract ALL unique users from the forgotten messages (Fixes Memory Dropout)
                     users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten if msg.get("user_id")}
