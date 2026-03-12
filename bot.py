@@ -81,6 +81,10 @@ async def send_help_menu(message, bot_name):
     await message.reply(help_text)
 
 async def perform_web_search(query):
+    # GUARD: Prevent crashes if the LLM hallucinates an empty search
+    if not query or not isinstance(query, str):
+        return "Search error: Invalid or missing search query."
+    
     now = datetime.now()
     current_date = now.strftime('%B %d, %Y')
     
@@ -193,8 +197,11 @@ async def on_message(message):
     if message.author == client.user or not client.user.mentioned_in(message):
         return
 
+    # Stripping logic that handles both @Name and @Nickname formats
     bot_mention = f'<@{client.user.id}>'
-    clean_message = message.content.replace(bot_mention, '').strip()
+    bot_nickname_mention = f'<@!{client.user.id}>' 
+    
+    clean_message = message.content.replace(bot_mention, '').replace(bot_nickname_mention, '').strip()
     user_name = f"{message.author.display_name}_{str(message.author.id)[-4:]}"
 
     for mentioned_user in message.mentions:
@@ -219,12 +226,11 @@ async def on_message(message):
                 if history_to_save:
                     users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
                     asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
-
+                
                 global_data["prompt"] = ""
                 global_data["history"] = [] 
                 save_json(GLOBAL_DATA_FILE, global_data)
             
-            # Show the confirmation along with the now-active default persona
             default_persona = "You are a neutral, conversational AI."
             await message.reply(
                 f"✅ Global personality removed and conversation history cleared! *(Recent memories were saved)*\n\n"
@@ -383,11 +389,12 @@ async def on_message(message):
     total_visuals = len(image_attachments) + len(valid_stickers)
     if total_visuals > 0: history_text_save += f" [User attached {total_visuals} visual(s)]"
 
+    # --- START OF CONCURRENCY FIX ---
+    # 1. Grab a snapshot of current history WITHOUT locking or appending yet
     async with global_lock:
-        global_data.setdefault("history", []).append({"role": "user", "content": history_text_save, "user_id": str(message.author.id), "user_name": user_name})
-        save_json(GLOBAL_DATA_FILE, global_data)
-        raw_history = global_data.get("history", [])[:-1] 
-        api_history = [{"role": m["role"], "content": m["content"]} for m in raw_history]
+        raw_history = list(global_data.get("history", []))
+        
+    api_history = [{"role": m["role"], "content": m["content"]} for m in raw_history]
         
     cleaned_history = []
     for msg in api_history:
@@ -410,9 +417,11 @@ async def on_message(message):
 
     async with safe_typing(message.channel):
         try:
+            # 2. Make API Call (Concurrency allowed! No arrays are locked here)
             response = await lm_client.chat.completions.create(model="local-model", messages=messages_to_send, tools=tools_schema, tool_choice="auto", temperature=1, max_tokens=1000)
             if response.usage and response.usage.total_tokens > highest_token_count: highest_token_count = response.usage.total_tokens
             response_message = response.choices[0].message
+            
             if response_message.tool_calls:
                 messages_to_send.append(response_message.model_dump(exclude_none=True))
                 search_tasks = []; tool_call_metadata = []
@@ -420,26 +429,49 @@ async def on_message(message):
                     if tool_call.function.name == "web_search":
                         try:
                             args = json.loads(tool_call.function.arguments)
-                            search_tasks.append(perform_web_search(args.get("query"))); tool_call_metadata.append(tool_call)
+                            search_tasks.append(perform_web_search(args.get("query")))
+                            tool_call_metadata.append(tool_call)
                         except json.JSONDecodeError:
                             async def return_error(): return "System error: Invalid JSON."
-                            search_tasks.append(return_error()); tool_call_metadata.append(tool_call)
+                            search_tasks.append(return_error())
+                            tool_call_metadata.append(tool_call)
+                    else:
+                        # FIX: Catch hallucinated tools to prevent API crash
+                        async def return_unknown_tool(): return f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
+                        search_tasks.append(return_unknown_tool())
+                        tool_call_metadata.append(tool_call)
+                
+                search_context_for_history = ""
                 if search_tasks:
                     completed_results = await asyncio.gather(*search_tasks)
+                    search_context_for_history = "\n".join(completed_results) # Save for history
                     for tool_call, result_text in zip(tool_call_metadata, completed_results):
                         messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
+                
                 second_response = await lm_client.chat.completions.create(model="local-model", messages=messages_to_send, temperature=1, max_tokens=1000)
                 final_reply = second_response.choices[0].message.content or "⚠️ *System error: empty response.*"
-            else: final_reply = response_message.content or "⚠️ *System error: empty response.*"
+                
+                # Combine the raw search data with the reply so the AI remembers what it read
+                history_save_text = f"[Internal Web Search Context:\n{search_context_for_history}]\n\n{final_reply}" if search_context_for_history else final_reply
+
+            else: 
+                final_reply = response_message.content or "⚠️ *System error: empty response.*"
+                history_save_text = final_reply
             
+            # 3. ATOMIC PAIR INSERTION: Append User AND Assistant simultaneously to prevent scrambling
             async with global_lock:
-                global_data["history"].append({"role": "assistant", "content": final_reply})
+                global_data.setdefault("history", []).append({"role": "user", "content": history_text_save, "user_id": str(message.author.id), "user_name": user_name})
+                global_data["history"].append({"role": "assistant", "content": history_save_text})
+                
                 if len(global_data["history"]) > MAX_HISTORY_LENGTH:
-                    forgotten = global_data["history"][:2]; global_data["history"] = global_data["history"][-MAX_HISTORY_LENGTH:]
-                    target_id = None; target_name = None
-                    for msg in forgotten:
-                        if msg.get("user_id"): target_id = msg.get("user_id"); target_name = msg.get("user_name"); break 
-                    if target_id: asyncio.create_task(update_user_memory(target_id, target_name, forgotten))
+                    # Dynamic slice prevents Parity Overlap bugs
+                    forgotten = global_data["history"][:-MAX_HISTORY_LENGTH]
+                    global_data["history"] = global_data["history"][-MAX_HISTORY_LENGTH:]
+                    
+                    # Extract ALL unique users from the forgotten messages (Fixes Memory Dropout)
+                    users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten if msg.get("user_id")}
+                    if users_in_forgotten:
+                        asyncio.create_task(process_memories_sequentially(users_in_forgotten, forgotten))
                 save_json(GLOBAL_DATA_FILE, global_data)
             
             remaining_text = final_reply; is_first = True
