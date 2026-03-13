@@ -79,10 +79,10 @@ async def send_help_menu(message, bot_name):
     help_text = (
         "**Here is how you can interact with me:**\n\n"
         f"• **`@{bot_name} [message]`** - Tag me to ask a question, chat, or analyze an attached image/sticker.\n"
-        f"  Example: @{bot_name} what is the weather in Tokyo?\n\n"
+        f"  Example: @{bot_name} what is the AQI in Delhi?\n\n"
         f"• **`@{bot_name} role`** - Show my currently active server personality.\n"
         f"• **`@{bot_name} role [prompt]`** - Set a custom personality and wipe history (saves core memories first).\n"
-        f"  Example: @{bot_name} role You are a grumpy history professor who hates technology.\n\n"
+        f"  Example: @{bot_name} role you are a pirate.\n\n"
         f"• **`@{bot_name} role clear`** - Reset me to my default neutral behavior.\n"
         f"• **`@{bot_name} clear`** - Wipe the server conversation history (saves core memories first).\n"
         f"• **`@{bot_name} memory`** - View the list of users I have core memories for in this server.\n"
@@ -561,7 +561,7 @@ async def on_message(message):
         "2. MULTI-USER CHAT: Address users by their names when appropriate.\n"
         "3. SEARCH DIRECTIVE: Use the web_search tool if current info is needed. NEVER guess.\n"
         "4. STRICT RULE: Do not use emojis unless your personality requires it.\n"
-        "5. MEMORY USAGE (CRITICAL): Use user facts below silently. NEVER repeat facts back unless asked."
+        "5. MEMORY USAGE (CRITICAL): Use user facts silently to guide your context. NEVER repeat or summarize these facts back to the user unless they explicitly ask what you remember about them."
     )
     
     user_context_str = ""
