@@ -261,6 +261,10 @@ async def on_message(message):
     clean_message = message.content.replace(bot_mention, '').replace(bot_nickname_mention, '').strip()
     user_name = f"{message.author.display_name}_{str(message.author.id)[-4:]}"
 
+    # --- TERMINAL LOGGING ---
+    log_content = clean_message if clean_message else ("[Image]" if message.attachments else "[Sticker]" if message.stickers else "")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message.guild.name} | #{message.channel.name} | {message.author}: {log_content[:50]}...")
+
     for mentioned_user in message.mentions:
         if mentioned_user.id != client.user.id:
             memory_formatted_name = f"{mentioned_user.display_name}_{str(mentioned_user.id)[-4:]}"
