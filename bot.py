@@ -6,6 +6,10 @@ import base64
 import contextlib
 import aiosqlite
 import io
+import re
+import fitz
+import aiohttp
+from bs4 import BeautifulSoup
 from PIL import Image
 from datetime import datetime
 from openai import AsyncOpenAI
@@ -50,6 +54,21 @@ async def init_db():
                             (server_id TEXT, user_id TEXT, user_name TEXT, facts TEXT,
                              PRIMARY KEY (server_id, user_id))''')
         await db.commit()
+
+def extract_pdf_text(pdf_bytes):
+    """Safely extracts text from PDF bytes in a background thread."""
+    text = ""
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            # Limit to the first 15 pages to prevent massive processing lag
+            for i, page in enumerate(doc):
+                if i > 15:
+                    text += "\n...[Additional pages skipped to save memory]"
+                    break
+                text += page.get_text() + "\n"
+        return text.strip()
+    except Exception as e:
+        return f"Error reading PDF: {str(e)}"
 
 @contextlib.asynccontextmanager
 async def safe_typing(channel):
@@ -146,6 +165,73 @@ async def perform_web_search(query):
         return search_text
     except Exception as e:
         return f"Search error: {e}"
+    
+async def fetch_url_content(url):
+    """Fetches a URL and returns either an image byte array or extracted text."""
+    try:
+        # Spoof a standard browser to bypass basic anti-bot blocks
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    return {"type": "error", "data": f"Failed to access URL (HTTP {response.status})"}
+                
+                # --- NEW: 10MB FILE SIZE LIMIT CHECK ---
+                MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 Megabytes
+                
+                # 1. Quick check using server headers
+                content_length = response.headers.get('Content-Length')
+                if content_length and int(content_length) > MAX_FILE_SIZE:
+                    return {"type": "error", "data": f"File skipped: Exceeds the 10MB size limit."}
+                
+                content_type = response.headers.get('Content-Type', '').lower()
+                
+                # 2. Safe download (stops reading if it crosses the limit)
+                file_bytes = await response.content.read(MAX_FILE_SIZE + 1)
+                if len(file_bytes) > MAX_FILE_SIZE:
+                    response.close() # <--- NEW: Gracefully hang up the connection
+                    return {"type": "error", "data": f"File skipped: Exceeds the 10MB size limit."}
+                
+                # Handle Image URLs
+                if 'image' in content_type:
+                    return {"type": "image", "data": file_bytes}
+                
+                # Handle PDF URLs
+                elif 'application/pdf' in content_type:
+                    # Run the heavy PDF extraction in a separate thread
+                    extracted_text = await asyncio.to_thread(extract_pdf_text, file_bytes)
+                    
+                    if len(extracted_text) > 40000:
+                        extracted_text = extracted_text[:40000] + "\n...[Content Truncated due to length limit]"
+                    return {"type": "text", "data": f"[Extracted PDF Document]:\n{extracted_text}"}
+                
+                # Handle Webpage URLs
+                elif 'text/html' in content_type or 'text/plain' in content_type:
+                    # Decode the bytes we already downloaded
+                    html = file_bytes.decode('utf-8', errors='ignore')
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # Strip out javascript, CSS, and navigation junk
+                    for script in soup(["script", "style", "nav", "footer", "header"]):
+                        script.decompose()
+                        
+                    text = soup.get_text(separator='\n', strip=True)
+                    
+                    # Truncate text to 40000 characters to prevent crashing local LLM context limits
+                    if len(text) > 40000:
+                        text = text[:40000] + "\n...[Content Truncated due to length limit]"
+                    return {"type": "text", "data": text}
+                else:
+                    return {"type": "error", "data": f"Unsupported content type: {content_type}"}
+    except Exception as e:
+        return {"type": "error", "data": str(e)}
+
+# Wrapper to seamlessly pass raw URL image bytes into your existing Discord attachment logic
+class URLImageAttachment:
+    def __init__(self, data):
+        self.data = data
+    async def read(self):
+        return self.data
     
 # FIX: Add server_id parameter to memory functions
 async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
@@ -508,9 +594,43 @@ async def on_message(message):
             except discord.Forbidden: break
         return
 
-    image_attachments = [att for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+    MAX_FILE_SIZE = 10 * 1024 * 1024 # 10 Megabytes
+    ephemeral_context = "" # <--- THIS LINE IS MANDATORY
+
+    image_attachments = []
+    for att in message.attachments:
+        if att.content_type and att.content_type.startswith('image/'):
+            if att.size <= MAX_FILE_SIZE:
+                image_attachments.append(att)
+            else:
+                clean_message += f"\n[System note: Attached image '{att.filename}' ignored because it exceeds the 10MB limit.]"
+
     valid_stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
     
+    # --- AUTONOMOUS PDF ATTACHMENT SCRAPING ---
+    pdf_attachments = []
+    for att in message.attachments:
+        if att.filename.lower().endswith('.pdf'):
+            if att.size <= MAX_FILE_SIZE:
+                pdf_attachments.append(att)
+            else:
+                clean_message += f"\n[System note: Attached PDF '{att.filename}' ignored because it exceeds the 10MB limit.]"
+                
+    if pdf_attachments:
+        async with safe_typing(message.channel):
+            for pdf in pdf_attachments:
+                # Download the PDF file from Discord
+                pdf_bytes = await pdf.read()
+                # Extract the text in the background thread
+                pdf_text = await asyncio.to_thread(extract_pdf_text, pdf_bytes)
+                
+                if len(pdf_text) > 40000:
+                    pdf_text = pdf_text[:40000] + "\n...[Content Truncated due to length limit]"
+                    
+                # --- EPHEMERAL FIX: Route massive text to the holding zone, save a tiny note for the DB ---
+                ephemeral_context += f"\n\n[Extracted PDF Content from {pdf.filename}]:\n{pdf_text}"
+                clean_message += f"\n[System note: User attached PDF '{pdf.filename}']"
+
     if message.reference and message.reference.message_id:
         try:
             replied_msg = await message.channel.fetch_message(message.reference.message_id)
@@ -530,33 +650,66 @@ async def on_message(message):
         await send_help_menu(message, client.user.name)
         return
 
+    # --- AUTONOMOUS URL SCRAPING ---
+    # Find all http/https links in the message, ignoring < > brackets Discord sometimes adds
+    url_pattern = r'(https?://[^\s<>]+)'
+    found_urls = re.findall(url_pattern, clean_message)
+    scraped_texts = []
+
+    if found_urls:
+        async with safe_typing(message.channel): # Show typing while downloading
+            for url in found_urls:
+                url_result = await fetch_url_content(url)
+                
+                if url_result["type"] == "image":
+                    # Funnel the downloaded image straight into your VRAM-safe resizing logic
+                    image_attachments.append(URLImageAttachment(url_result["data"]))
+                elif url_result["type"] == "text":
+                    # Append the cleaned webpage text directly behind the user's question
+                    scraped_texts.append(f"\n\n[Extracted webpage content from {url}]:\n{url_result['data']}")
+                elif url_result["type"] == "error":
+                    scraped_texts.append(f"\n\n[System note: Attempted to read {url} but failed: {url_result['data']}]")
+                    
+        # Inject the massive scraped data into the temporary holding zone
+        if scraped_texts:
+            ephemeral_context += "".join(scraped_texts)
+            # (We don't need a DB note here because the original URL is already in clean_message)
+
+    # --- BUILD API PAYLOAD & DATABASE PAYLOAD ---
     api_user_content = []
-    text_part = f"{user_name}: {clean_message}" if clean_message else f"{user_name}: What is in this image?"
+    db_user_content_obj = [] # NEW: Lightweight payload strictly for the database
+    
+    # The massive text the AI sees right now:
+    ai_text_part = f"{user_name}: {clean_message}{ephemeral_context}" if (clean_message or ephemeral_context) else f"{user_name}: What is in this image?"
+    # The lightweight text the Database remembers forever:
+    db_text_part = f"{user_name}: {clean_message}" if clean_message else f"{user_name}: [Media attached]"
+
     if image_attachments or valid_stickers:
-        api_user_content.append({"type": "text", "text": text_part})
+        api_user_content.append({"type": "text", "text": ai_text_part})
+        db_user_content_obj.append({"type": "text", "text": db_text_part}) # Save tiny text
+        
         for img in image_attachments:
             img_bytes = await img.read()
             
             # FIX: VRAM Optimization - Resize massive images before sending to local LLM
             with Image.open(io.BytesIO(img_bytes)) as pil_img:
-                # Convert RGBA (transparent PNGs) to RGB to prevent JPEG conversion crashes
-                if pil_img.mode in ("RGBA", "P"):
-                    pil_img = pil_img.convert("RGB")
-                    
-                # thumbnail() mathematically shrinks the image to fit within the box while keeping aspect ratio
+                if pil_img.mode in ("RGBA", "P"): pil_img = pil_img.convert("RGB")
                 pil_img.thumbnail((1024, 1024))
-                
-                # Save it into a new buffer as a standardized, compressed JPEG
                 buffer = io.BytesIO()
                 pil_img.save(buffer, format="JPEG", quality=85)
-                
                 img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
                 
             api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+            db_user_content_obj.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}) # Save image for follow-ups
+            
         for sticker in valid_stickers:
-            sticker_bytes = await sticker.read(); sticker_b64 = base64.b64encode(sticker_bytes).decode('utf-8')
+            sticker_bytes = await sticker.read()
+            sticker_b64 = base64.b64encode(sticker_bytes).decode('utf-8')
             api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
-    else: api_user_content = text_part
+            db_user_content_obj.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
+    else: 
+        api_user_content = ai_text_part
+        db_user_content_obj = db_text_part # Save tiny text
 
     current_system_prompt = (
         f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\n"
@@ -612,6 +765,17 @@ async def on_message(message):
                     # Ensure it is a Vision array (contains dicts), otherwise revert to string
                     if len(parsed_content) > 0 and not isinstance(parsed_content[0], dict):
                         parsed_content = r[1]
+                    else:
+                        # --- NEW: VRAM TRAP FIX ---
+                        # Strip Base64 images from historical messages to prevent KV-cache bloat
+                        scrubbed_content = []
+                        for item in parsed_content:
+                            if item.get("type") == "image_url":
+                                scrubbed_content.append({"type": "text", "text": "[Image attached in previous message]"})
+                            else:
+                                scrubbed_content.append(item)
+                        parsed_content = scrubbed_content
+                        
                 elif not isinstance(parsed_content, str):
                     # If it parsed into an int, float, or bool, revert it to string
                     parsed_content = str(parsed_content)
@@ -693,11 +857,11 @@ async def on_message(message):
                                     if isinstance(args, dict):
                                         search_tasks.append(perform_web_search(args.get("query")))
                                     else:
-                                        search_tasks.append(resolve_tool_error("System error: Tool arguments must be a valid JSON object."))
+                                        search_tasks.append(resolve_tool_error("System error: Tool arguments must be a valid JSON object. TOOL FAILED. DO NOT attempt to use the tool again. Answer the user directly using your existing knowledge."))
                                         
                                     tool_call_metadata.append(tool_call)
                                 except json.JSONDecodeError:
-                                    search_tasks.append(resolve_tool_error("System error: Invalid JSON."))
+                                    search_tasks.append(resolve_tool_error("System error: Invalid JSON. TOOL FAILED. DO NOT attempt to use the tool again. Answer the user directly using your existing knowledge."))
                                     tool_call_metadata.append(tool_call)
                             else:
                                 error_str = f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
@@ -733,8 +897,8 @@ async def on_message(message):
                     
                 # 3. ATOMIC PAIR INSERTION & CHUNKED PRUNING VIA SQLITE
                 async with aiosqlite.connect(DB_FILE) as db:
-                    # Convert the full multimodal arrays into JSON strings for storage (Vision Bug Fix)
-                    db_user_content = json.dumps(api_user_content)
+                    # EPHEMERAL FIX: Save the lightweight database object, NOT the massive API prompt
+                    db_user_content = json.dumps(db_user_content_obj) if isinstance(db_user_content_obj, list) else str(db_user_content_obj)
                     
                     # FIX: Save ONLY the final synthesized reply! (No JSON encoding needed for strings)
                     db_assistant_content = final_reply
@@ -792,9 +956,20 @@ async def on_message(message):
                             await message.channel.send(chunk)
                     except discord.Forbidden: break
             except Exception as e:
-                print(f"Error: {e}")
-                try: await message.reply("Oops! I couldn't process that.")
-                except: pass
+                error_str = str(e).lower()
+                print(f"Generation Error: {e}")
+                
+                try: 
+                    # Check if the user tried to send media
+                    has_media = bool(image_attachments or valid_stickers)
+                    
+                    # If media was sent and the local server threw a 400 or vision error
+                    if has_media and ("400" in error_str or "vision" in error_str or "image" in error_str):
+                        await message.reply("⚠️ **Compatibility Error:** The AI model currently loaded in my local server does not support image analysis. Please try again with text only, or load a multimodal/vision model!")
+                    else:
+                        await message.reply("Oops! I couldn't process that. Please check my terminal for more details.")
+                except: 
+                    pass
                 return
 
 if TOKEN: client.run(TOKEN)
