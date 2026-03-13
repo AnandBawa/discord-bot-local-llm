@@ -8,10 +8,10 @@ A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM e
 - Uses an OpenAI-compatible chat API via configurable base URL
 - Supports image and sticker understanding in prompts
 - Supports PDF attachments (extracts text and adds it to model context)
-- Ingests URLs found in messages:
-  - Web pages and plain text pages are fetched and cleaned
+- Ingests URLs found in messages through Jina Reader (`https://r.jina.ai/`):
   - Direct image URLs are treated like image attachments
-  - Direct PDF URLs are parsed and added as text context
+  - PDF URLs are parsed and added as text context
+  - Other content is decoded as text and truncated safely
 - Maintains per-server chat history in SQLite
 - Extracts and stores per-user core memories per server
 - Supports server-level personality prompts (`role` command)
@@ -29,7 +29,6 @@ A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM e
 - `ddgs` (DuckDuckGo search)
 - `Pillow`
 - `aiohttp`
-- `beautifulsoup4`
 - `PyMuPDF`
 
 ## Project Structure
@@ -44,7 +43,7 @@ A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM e
 2. Install dependencies:
 
 ```bash
-pip install discord.py openai aiosqlite python-dotenv ddgs pillow aiohttp beautifulsoup4 pymupdf
+pip install discord.py openai aiosqlite python-dotenv ddgs pillow aiohttp pymupdf
 ```
 
 3. Create a `.env` file:
@@ -100,20 +99,58 @@ Owner-only commands:
   - Lightweight message content is stored in the database instead of full scraped blobs.
 - Historical image payloads are scrubbed from replay context to reduce KV-cache and VRAM pressure.
 
+## Runtime Pipeline
+
+The message flow is organized into explicit pipeline stages:
+
+1. Command interception (`help`, `role`, `clear`, `status`, `memory`, admin commands)
+2. Context extraction (attachments, reply context, URL fetches)
+3. Payload building (text/media packaging for API and DB)
+4. AI context assembly (system prompt, memory injection, history cleanup)
+5. Generation and tool loop execution (up to 3 tool iterations)
+6. Persistence and response delivery (DB save + chunked Discord send)
+
+Concurrency and safety controls:
+
+- LLM call concurrency is capped with a semaphore (`llm_queue = 3`).
+- Memory writes are serialized with `memory_lock`.
+- Deletion requests are timestamped and stale entries are pruned.
+- Typing indicators are wrapped with a safe context manager to avoid permission/HTTP failures.
+
 ## Input Limits and Safety Guards
 
 - 10MB limit for attached images and PDFs.
 - 10MB limit for URL-fetched files.
-- PDF extraction is capped to the first 16 pages (index 0 through 15).
+- PDF extraction is capped to the first 15 pages.
 - Extracted webpage and PDF text is truncated to 40,000 characters.
-- Unsupported URL content types are skipped with a system note.
+- URL fetch timeout is 15 seconds.
+- URL fetches use `X-Return-Format: markdown` and `X-No-Cache: true` headers via Jina Reader.
+
+## Deployment Tuning Note
+
+Several runtime parameters are intentionally conservative defaults and should be tuned for your specific hardware, model size, and latency targets.
+
+In particular, review and adjust values such as:
+
+- LLM concurrency (`llm_queue` semaphore)
+- File size limits (`MAX_FILE_SIZE`)
+- PDF extraction page cap (currently first 15 pages)
+- Text truncation threshold (currently 40,000 characters)
+- Generation settings (`temperature`, `max_tokens`)
+- Tool loop limits (max iterations)
+- History retention policy (`MAX_HISTORY_LENGTH`, and eviction thresholds such as `>= 50` with oldest `LIMIT 20`)
+- Image preprocessing (`thumbnail((1024, 1024))`, JPEG `quality=85`)
+
+If your model server has lower VRAM or slower throughput, reduce concurrency and token/context-related limits. If you have stronger hardware and stable latency, you can increase them cautiously while monitoring response time, memory pressure, and failure rates.
 
 ## Notes
 
-- The bot uses a tool-calling loop for web search via DuckDuckGo when the model requests it.
+- The bot exposes one tool (`web_search`) and runs a tool-calling loop for up to 3 iterations.
 - Large images are resized to fit within 1024x1024 and JPEG-compressed before sending to the LLM.
+- Sticker bytes are base64-encoded and sent as image payloads.
 - If a non-vision model is loaded and media is sent, the bot replies with a compatibility warning.
 - If the local model endpoint is offline, `status` reports it as `Offline / Unreachable`.
+- Response chunking is Markdown-aware for fenced code blocks to avoid broken formatting across Discord message splits.
 
 ## License
 
