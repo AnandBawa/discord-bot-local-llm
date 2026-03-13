@@ -1,93 +1,98 @@
-# Discord Bot with Local LLM
+# discord-bot-local-llm
 
-A Discord bot powered by a locally hosted large language model through [LM Studio](https://lmstudio.ai/). It supports multi-user conversations, persistent per-user memory, autonomous web search, image analysis, and customizable personas -- all running entirely on your own hardware.
+A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM endpoint (for example, LM Studio), supports multimodal prompts (text + images/stickers), keeps per-server chat memory, and performs autonomous web search when needed.
 
-## Features
+## What It Does
 
-- **Local LLM Integration** -- Connects to any model served by LM Studio via its OpenAI-compatible API (`localhost:1234`).
-- **Conversation History** -- Maintains the last 50 messages across the channel, providing context for ongoing discussions.
-- **Core Memories** -- Automatically extracts and persists long-term facts about users (preferences, projects, tech stacks) before conversation history is cleared or trimmed.
-- **Autonomous Web Search** -- Uses DuckDuckGo to search the web when current information is needed, via OpenAI-style tool calling.
-- **Image and Sticker Analysis** -- Accepts image attachments and Discord stickers for multimodal analysis (requires a vision-capable model).
-- **Custom Personas** -- Set a global system prompt to change the bot's personality on the fly.
-- **Concurrency-Safe** -- Handles simultaneous messages with async locks and atomic history insertion to prevent data corruption.
+- Responds when the bot is mentioned in a server channel
+- Uses an OpenAI-compatible chat API via configurable base URL
+- Supports image and sticker understanding in prompts
+- Maintains per-server chat history in SQLite
+- Extracts and stores per-user core memories per server
+- Supports server-level personality prompts (`role` command)
+- Exposes diagnostic and memory management commands
+- Allows owner-only administrative data wipe commands
 
-## Prerequisites
+## Tech Stack
 
-- Python 3.9+
-- [LM Studio](https://lmstudio.ai/) running locally with a model loaded and the local server started on port `1234`
-- A Discord bot token (from the [Discord Developer Portal](https://discord.com/developers/applications))
+- Python 3.12+
+- `discord.py`
+- `openai` (async client, OpenAI-compatible endpoint)
+- `aiosqlite`
+- `python-dotenv`
+- `ddgs` (DuckDuckGo search)
+- `Pillow`
 
-## Installation
+## Project Structure
 
-1. **Clone the repository**
+- `bot.py`: Main bot implementation
+- `.env`: Runtime secrets and model endpoint config (not committed)
+- `bot_database.db`: SQLite data store (created at runtime)
 
-   ```bash
-   git clone https://github.com/AnandBawa/discord-bot-local-llm.git
-   cd discord-bot-local-llm
-   ```
+## Setup
 
-2. **Create and activate a virtual environment**
+1. Create and activate a virtual environment.
+2. Install dependencies:
 
-   ```bash
-   python -m venv venv_bot
-   source venv_bot/bin/activate
-   ```
+```bash
+pip install discord.py openai aiosqlite python-dotenv ddgs pillow
+```
 
-3. **Install dependencies**
+3. Create a `.env` file:
 
-   ```bash
-   pip install discord.py openai python-dotenv duckduckgo-search
-   ```
+```env
+DISCORD_BOT_TOKEN=your_discord_bot_token
+LLM_BASE_URL=http://localhost:1234/v1
+LLM_API_KEY=lm-studio
+LLM_MODEL_NAME=local-model
+```
 
-4. **Configure environment variables**
-
-   Create a `.env` file in the project root:
-
-   ```
-   DISCORD_BOT_TOKEN=your_discord_bot_token_here
-   ```
-
-5. **Start LM Studio** and load a model, then enable the local server (defaults to `http://localhost:1234`).
-
-## Usage
+4. Run the bot:
 
 ```bash
 python bot.py
 ```
 
-Once running, mention the bot in any Discord channel it has access to:
+## Required Discord Configuration
 
-| Command                  | Description                                              |
-|--------------------------|----------------------------------------------------------|
-| `@Bot [message]`         | Chat, ask questions, or attach images for analysis.      |
-| `@Bot role`              | Show the current global personality.                     |
-| `@Bot role [prompt]`     | Set a custom personality (clears history, saves memory). |
-| `@Bot role clear`        | Reset to default neutral behavior.                       |
-| `@Bot clear`             | Clear conversation history (saves memory first).         |
-| `@Bot memory`            | List users with stored core memories.                    |
-| `@Bot memory [name]`     | View stored facts about a specific user.                 |
-| `@Bot status`            | Show latency, loaded model, and token usage.             |
-| `@Bot help`              | Display the help menu.                                   |
+- Enable **Message Content Intent** for the bot application.
+- Invite the bot with permissions to read/send messages in target channels.
+- Use the bot in servers (DMs are intentionally ignored).
 
-You can also **reply** to any message and tag the bot to continue a specific thread of conversation.
+## Command Reference
 
-## Project Structure
+Use commands by mentioning the bot, for example: `@BotName help`
 
-```
-bot.py               # Main bot application (single-file)
-.env                 # Discord bot token (not committed)
-global_data.json     # Conversation history and active persona (auto-generated)
-core_memories.json   # Persistent per-user memory store (auto-generated)
-```
+- `help`: Show command help
+- `status`: Show latency, model status, and history metrics
+- `role`: Show current server personality
+- `role <prompt>`: Set server personality and reset chat history
+- `role clear`: Reset to default personality and clear server history
+- `clear`: Clear server conversation history
+- `memory`: List known users with stored core memories
+- `memory <name>`: Show stored facts for a user
+- `memory clear`: Delete your own memory and chat history in this server
 
-## How It Works
+Owner-only commands:
 
-1. When a user mentions the bot, the message (with optional images) is sent to the local LLM along with conversation history and relevant user memories.
-2. If the LLM determines it needs current information, it autonomously triggers a web search via DuckDuckGo and incorporates the results into its response.
-3. When conversation history exceeds 50 messages, the oldest messages are trimmed and a background task extracts permanent facts about each user into `core_memories.json`.
-4. These core memories are injected into the system prompt on every request, giving the bot long-term recall without unbounded context growth.
+- `force-forget @user`: Delete a specific user's data in the current server
+- `wipe-server-memories`: Delete all memory and chat history for the current server
+
+## Data and Memory Behavior
+
+- Chat history is stored per server in SQLite.
+- Core memories are keyed by `(server_id, user_id)`.
+- History capacity is managed with chunk eviction:
+  - When history reaches 50 records, the oldest 20 are extracted.
+  - Extracted messages are summarized into core memories asynchronously.
+- Memory and wipe operations include safeguards to prevent stale background tasks from restoring deleted data.
+
+## Notes
+
+- The bot uses a tool-calling loop for web search via DuckDuckGo when the model requests it.
+- Large images are resized and JPEG-compressed before sending to the LLM to reduce memory usage.
+- If the local model endpoint is offline, `status` will report it as unreachable.
 
 ## License
 
-[MIT](LICENSE)
+MIT. See `LICENSE`.

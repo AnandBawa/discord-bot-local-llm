@@ -4,6 +4,9 @@ import json
 import os
 import base64
 import contextlib
+import aiosqlite
+import io
+from PIL import Image
 from datetime import datetime
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -12,32 +15,41 @@ from ddgs import DDGS
 load_dotenv()
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
-lm_client = AsyncOpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'http://localhost:1234/v1')
+LLM_API_KEY = os.getenv('LLM_API_KEY', 'lm-studio')
+LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'local-model')
+
+lm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
 # --- DATA SETUP ---
-GLOBAL_DATA_FILE = "global_data.json"
-MEMORY_FILE = "core_memories.json"
+DB_FILE = "bot_database.db"
 MAX_HISTORY_LENGTH = 50 
 highest_token_count = 0
-global_lock = asyncio.Lock()
 memory_lock = asyncio.Lock()
+background_tasks = set()
+llm_queue = asyncio.Semaphore(3)
+pending_deletions = {}
 
-def load_json(filepath, default_val):
-    if os.path.exists(filepath):
-        with open(filepath, "r") as f:
-            return json.load(f)
-    return default_val
-
-def save_json(filepath, data):
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=4)
-
-# Initialize as an empty dictionary since we now store data per server_id
-global_data = load_json(GLOBAL_DATA_FILE, {})
+async def init_db():
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute('PRAGMA journal_mode=WAL;')
+        
+        await db.execute('''CREATE TABLE IF NOT EXISTS server_config
+                            (server_id TEXT PRIMARY KEY, prompt TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS chat_history
+                            (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                             server_id TEXT, role TEXT, content TEXT, 
+                             user_id TEXT, user_name TEXT)''')
+                             
+        # FIX: Make core memories isolated to specific servers
+        await db.execute('''CREATE TABLE IF NOT EXISTS core_memories
+                            (server_id TEXT, user_id TEXT, user_name TEXT, facts TEXT,
+                             PRIMARY KEY (server_id, user_id))''')
+        await db.commit()
 
 @contextlib.asynccontextmanager
 async def safe_typing(channel):
@@ -63,29 +75,44 @@ async def resolve_tool_error(error_message):
     return error_message
 
 async def send_help_menu(message, bot_name):
+    # 1. Base help text visible to EVERYONE
     help_text = (
         "**Here is how you can interact with me:**\n\n"
         f"• **`@{bot_name} [message]`** - Tag me to ask a question, chat, or analyze an attached image/sticker.\n"
         f"  Example: @{bot_name} what is the weather in Tokyo?\n\n"
-        f"• **`@{bot_name} role`** - Show my currently active global personality.\n"
+        f"• **`@{bot_name} role`** - Show my currently active server personality.\n"
         f"• **`@{bot_name} role [prompt]`** - Set a custom personality and wipe history (saves core memories first).\n"
         f"  Example: @{bot_name} role You are a grumpy history professor who hates technology.\n\n"
         f"• **`@{bot_name} role clear`** - Reset me to my default neutral behavior.\n"
-        f"• **`@{bot_name} clear`** - Wipe the global conversation history (saves core memories first).\n"
-        f"• **`@{bot_name} memory`** - View the list of users I have core memories for.\n"
+        f"• **`@{bot_name} clear`** - Wipe the server conversation history (saves core memories first).\n"
+        f"• **`@{bot_name} memory`** - View the list of users I have core memories for in this server.\n"
         f"• **`@{bot_name} memory [name]`** - View specific permanent facts learned about a person.\n"
-        f"  Example: @{bot_name} memory Charlie\n\n"
+        f"  Example: @{bot_name} memory Icy\n"
+        f"• **`@{bot_name} memory clear`** - Permanently erase your own core memories and chat history from this server.\n\n"
         f"• **`@{bot_name} status`** - Show my latency, loaded AI model, history capacity, and token usage.\n"
         f"• **`@{bot_name} help`** - Show this menu.\n\n"
+    )
+
+    # 2. DYNAMIC CHECK: Inject secret commands ONLY if the user is the bot owner
+    app_info = await client.application_info()
+    if message.author.id == app_info.owner.id:
+        help_text += (
+            "**Bot Owner Commands:**\n"
+            f"• **`@{bot_name} force-forget [@user]`** - Permanently erase a specific user's data from this server's database.\n"
+            f"• **`@{bot_name} wipe-server-memories`** - Erase EVERYONE'S core memories and chat history for this specific server.\n\n"
+        )
+
+    # 3. Append the tips at the very end for everyone
+    help_text += (
         "**Good to know:**\n"
         "> **Long-term Memory:** I remember the last 50 interactions in the channel. Core facts are automatically extracted and saved before history is cleared or naturally cycles out.\n"
         "> **Contextual Replies:** You can **reply** to an old message or image and tag me to continue that specific thought.\n"
         "> **Live Web Search:** If you ask about current events or facts I don't know, I will autonomously search the web to find the answer!"
     )
+    
     await message.reply(help_text)
 
 async def perform_web_search(query):
-    # GUARD: Prevent crashes if the LLM hallucinates an empty search
     if not query or not isinstance(query, str):
         return "Search error: Invalid or missing search query."
     
@@ -105,8 +132,9 @@ async def perform_web_search(query):
 
     print(f"🔍 AI initiated web search for: '{optimized_query}'")
     try:
+        # FIX: Wrap the generator in list() so all network I/O happens in the background thread!
         results = await asyncio.to_thread(
-            lambda: DDGS().text(optimized_query, max_results=3)
+            lambda: list(DDGS().text(optimized_query, max_results=3))
         )
             
         if not results:
@@ -119,16 +147,31 @@ async def perform_web_search(query):
     except Exception as e:
         return f"Search error: {e}"
     
-async def update_user_memory(user_id, user_name, forgotten_messages):
-    # FIX: Lock the ENTIRE process so simultaneous memory queues don't overwrite each other
+# FIX: Add server_id parameter to memory functions
+async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
+    task_start_time = datetime.now().timestamp()
+    
     async with memory_lock:
-        current_memories = load_json(MEMORY_FILE, {})
-        user_data = current_memories.get(str(user_id), {"name": user_name, "facts": "No core memories yet."})
-        existing_memory = user_data["facts"]
-        
+        async with aiosqlite.connect(DB_FILE) as db:
+            # Check for existing memory in THIS specific server
+            cursor = await db.execute("SELECT facts FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(user_id)))
+            row = await cursor.fetchone()
+            existing_memory = row[0] if row else "No core memories yet."
+            
         chat_log = ""
         for msg in forgotten_messages:
-            chat_log += f"{msg['role'].capitalize()}: {msg['content']}\n"
+            raw_content = msg['content']
+            try:
+                parsed_content = json.loads(raw_content)
+                if isinstance(parsed_content, list) and len(parsed_content) > 0 and isinstance(parsed_content[0], dict):
+                    text_only = next((item.get("text", "[Text Missing]") for item in parsed_content if item.get("type") == "text"), "[Image data]")
+                    raw_content = text_only
+                else:
+                    raw_content = str(parsed_content)
+            except (json.JSONDecodeError, TypeError):
+                pass
+                
+            chat_log += f"{msg['role'].capitalize()}: {raw_content}\n"
             
         memory_prompt = (
             f"You are an AI memory manager. Extract long-term, permanent facts about the user '{user_name}' from the chat log below. "
@@ -140,31 +183,36 @@ async def update_user_memory(user_id, user_name, forgotten_messages):
         )
         
         try:
-            response = await lm_client.chat.completions.create(
-                model="local-model",
-                messages=[{"role": "user", "content": memory_prompt}],
-                temperature=0.3, 
-                max_tokens=300
-            )
+            async with llm_queue:
+                response = await lm_client.chat.completions.create(
+                    model=LLM_MODEL_NAME,
+                    messages=[{"role": "user", "content": memory_prompt}],
+                    temperature=0.3, 
+                    max_tokens=300
+                )
             
             new_memory = response.choices[0].message.content.strip()
             
             if new_memory != existing_memory and new_memory:
-                # File is already safely locked from the top!
-                user_data["facts"] = new_memory
-                user_data["name"] = user_name 
-                current_memories[str(user_id)] = user_data
-                save_json(MEMORY_FILE, current_memories)
-                print(f"[Memory] Core memory updated for {user_name}.")
-            else:
-                print(f"[Memory] Scanned old messages, no new permanent facts found for {user_name}.")
+                # FIX: Check if either the specific user OR the entire server requested a wipe
+                if pending_deletions.get(str(user_id), 0) > task_start_time or pending_deletions.get(f"wipe_{server_id}", 0) > task_start_time:
+                    print(f"[Memory] Aborted save for {user_name} due to mid-generation wipe request.")
+                    return
                 
+                async with aiosqlite.connect(DB_FILE) as db:
+                    # FIX: Save the new memory bound to THIS server
+                    await db.execute('''INSERT INTO core_memories (server_id, user_id, user_name, facts) 
+                                        VALUES (?, ?, ?, ?) 
+                                        ON CONFLICT(server_id, user_id) DO UPDATE SET facts=excluded.facts, user_name=excluded.user_name''', 
+                                     (server_id, str(user_id), user_name, new_memory))
+                    await db.commit()
+                print(f"[Memory] Core memory updated for {user_name} in server {server_id}.")
         except Exception as e:
             print(f"Failed to update core memory for {user_name}: {e}")
 
-async def process_memories_sequentially(users_dict, forgotten_messages):
+async def process_memories_sequentially(server_id, users_dict, forgotten_messages):
     for uid, uname in users_dict.items():
-        await update_user_memory(uid, uname, forgotten_messages)
+        await update_user_memory(server_id, uid, uname, forgotten_messages)
         await asyncio.sleep(1)
 
 tools_schema = [
@@ -189,8 +237,9 @@ tools_schema = [
 
 @client.event
 async def on_ready():
+    await init_db()
     print(f'✅ Logged in successfully as {client.user}')
-    print('🌐 Autonomous Web Search capability enabled!')
+    print('🌐 Database & Autonomous Web Search enabled!')
 
 @client.event
 async def on_message(message):
@@ -204,12 +253,6 @@ async def on_message(message):
         return
         
     server_id = str(message.guild.id)
-    
-    # Initialize this specific server in the JSON if it's their first time talking
-    async with global_lock:
-        if server_id not in global_data:
-            global_data[server_id] = {"history": [], "prompt": ""}
-            save_json(GLOBAL_DATA_FILE, global_data)
 
     # Stripping logic that handles both @Name and @Nickname formats
     bot_mention = f'<@{client.user.id}>'
@@ -225,7 +268,11 @@ async def on_message(message):
             clean_message = clean_message.replace(f"<@!{mentioned_user.id}>", f"@{memory_formatted_name}")
 
     if clean_message.lower() == 'role':
-        current_role = global_data[server_id].get("prompt")
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
+            row = await cursor.fetchone()
+            current_role = row[0] if row and row[0] else None
+
         if current_role:
             await message.reply(f"**Current Server Personality:**\n> *{current_role}*")
         else:
@@ -235,15 +282,19 @@ async def on_message(message):
     if clean_message.lower().startswith('role '):
         new_prompt = clean_message[5:].strip() 
         if new_prompt.lower() == 'clear':
-            async with global_lock:
-                history_to_save = global_data[server_id].get("history", [])
-                if history_to_save:
+            async with aiosqlite.connect(DB_FILE) as db:
+                cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+                rows = await cursor.fetchall()
+                if rows:
+                    history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
                     users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-                    asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
+                    task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
+                    background_tasks.add(task)
+                    task.add_done_callback(background_tasks.discard)
                 
-                global_data[server_id]["prompt"] = ""
-                global_data[server_id]["history"] = [] 
-                save_json(GLOBAL_DATA_FILE, global_data)
+                await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+                await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
+                await db.commit()
             
             default_persona = "You are a neutral, conversational AI."
             await message.reply(
@@ -251,28 +302,42 @@ async def on_message(message):
                 f"**Current Personality:**\n> {default_persona}"
             )
             return
+            
         if not new_prompt:
             await message.reply(f"Please provide a prompt! Example: `@{client.user.name} role You are a pirate.`")
             return
-        async with global_lock:
-            history_to_save = global_data[server_id].get("history", [])
-            if history_to_save:
+            
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+            rows = await cursor.fetchall()
+            if rows:
+                history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
                 users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-                asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
-            global_data[server_id]["prompt"] = new_prompt
-            global_data[server_id]["history"] = [] 
-            save_json(GLOBAL_DATA_FILE, global_data)
+                task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+            
+            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+            await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt))
+            await db.commit()
+            
         await message.reply(f"✅ Saved server personality and cleared conversation history for a fresh start! *(Recent memories were saved)*\n> *{new_prompt}*")
         return
 
     if clean_message.lower() == 'clear':
-        async with global_lock:
-            history_to_save = global_data[server_id].get("history", [])
-            if history_to_save:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+            rows = await cursor.fetchall()
+            if rows:
+                history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
                 users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-                asyncio.create_task(process_memories_sequentially(users_in_history, history_to_save))
-            global_data[server_id]["history"] = []
-            save_json(GLOBAL_DATA_FILE, global_data)
+                task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+            
+            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+            await db.commit()
+            
         await message.reply("🗑️ Server conversation history cleared! *(Recent memories were saved)*")
         return
     
@@ -288,56 +353,131 @@ async def on_message(message):
             current_model = models_response.data[0].id if models_response.data else "None"
         except Exception:
             current_model = f"Offline / Unreachable"
+            
+        async with aiosqlite.connect(DB_FILE) as db:
+            cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
+            history_length = (await cursor.fetchone())[0]
+            
         diagnostics = (
             "**Bot Diagnostics & Status**\n\n"
             f"• **Discord Ping:** `{ping_ms}ms`\n"
             f"• **Loaded AI Model:** `{current_model}`\n"
             f"• **Peak Context Used:** `{highest_token_count} tokens`\n"
-            f"• **Current History Length:** `{len(global_data[server_id]['history'])}/{MAX_HISTORY_LENGTH} messages`"
+            f"• **Current History Length:** `{history_length}/{MAX_HISTORY_LENGTH} messages`"
         )
         await status_msg.edit(content=diagnostics)
         return
     
+    if clean_message.lower().startswith('force-forget'):
+        # 1. Verify the user is the official Bot Owner
+        app_info = await client.application_info()
+        if message.author.id != app_info.owner.id:
+            await message.reply("⛔ **Permission denied.** Only the bot owner can use this command.")
+            return
+            
+        # 2. Extract the mentioned user (ignoring the bot itself)
+        target_user = next((u for u in message.mentions if u.id != client.user.id), None)
+        if not target_user:
+            await message.reply("Please mention the user you want to erase. Example: `@Bot force-forget @User`")
+            return
+            
+        target_id = str(target_user.id)
+        
+        # 3. Apply the timestamp shield to prevent background tasks from reviving them
+        pending_deletions[target_id] = datetime.now().timestamp()
+        
+        # 4. Shred their data
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, target_id))
+            await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, target_id))
+            await db.commit()
+            
+        await message.reply(f"🗑️ **Admin Override Executed.** All data for **{target_user.display_name}** has been permanently erased from the database.")
+        return
+    
+    # --- ADMIN: WIPE ENTIRE SERVER DATABASE ---
+    if clean_message.lower() == 'wipe-server-memories':
+        # 1. Verify the user is the official Bot Owner
+        app_info = await client.application_info()
+        if message.author.id != app_info.owner.id:
+            await message.reply("⛔ **Permission denied.** Only the bot owner can use this command.")
+            return
+            
+        # 2. Shield THIS server from any currently running background tasks reviving data
+        pending_deletions[f"wipe_{server_id}"] = datetime.now().timestamp()
+        
+        # 3. Shred everything strictly for THIS server (using server_id)
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute("DELETE FROM core_memories WHERE server_id = ?", (server_id,))
+            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+            await db.commit()
+            
+        await message.reply("☢️ **SERVER WIPED.** All core memories and chat histories for **this specific server** have been permanently erased. Data in other servers remains safe.")
+        return
+    
     if clean_message.lower().startswith('memory'):
-        current_memories = load_json(MEMORY_FILE, {})
-        if not current_memories:
-            await message.reply("I don't have any core memories saved yet.")
+        command_parts = clean_message.split()
+        
+        # NEW FEATURE: User-controlled memory deletion
+        if len(command_parts) == 2 and command_parts[1].lower() == 'clear':
+            
+            # FIX: Record exactly when the user requested the wipe
+            pending_deletions[str(message.author.id)] = datetime.now().timestamp()
+            
+            async with aiosqlite.connect(DB_FILE) as db:
+                await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(message.author.id)))
+                await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, str(message.author.id)))
+                await db.commit()
+            await message.reply("🗑️ **Forget successful.** All your core memories and recent chat history have been permanently erased from my database.")
             return
 
-        command_parts = clean_message.split()
-        if len(command_parts) > 1:
-            target_name = " ".join(command_parts[1:]).lower()
+        async with aiosqlite.connect(DB_FILE) as db:
+            # Build the active users list for the current server
+            cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
+            active_users = [str(r[0]) for r in await cursor.fetchall()]
+            active_users.append(str(message.author.id))
+            active_users = list(set(active_users))
             
-            # FIX: Build the active users list for the targeted search
-            active_users = {str(message.author.id)}
-            for msg in global_data[server_id].get("history", []):
-                if "user_id" in msg: active_users.add(str(msg["user_id"]))
+            if len(command_parts) > 1:
+                target_name = " ".join(command_parts[1:]).lower()
+                found_user = None
                 
-            found_user = None
-            # FIX: Only search for the name if they are in the active_users set
-            for uid in active_users:
-                if uid in current_memories and target_name in current_memories[uid]['name'].lower():
-                    found_user = current_memories[uid]
-                    break
+                if active_users:
+                    placeholders = ','.join('?' * len(active_users))
                     
-            if found_user:
-                memory_text = f"**Facts known about {found_user['name']}:**\n{found_user['facts']}"
+                    # FIX: Make the specific user memory search strictly isolated to this server
+                    params = [server_id] + active_users
+                    cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+                    
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        if target_name in row[0].lower():
+                            found_user = {"name": row[0], "facts": row[1]}
+                            break
+                        
+                if found_user:
+                    memory_text = f"**Facts known about {found_user['name']}:**\n{found_user['facts']}"
+                else:
+                    memory_text = f"I couldn't find any memories for '{target_name}' in this server's recent chat history."
             else:
-                memory_text = f"I couldn't find any memories for '{target_name}' in this server's recent chat history."
-        else:
-            # FIX: Only list users active in the current server's history
-            active_users = {str(message.author.id)}
-            for msg in global_data[server_id].get("history", []):
-                if "user_id" in msg: active_users.add(str(msg["user_id"]))
+                memory_text = f"**Tracked Active Users**\nType `@{client.user.name} memory [name]` to search all known users.\nType `@{client.user.name} memory clear` to erase your own data.\n\n"
+                found_any = False
                 
-            memory_text = f"**Tracked Active Users**\nType `@{client.user.name} memory [name]` to search all known users.\n\n"
-            found_any = False
-            for uid in active_users:
-                if uid in current_memories and current_memories[uid]['facts'] and current_memories[uid]['facts'] != "No core memories yet.":
-                    memory_text += f"• {current_memories[uid]['name']}\n"
-                    found_any = True
-            if not found_any:
-                memory_text += "*No core memories found for active users in this chat.*"
+                if active_users:
+                    placeholders = ','.join('?' * len(active_users))
+                    
+                    # FIX: Make the global memory list strictly isolated to this server
+                    params = [server_id] + active_users
+                    cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+                    
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        if row[1] and row[1] != "No core memories yet.":
+                            memory_text += f"• {row[0]}\n"
+                            found_any = True
+                            
+                if not found_any:
+                    memory_text += "*No core memories found for active users in this chat.*"
         
         chunk_size = 1990
         remaining_text = memory_text
@@ -391,8 +531,24 @@ async def on_message(message):
     if image_attachments or valid_stickers:
         api_user_content.append({"type": "text", "text": text_part})
         for img in image_attachments:
-            img_bytes = await img.read(); img_b64 = base64.b64encode(img_bytes).decode('utf-8')
-            api_user_content.append({"type": "image_url", "image_url": {"url": f"data:{img.content_type};base64,{img_b64}"}})
+            img_bytes = await img.read()
+            
+            # FIX: VRAM Optimization - Resize massive images before sending to local LLM
+            with Image.open(io.BytesIO(img_bytes)) as pil_img:
+                # Convert RGBA (transparent PNGs) to RGB to prevent JPEG conversion crashes
+                if pil_img.mode in ("RGBA", "P"):
+                    pil_img = pil_img.convert("RGB")
+                    
+                # thumbnail() mathematically shrinks the image to fit within the box while keeping aspect ratio
+                pil_img.thumbnail((1024, 1024))
+                
+                # Save it into a new buffer as a standardized, compressed JPEG
+                buffer = io.BytesIO()
+                pil_img.save(buffer, format="JPEG", quality=85)
+                
+                img_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                
+            api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
         for sticker in valid_stickers:
             sticker_bytes = await sticker.read(); sticker_b64 = base64.b64encode(sticker_bytes).decode('utf-8')
             api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
@@ -401,43 +557,65 @@ async def on_message(message):
     current_system_prompt = (
         f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\n"
         "CRITICAL INSTRUCTIONS:\n"
-        "1. EXTREME BREVITY: Answer in 1-5 sentences unless asked otherwise.\n"
+        "1. EXTREME BREVITY: Answer in 1-3 sentences unless asked otherwise.\n"
         "2. MULTI-USER CHAT: Address users by their names when appropriate.\n"
         "3. SEARCH DIRECTIVE: Use the web_search tool if current info is needed. NEVER guess.\n"
         "4. STRICT RULE: Do not use emojis unless your personality requires it.\n"
         "5. MEMORY USAGE (CRITICAL): Use user facts below silently. NEVER repeat facts back unless asked."
     )
     
-    current_memories = load_json(MEMORY_FILE, {})
-    
-    # FIX: Only inject memories of users actively participating in THIS server's conversation
-    active_users = {str(message.author.id)}
-    for msg in global_data[server_id].get("history", []):
-        if "user_id" in msg:
-            active_users.add(str(msg["user_id"]))
-            
     user_context_str = ""
-    for uid in active_users:
-        if uid in current_memories and current_memories[uid]['facts'] != "No core memories yet.":
-            user_context_str += f"- {current_memories[uid]['name']}: {current_memories[uid]['facts']}\n"
-            
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Fetch Active Users
+        cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
+        active_user_ids = [str(r[0]) for r in await cursor.fetchall()]
+        active_user_ids.append(str(message.author.id))
+        active_user_ids = list(set(active_user_ids))
+        
+        # Inject Memories
+        if active_user_ids:
+            placeholders = ','.join('?' * len(active_user_ids))
+            # Include server_id in the parameters list
+            params = [server_id] + active_user_ids 
+            cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+            rows = await cursor.fetchall()
+            for row in rows:
+                if row[1] != "No core memories yet.":
+                    user_context_str += f"- {row[0]}: {row[1]}\n"
+                    
+        # Fetch Role
+        cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
+        row = await cursor.fetchone()
+        base_personality = row[0] if row and row[0] else "You are a neutral, conversational AI."
+
     if user_context_str: 
         current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT ACTIVE USERS (READ ONLY - DO NOT REPEAT):\n{user_context_str}"
 
-    base_personality = global_data[server_id].get("prompt") or "You are a neutral, conversational AI."
     current_system_prompt += f"\n\nYOUR ASSIGNED PERSONA AND ROLE:\n{base_personality}"
     system_message = {"role": "system", "content": current_system_prompt}
 
-    history_text_save = text_part
-    total_visuals = len(image_attachments) + len(valid_stickers)
-    if total_visuals > 0: history_text_save += f" [User attached {total_visuals} visual(s)]"
-
-    # --- START OF CONCURRENCY FIX ---
-    # 1. Grab a snapshot of current history WITHOUT locking or appending yet
-    async with global_lock:
-        raw_history = list(global_data[server_id].get("history", []))
+    # Grab a snapshot of current history
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT role, content FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
         
-    api_history = [{"role": m["role"], "content": m["content"]} for m in raw_history]
+        api_history = []
+        for r in await cursor.fetchall():
+            try:
+                parsed_content = json.loads(r[1])
+                
+                # FIX: Prevent json.loads from hijacking pure numbers or raw text arrays
+                if isinstance(parsed_content, list):
+                    # Ensure it is a Vision array (contains dicts), otherwise revert to string
+                    if len(parsed_content) > 0 and not isinstance(parsed_content[0], dict):
+                        parsed_content = r[1]
+                elif not isinstance(parsed_content, str):
+                    # If it parsed into an int, float, or bool, revert it to string
+                    parsed_content = str(parsed_content)
+                    
+            except (json.JSONDecodeError, TypeError):
+                parsed_content = r[1] # Fallback for older messages
+                
+            api_history.append({"role": r[0], "content": parsed_content})
         
     cleaned_history = []
     for msg in api_history:
@@ -445,126 +623,174 @@ async def on_message(message):
             if msg["role"] == "assistant": cleaned_history.append({"role": "user", "content": "[Conversation Started]"})
             cleaned_history.append(msg)
         else:
-            if cleaned_history[-1]["role"] == msg["role"]: cleaned_history[-1]["content"] += f"\n\n{msg['content']}"
-            else: cleaned_history.append(msg)
+            if cleaned_history[-1]["role"] == msg["role"]:
+                c1 = cleaned_history[-1]["content"]
+                c2 = msg["content"]
+                
+                # Scenario A: Both are simple text strings
+                if isinstance(c1, str) and isinstance(c2, str):
+                    cleaned_history[-1]["content"] = f"{c1}\n\n{c2}"
+                # Scenario B: One or both are vision arrays (lists)
+                else:
+                    # Convert strings to OpenAI text dicts if necessary
+                    list1 = [{"type": "text", "text": c1}] if isinstance(c1, str) else c1.copy()
+                    list2 = [{"type": "text", "text": f"\n\n{c2}"}] if isinstance(c2, str) else c2.copy()
+                    # Safely merge the two lists
+                    cleaned_history[-1]["content"] = list1 + list2
+            else: 
+                cleaned_history.append(msg)
                 
     if cleaned_history and cleaned_history[-1]["role"] == "user":
-        if isinstance(api_user_content, str): cleaned_history[-1]["content"] += f"\n\n{api_user_content}"
+        c1 = cleaned_history[-1]["content"]
+        c2 = api_user_content
+        
+        # Scenario A: Both are simple text strings
+        if isinstance(c1, str) and isinstance(c2, str):
+            cleaned_history[-1]["content"] = f"{c1}\n\n{c2}"
+        # Scenario B: One or both are vision arrays (lists)
         else:
-            prev_text = cleaned_history[-1]["content"]
-            merged_content = [{"type": "text", "text": f"{prev_text}\n\n{api_user_content[0]['text']}"}] + api_user_content[1:]
-            cleaned_history[-1]["content"] = merged_content
-    else: cleaned_history.append({"role": "user", "content": api_user_content})
+            # Convert strings to OpenAI text dicts if necessary
+            list1 = [{"type": "text", "text": c1}] if isinstance(c1, str) else c1.copy()
+            list2 = [{"type": "text", "text": f"\n\n{c2}"}] if isinstance(c2, str) else c2.copy()
+            # Safely merge the two lists
+            cleaned_history[-1]["content"] = list1 + list2
+    else: 
+        cleaned_history.append({"role": "user", "content": api_user_content})
         
     messages_to_send = [system_message] + cleaned_history
 
     async with safe_typing(message.channel):
-        try:
-            # 2. Make API Call with a Loop for chained tool calls
-            max_iterations = 3
-            current_iteration = 0
-            final_reply = ""
-            search_context_for_history = ""
-            
-            response = await lm_client.chat.completions.create(model="local-model", messages=messages_to_send, tools=tools_schema, tool_choice="auto", temperature=1, max_tokens=1000)
-            if response.usage and response.usage.total_tokens > highest_token_count: highest_token_count = response.usage.total_tokens
-            response_message = response.choices[0].message
-            
-            while current_iteration < max_iterations:
-                if response_message.tool_calls:
-                    messages_to_send.append(response_message.model_dump(exclude_none=True))
-                    search_tasks = []; tool_call_metadata = []
-                    
-                    for tool_call in response_message.tool_calls:
-                        if tool_call.function.name == "web_search":
-                            try:
-                                args = json.loads(tool_call.function.arguments)
-                                search_tasks.append(perform_web_search(args.get("query")))
-                                tool_call_metadata.append(tool_call)
-                            except json.JSONDecodeError:
-                                # FIX: Evaluated immediately, no closure traps
-                                search_tasks.append(resolve_tool_error("System error: Invalid JSON."))
-                                tool_call_metadata.append(tool_call)
-                        else:
-                            # FIX: Evaluated immediately
-                            error_str = f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
-                            search_tasks.append(resolve_tool_error(error_str))
-                            tool_call_metadata.append(tool_call)
-                    
-                    if search_tasks:
-                        completed_results = await asyncio.gather(*search_tasks)
-                        search_context_for_history += "\n".join(completed_results) + "\n" # Accumulate history
-                        
-                        for tool_call, result_text in zip(tool_call_metadata, completed_results):
-                            messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
-                    
-                    # Request the next step from the model (NOW WITH TOOLS AND TRACKING!)
-                    response = await lm_client.chat.completions.create(
-                        model="local-model", 
-                        messages=messages_to_send, 
-                        tools=tools_schema, # FIX: Re-enable tools for chaining!
-                        tool_choice="auto", 
-                        temperature=1, 
-                        max_tokens=1000
-                    )
-                    
-                    # FIX: Accurately track the heavier chained requests
-                    if response.usage and response.usage.total_tokens > highest_token_count: 
-                        highest_token_count = response.usage.total_tokens
-                        
-                    response_message = response.choices[0].message
-                    current_iteration += 1
-                else:
-                    # The model returned a text response! Break the loop.
-                    final_reply = response_message.content
-                    break
-            
-            # Fallback if the model chained tools too many times or returned empty content
-            if not final_reply:
-                final_reply = response_message.content or "⚠️ *System error: Reached max tool iterations or empty response.*"
+        async with llm_queue:
+            try:
+                max_iterations = 3
+                current_iteration = 0
+                final_reply = ""
                 
-            history_save_text = f"[Internal Web Search Context:\n{search_context_for_history.strip()}]\n\n{final_reply}" if search_context_for_history else final_reply
-            
-            # 3. ATOMIC PAIR INSERTION: Append User AND Assistant simultaneously to prevent scrambling
-            async with global_lock:
-                global_data[server_id].setdefault("history", []).append({"role": "user", "content": history_text_save, "user_id": str(message.author.id), "user_name": user_name})
-                global_data[server_id]["history"].append({"role": "assistant", "content": history_save_text})
+                response = await lm_client.chat.completions.create(model=LLM_MODEL_NAME, messages=messages_to_send, tools=tools_schema, tool_choice="auto", temperature=1, max_tokens=1000)
+                if response.usage and response.usage.total_tokens > highest_token_count: highest_token_count = response.usage.total_tokens
+                response_message = response.choices[0].message
                 
-                if len(global_data[server_id]["history"]) > MAX_HISTORY_LENGTH:
-                    # Dynamic slice prevents Parity Overlap bugs
-                    forgotten = global_data[server_id]["history"][:-MAX_HISTORY_LENGTH]
-                    global_data[server_id]["history"] = global_data[server_id]["history"][-MAX_HISTORY_LENGTH:]
-                    
-                    # Extract ALL unique users from the forgotten messages (Fixes Memory Dropout)
-                    users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten if msg.get("user_id")}
-                    if users_in_forgotten:
-                        asyncio.create_task(process_memories_sequentially(users_in_forgotten, forgotten))
-                save_json(GLOBAL_DATA_FILE, global_data)
-            
-            remaining_text = final_reply; is_first = True
-            while len(remaining_text) > 0:
-                if len(remaining_text) <= 1990: chunk = remaining_text; remaining_text = ""
-                else:
-                    split_index = remaining_text.rfind('\n', 0, 1990)
-                    if split_index == -1: split_index = remaining_text.rfind(' ', 0, 1990)
-                    if split_index == -1: split_index = 1990
-                    else: split_index += 1 
-                    chunk = remaining_text[:split_index]; remaining_text = remaining_text[split_index:]
-                try:
-                    if is_first:
-                        try: await message.reply(chunk)
-                        except discord.HTTPException as http_exc:
-                            if http_exc.code == 50035: await message.channel.send(f"<@{message.author.id}> {chunk}")
-                            else: raise http_exc
-                        is_first = False
+                while current_iteration < max_iterations:
+                    if response_message.tool_calls:
+                        # FIX: Safely dump the model but force the 'content' key to exist to prevent schema crashes
+                        msg_dump = response_message.model_dump(exclude_none=True)
+                        if "content" not in msg_dump:
+                            msg_dump["content"] = "" # Satisfies the strict OpenAI schema requirement
+                        messages_to_send.append(msg_dump)
+                        
+                        search_tasks = []; tool_call_metadata = []
+                        
+                        for tool_call in response_message.tool_calls:
+                            if tool_call.function.name == "web_search":
+                                try:
+                                    args = json.loads(tool_call.function.arguments)
+                                    
+                                    # FIX: Ensure the LLM didn't hallucinate a string or list before using .get()
+                                    if isinstance(args, dict):
+                                        search_tasks.append(perform_web_search(args.get("query")))
+                                    else:
+                                        search_tasks.append(resolve_tool_error("System error: Tool arguments must be a valid JSON object."))
+                                        
+                                    tool_call_metadata.append(tool_call)
+                                except json.JSONDecodeError:
+                                    search_tasks.append(resolve_tool_error("System error: Invalid JSON."))
+                                    tool_call_metadata.append(tool_call)
+                            else:
+                                error_str = f"System error: Tool '{tool_call.function.name}' does not exist. Do not use it."
+                                search_tasks.append(resolve_tool_error(error_str))
+                                tool_call_metadata.append(tool_call)
+                        
+                        if search_tasks:
+                            completed_results = await asyncio.gather(*search_tasks)
+                            
+                            for tool_call, result_text in zip(tool_call_metadata, completed_results):
+                                messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
+                        
+                        response = await lm_client.chat.completions.create(
+                            model=LLM_MODEL_NAME, 
+                            messages=messages_to_send, 
+                            tools=tools_schema, 
+                            tool_choice="auto", 
+                            temperature=1, 
+                            max_tokens=1000
+                        )
+                        
+                        if response.usage and response.usage.total_tokens > highest_token_count: 
+                            highest_token_count = response.usage.total_tokens
+                            
+                        response_message = response.choices[0].message
+                        current_iteration += 1
                     else:
-                        async with safe_typing(message.channel): await asyncio.sleep(1.5) 
-                        await message.channel.send(chunk)
-                except discord.Forbidden: break
-        except Exception as e:
-            print(f"Error: {e}")
-            try: await message.reply("Oops! I couldn't process that.")
-            except: pass
-            return
+                        final_reply = response_message.content
+                        break
+                
+                if not final_reply:
+                    final_reply = response_message.content or "⚠️ *System error: Reached max tool iterations or empty response.*"
+                    
+                # 3. ATOMIC PAIR INSERTION & CHUNKED PRUNING VIA SQLITE
+                async with aiosqlite.connect(DB_FILE) as db:
+                    # Convert the full multimodal arrays into JSON strings for storage (Vision Bug Fix)
+                    db_user_content = json.dumps(api_user_content)
+                    
+                    # FIX: Save ONLY the final synthesized reply! (No JSON encoding needed for strings)
+                    db_assistant_content = final_reply
+                    
+                    await db.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", 
+                                    (server_id, "user", db_user_content, str(message.author.id), user_name))
+                    # FIX: Tag the assistant's reply with the user's ID so 'memory clear' deletes the full interaction!
+                    await db.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", 
+                                    (server_id, "assistant", db_assistant_content, str(message.author.id), user_name))
+                    
+                    # FIX: "Chunked Eviction" - Check current history length
+                    cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
+                    current_count = (await cursor.fetchone())[0]
+                    
+                    # If history hits 50, slice the oldest 20 messages for bulk summarization
+                    if current_count >= 50:
+                        cursor = await db.execute('''SELECT id, role, content, user_id, user_name FROM chat_history 
+                                                    WHERE server_id = ? ORDER BY id ASC LIMIT 20''', (server_id,))
+                        forgotten_rows = await cursor.fetchall()
+                        
+                        if forgotten_rows:
+                            forgotten_msgs = [{"role": r[1], "content": r[2], "user_id": r[3], "user_name": r[4]} for r in forgotten_rows]
+                            users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten_msgs if msg.get("user_id")}
+                            
+                            if users_in_forgotten:
+                                task = asyncio.create_task(process_memories_sequentially(server_id, users_in_forgotten, forgotten_msgs))
+                                background_tasks.add(task)
+                                task.add_done_callback(background_tasks.discard)
+                                
+                            # Safely delete only the exact 20 messages we just extracted
+                            ids_to_delete = [r[0] for r in forgotten_rows]
+                            placeholders = ','.join('?' * len(ids_to_delete))
+                            await db.execute(f"DELETE FROM chat_history WHERE id IN ({placeholders})", ids_to_delete)
+                    
+                    await db.commit()
+                
+                remaining_text = final_reply; is_first = True
+                while len(remaining_text) > 0:
+                    if len(remaining_text) <= 1990: chunk = remaining_text; remaining_text = ""
+                    else:
+                        split_index = remaining_text.rfind('\n', 0, 1990)
+                        if split_index == -1: split_index = remaining_text.rfind(' ', 0, 1990)
+                        if split_index == -1: split_index = 1990
+                        else: split_index += 1 
+                        chunk = remaining_text[:split_index]; remaining_text = remaining_text[split_index:]
+                    try:
+                        if is_first:
+                            try: await message.reply(chunk)
+                            except discord.HTTPException as http_exc:
+                                if http_exc.code == 50035: await message.channel.send(f"<@{message.author.id}> {chunk}")
+                                else: raise http_exc
+                            is_first = False
+                        else:
+                            async with safe_typing(message.channel): await asyncio.sleep(1.5) 
+                            await message.channel.send(chunk)
+                    except discord.Forbidden: break
+            except Exception as e:
+                print(f"Error: {e}")
+                try: await message.reply("Oops! I couldn't process that.")
+                except: pass
+                return
 
 if TOKEN: client.run(TOKEN)
