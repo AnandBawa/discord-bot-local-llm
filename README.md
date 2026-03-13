@@ -1,17 +1,23 @@
 # Discord Bot with Local LLM
 
-A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM endpoint (for example, LM Studio), supports multimodal prompts (text + images/stickers), keeps per-server chat memory, and performs autonomous web search when needed.
+A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM endpoint (for example, LM Studio), supports multimodal prompts (text, images, stickers, and PDFs), ingests content from URLs, keeps per-server chat memory, and performs autonomous web search when needed.
 
 ## What It Does
 
 - Responds when the bot is mentioned in a server channel
 - Uses an OpenAI-compatible chat API via configurable base URL
 - Supports image and sticker understanding in prompts
+- Supports PDF attachments (extracts text and adds it to model context)
+- Ingests URLs found in messages:
+  - Web pages and plain text pages are fetched and cleaned
+  - Direct image URLs are treated like image attachments
+  - Direct PDF URLs are parsed and added as text context
 - Maintains per-server chat history in SQLite
 - Extracts and stores per-user core memories per server
 - Supports server-level personality prompts (`role` command)
 - Exposes diagnostic and memory management commands
 - Allows owner-only administrative data wipe commands
+- Ignores DMs by design (server-only operation)
 
 ## Tech Stack
 
@@ -22,6 +28,9 @@ A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM e
 - `python-dotenv`
 - `ddgs` (DuckDuckGo search)
 - `Pillow`
+- `aiohttp`
+- `beautifulsoup4`
+- `PyMuPDF`
 
 ## Project Structure
 
@@ -35,7 +44,7 @@ A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM e
 2. Install dependencies:
 
 ```bash
-pip install discord.py openai aiosqlite python-dotenv ddgs pillow
+pip install discord.py openai aiosqlite python-dotenv ddgs pillow aiohttp beautifulsoup4 pymupdf
 ```
 
 3. Create a `.env` file:
@@ -86,12 +95,25 @@ Owner-only commands:
   - When history reaches 50 records, the oldest 20 are extracted.
   - Extracted messages are summarized into core memories asynchronously.
 - Memory and wipe operations include safeguards to prevent stale background tasks from restoring deleted data.
+- Large extracted context from PDFs and URLs is treated as ephemeral runtime context:
+  - It is sent to the model for the current response.
+  - Lightweight message content is stored in the database instead of full scraped blobs.
+- Historical image payloads are scrubbed from replay context to reduce KV-cache and VRAM pressure.
+
+## Input Limits and Safety Guards
+
+- 10MB limit for attached images and PDFs.
+- 10MB limit for URL-fetched files.
+- PDF extraction is capped to the first 16 pages (index 0 through 15).
+- Extracted webpage and PDF text is truncated to 40,000 characters.
+- Unsupported URL content types are skipped with a system note.
 
 ## Notes
 
 - The bot uses a tool-calling loop for web search via DuckDuckGo when the model requests it.
-- Large images are resized and JPEG-compressed before sending to the LLM to reduce memory usage.
-- If the local model endpoint is offline, `status` will report it as unreachable.
+- Large images are resized to fit within 1024x1024 and JPEG-compressed before sending to the LLM.
+- If a non-vision model is loaded and media is sent, the bot replies with a compatibility warning.
+- If the local model endpoint is offline, `status` reports it as `Offline / Unreachable`.
 
 ## License
 
