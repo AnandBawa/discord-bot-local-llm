@@ -1,4 +1,4 @@
-# discord-bot-local-llm
+# Discord Bot with Local LLM
 
 A Discord mention-based chatbot that connects to a local OpenAI-compatible LLM endpoint (for example, LM Studio), supports multimodal prompts (text + images/stickers), keeps per-server chat memory, and performs autonomous web search when needed.
 
