@@ -14,7 +14,7 @@ A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interf
 ## Prerequisites
 
 - Python 3.8 or higher.
-- A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal).
+- A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal). When creating OAuth2 URL for bot invite, select **bot** and **application.commands** under **Scopes**, **View Channels** and **Send Messages** under **Bot Permissions**. You can add more scopes/permissions as per requirements.
 - An active LLM API endpoint (defaults to a local instance running on `http://localhost:1234/v1` but can be configured for cloud providers).
 
 ## Installation
