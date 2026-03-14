@@ -209,4 +209,4 @@ __marimo__/
 venv_bot/
 global_data.json
 core_memories.json
-bot_database.db
+bot_database.*

@@ -39,6 +39,11 @@ logging.basicConfig(
     ]
 )
 
+# Silence the noisy HTTP request logs from underlying libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'http://localhost:1234/v1')
 LLM_API_KEY = os.getenv('LLM_API_KEY', 'lm-studio')
 LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'local-model')
@@ -47,7 +52,48 @@ lm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+
+class MyAIClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Neatly encapsulate our state variables inside the bot instance
+        self.memory_lock = None
+        self.llm_queue = None
+        self.db_conn = None
+
+    async def setup_hook(self):
+        """Native discord.py hook that runs exactly ONCE before connection."""
+        # 1. Initialize primitives safely inside the event loop
+        self.memory_lock = asyncio.Lock()
+        self.llm_queue = asyncio.Semaphore(3)
+        
+        # 2. Initialize the Database
+        self.db_conn = await aiosqlite.connect(DB_FILE)
+        await self.db_conn.execute('PRAGMA journal_mode=WAL;')
+        await init_db()
+        
+        # 3. Sync Slash Commands globally
+        await tree.sync()
+        logging.info('🔄 Database loaded and Slash Commands synced globally!')
+
+    async def close(self):
+        """Native override for graceful shutdown."""
+        logging.info("Shutdown signal received. Waiting for background memory tasks to finish...")
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+            logging.info("All background tasks completed. Memories safely saved.")
+            
+        # Safely close the instance's database connection
+        if self.db_conn:
+            await self.db_conn.close()
+            logging.info("Database connection closed safely.")
+            
+        logging.info("Disconnecting from Discord. Goodbye!")
+        # Call the original discord.Client close method safely
+        await super().close()
+
+# Instantiate your new custom class!
+client = MyAIClient(intents=intents)
 
 # --- SLASH COMMAND SETUP ---
 tree = app_commands.CommandTree(client)
@@ -85,11 +131,8 @@ highest_token_count = 0
 background_tasks = set()                            
 pending_deletions = {}                              
 server_personas_cache = {}                          # RAM cache for server personas
-synced_commands = False
 
-# FIX: Initialized as None to prevent Python 3.8/3.9 event loop crashes
-memory_lock = None                                  
-llm_queue = None                                  
+# (Global variables for lock, queue, and db_conn have been removed. They are now accessed via client.*)
 
 # ==========================================
 # 1. CORE DATABASE & UTILITY FUNCTIONS
@@ -97,12 +140,10 @@ llm_queue = None
 
 async def init_db():
     """Initializes SQLite tables for configuration, history, and long-term memory."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute('PRAGMA journal_mode=WAL;')
-        await db.execute('''CREATE TABLE IF NOT EXISTS server_config (server_id TEXT PRIMARY KEY, prompt TEXT)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, role TEXT, content TEXT, user_id TEXT, user_name TEXT)''')
-        await db.execute('''CREATE TABLE IF NOT EXISTS core_memories (server_id TEXT, user_id TEXT, user_name TEXT, facts TEXT, PRIMARY KEY (server_id, user_id))''')
-        await db.commit()
+    await client.db_conn.execute('''CREATE TABLE IF NOT EXISTS server_config (server_id TEXT PRIMARY KEY, prompt TEXT)''')
+    await client.db_conn.execute('''CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, role TEXT, content TEXT, user_id TEXT, user_name TEXT)''')
+    await client.db_conn.execute('''CREATE TABLE IF NOT EXISTS core_memories (server_id TEXT, user_id TEXT, user_name TEXT, facts TEXT, PRIMARY KEY (server_id, user_id))''')
+    await client.db_conn.commit()
 
 def register_deletion(key):
     """Registers a wipe request and prunes stale locks to prevent memory leaks."""
@@ -161,18 +202,26 @@ def extract_pdf_text(pdf_bytes):
     
 def process_image_bytes(img_bytes):
     """Synchronous CPU-bound task for downscaling and compressing images."""
-    with Image.open(io.BytesIO(img_bytes)) as pil_img:
-        if pil_img.mode in ("RGBA", "P"): 
-            pil_img = pil_img.convert("RGB")
-            
-        pil_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format="JPEG", quality=IMAGE_COMPRESSION_QUALITY)
-        return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as pil_img:
+            if pil_img.mode in ("RGBA", "P"): 
+                pil_img = pil_img.convert("RGB")
+                
+            pil_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
+            buffer = io.BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=IMAGE_COMPRESSION_QUALITY)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    except Exception as e:
+        logging.warning(f"⚠️ Pillow failed to process image (likely corrupted or fake): {e}")
+        return None
     
 def process_sticker_bytes(sticker_bytes):
-    """Synchronous base64 encoding for standard Discord stickers."""
-    return base64.b64encode(sticker_bytes).decode('utf-8')
+    """Synchronous base64 encoding for standard Discord stickers with safety catch."""
+    try:
+        return base64.b64encode(sticker_bytes).decode('utf-8')
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to encode sticker bytes: {e}")
+        return None
 
 # ==========================================
 # 3. AUTONOMOUS TOOLS & SCRAPING
@@ -280,56 +329,61 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
     """Summarizes chat history into permanent core facts when history cycles out."""
     task_start_time = datetime.now().timestamp()
     
-    async with memory_lock:
-        async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT facts FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(user_id)))
-            row = await cursor.fetchone()
-            existing_memory = row[0] if row else "No core memories yet."
+    # 1. READ PHASE (Locked briefly)
+    async with client.memory_lock:
+        cursor = await client.db_conn.execute("SELECT facts FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(user_id)))
+        row = await cursor.fetchone()
+        existing_memory = row[0] if row else "No core memories yet."
             
-        # Compile forgotten history into a single string
-        chat_log = ""
-        for msg in forgotten_messages:
-            raw_content = msg['content']
-            try:
-                parsed_content = json.loads(raw_content)
-                if isinstance(parsed_content, list) and len(parsed_content) > 0 and isinstance(parsed_content[0], dict):
-                    text_only = next((item.get("text", "[Text Missing]") for item in parsed_content if item.get("type") == "text"), "[Image data]")
-                    raw_content = text_only
-                else: 
-                    raw_content = str(parsed_content)
-            except (json.JSONDecodeError, TypeError): 
-                pass
-            chat_log += f"{msg['role'].capitalize()}: {raw_content}\n"
-            
-        memory_prompt = (f"You are an AI memory manager. Extract long-term, permanent facts about the user '{user_name}' from the chat log below. Update the existing memory with any new facts (preferences, tech stack, ongoing projects). Keep it strictly concise and bulleted. If there are no new facts about this user, just return the EXISTING MEMORY exactly as is. Do not include temporary conversational details.\n\nEXISTING MEMORY for {user_name}:\n{existing_memory}\n\nRECENT CHAT LOG:\n{chat_log}")
-        
+    # Compile forgotten history into a single string
+    chat_log = ""
+    for msg in forgotten_messages:
+        raw_content = msg['content']
         try:
-            async with llm_queue:
-                response = await lm_client.chat.completions.create(
-                    model=LLM_MODEL_NAME, 
-                    messages=[{"role": "user", "content": memory_prompt}], 
-                    temperature=MEMORY_TEMPERATURE, 
-                    max_tokens=MEMORY_MAX_TOKENS
-                )
-            new_memory = response.choices[0].message.content.strip()
-            
-            # Save memory unless an admin issued a wipe command during generation
-            if new_memory != existing_memory and new_memory:
-                if pending_deletions.get(str(user_id), 0) > task_start_time or pending_deletions.get(f"wipe_{server_id}", 0) > task_start_time:
-                    logging.info(f"[Memory] Aborted save for {user_name} due to mid-generation wipe request.")
-                    return
-                async with aiosqlite.connect(DB_FILE) as db:
-                    await db.execute('''INSERT INTO core_memories (server_id, user_id, user_name, facts) VALUES (?, ?, ?, ?) ON CONFLICT(server_id, user_id) DO UPDATE SET facts=excluded.facts, user_name=excluded.user_name''', (server_id, str(user_id), user_name, new_memory))
-                    await db.commit()
+            parsed_content = json.loads(raw_content)
+            if isinstance(parsed_content, list) and len(parsed_content) > 0 and isinstance(parsed_content[0], dict):
+                text_only = next((item.get("text", "[Text Missing]") for item in parsed_content if item.get("type") == "text"), "[Image data]")
+                raw_content = text_only
+            else: 
+                raw_content = str(parsed_content)
+        except (json.JSONDecodeError, TypeError): 
+            pass
+        chat_log += f"{msg['role'].capitalize()}: {raw_content}\n"
+        
+    memory_prompt = (f"You are an AI memory manager. Extract long-term, permanent facts about the user '{user_name}' from the chat log below. Update the existing memory with any new facts (preferences, tech stack, ongoing projects). Keep it strictly concise and bulleted. If there are no new facts about this user, just return the EXISTING MEMORY exactly as is. Do not include temporary conversational details.\n\nEXISTING MEMORY for {user_name}:\n{existing_memory}\n\nRECENT CHAT LOG:\n{chat_log}")
+    
+    try:
+        # 2. LLM GENERATION PHASE (Unlocked! Semaphore handles limits)
+        async with client.llm_queue:
+            response = await lm_client.chat.completions.create(
+                model=LLM_MODEL_NAME, 
+                messages=[{"role": "user", "content": memory_prompt}], 
+                temperature=MEMORY_TEMPERATURE, 
+                max_tokens=MEMORY_MAX_TOKENS
+            )
+        new_memory = response.choices[0].message.content.strip()
+        
+        # 3. WRITE PHASE (Locked briefly)
+        if new_memory != existing_memory and new_memory:
+            if pending_deletions.get(str(user_id), 0) > task_start_time or pending_deletions.get(f"wipe_{server_id}", 0) > task_start_time:
+                logging.info(f"[Memory] Aborted save for {user_name} due to mid-generation wipe request.")
+                return
+            async with client.memory_lock:
+                await client.db_conn.execute('''INSERT INTO core_memories (server_id, user_id, user_name, facts) VALUES (?, ?, ?, ?) ON CONFLICT(server_id, user_id) DO UPDATE SET facts=excluded.facts, user_name=excluded.user_name''', (server_id, str(user_id), user_name, new_memory))
+                await client.db_conn.commit()
                 logging.info(f"[Memory] Core memory updated for {user_name} in server {server_id}.")
-        except Exception as e: 
-            logging.error(f"Failed to update core memory for {user_name}: {e}")
+    except Exception as e: 
+        logging.error(f"Failed to update core memory for {user_name}: {e}")
 
-async def process_memories_sequentially(server_id, users_dict, forgotten_messages):
-    """Processes background memories sequentially to avoid API throttling."""
+async def process_memories_concurrently(server_id, users_dict, forgotten_messages):
+    """Fires background memories concurrently, relying on the llm_queue Semaphore for traffic control."""
+    tasks = []
     for uid, uname in users_dict.items():
-        await update_user_memory(server_id, uid, uname, forgotten_messages)
-        await asyncio.sleep(CHUNK_MESSAGE_DELAY)
+        tasks.append(update_user_memory(server_id, uid, uname, forgotten_messages))
+    
+    # Run them all at once! The Semaphore(3) will ensure only 3 hit the LLM API at a time.
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ==========================================
 # 5. SLASH COMMANDS
@@ -368,9 +422,8 @@ async def cmd_status(interaction: discord.Interaction):
     except Exception: 
         current_model = "Offline / Unreachable"
         
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),))
-        history_length = (await cursor.fetchone())[0]
+    cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),))
+    history_length = (await cursor.fetchone())[0]
         
     diagnostics = f"**Bot Diagnostics & Status**\n\n• **Discord Ping:** `{ping_ms}ms`\n• **Loaded AI Model:** `{current_model}`\n• **Peak Context Used:** `{highest_token_count} tokens`\n• **Current History Length:** `{history_length}/{MAX_HISTORY_LENGTH} messages`"
     await interaction.followup.send(diagnostics)
@@ -386,46 +439,45 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
         await interaction.followup.send(f"**Current Server Persona:**\n> *{current_role}*")
         return
 
-    async with aiosqlite.connect(DB_FILE) as db:
-        # Backup history before wipe
-        cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        rows = await cursor.fetchall()
-        if rows:
-            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-            task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
-            
-        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+    # Backup history before wipe
+    cursor = await client.db_conn.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+    rows = await cursor.fetchall()
+    if rows:
+        history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
+        users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+        task = asyncio.create_task(process_memories_concurrently(server_id, users_in_history, history_to_save))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         
-        if prompt.lower() == 'clear':
-            await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
-            server_personas_cache[server_id] = DEFAULT_PERSONA
-            await interaction.followup.send(f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}")
-        else:
-            await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, prompt))
-            server_personas_cache[server_id] = prompt
-            await interaction.followup.send(f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{prompt}*")
-        await db.commit()
+    await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+    
+    if prompt.lower() == 'clear':
+        await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
+        server_personas_cache[server_id] = DEFAULT_PERSONA
+        await interaction.followup.send(f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}")
+    else:
+        await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, prompt))
+        server_personas_cache[server_id] = prompt
+        await interaction.followup.send(f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{prompt}*")
+    await client.db_conn.commit()
 
 @tree.command(name="clear", description="Clear the current conversation history (core facts retained).")
 @app_commands.default_permissions(manage_messages=True)
 async def cmd_clear(interaction: discord.Interaction):
     server_id = str(interaction.guild_id)
     await interaction.response.defer()
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        rows = await cursor.fetchall()
-        if rows:
-            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-            task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
-            
-        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-        await db.commit()
+
+    cursor = await client.db_conn.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+    rows = await cursor.fetchall()
+    if rows:
+        history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
+        users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+        task = asyncio.create_task(process_memories_concurrently(server_id, users_in_history, history_to_save))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        
+    await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+    await client.db_conn.commit()
     await interaction.followup.send("🗑️ Server conversation history cleared! *(Recent memories saved)*")
 
 @tree.command(name="admin_wipe_server", description="[ADMIN/OWNER] Complete factory reset of all data for this server.")
@@ -444,17 +496,16 @@ async def cmd_wipe_server(interaction: discord.Interaction):
     server_id = str(interaction.guild_id)
     register_deletion(f"wipe_{server_id}")
     
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM core_memories WHERE server_id = ?", (server_id,))
-        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-        await db.commit()
+    await client.db_conn.execute("DELETE FROM core_memories WHERE server_id = ?", (server_id,))
+    await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+    await client.db_conn.commit()
         
     await interaction.followup.send("☢️ **SERVER WIPED.** All core memories and chat histories for **this specific server** have been erased.")
 
 
 @tree.command(name="force-forget", description="[ADMIN/OWNER] Purge all stored data for a specific user.")
 @app_commands.describe(target_user="The user whose memory you want to erase")
-async def cmd_force_forget(interaction: discord.Interaction, target_user: discord.User): # Changed to discord.User!
+async def cmd_force_forget(interaction: discord.Interaction, target_user: discord.User): 
     # Check if the user is the Bot Owner OR a Server Admin
     is_owner = (interaction.user.id == BOT_OWNER_ID)
     is_admin = interaction.permissions.administrator
@@ -471,10 +522,9 @@ async def cmd_force_forget(interaction: discord.Interaction, target_user: discor
     
     register_deletion(user_id)
     
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, user_id))
-        await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, user_id))
-        await db.commit()
+    await client.db_conn.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, user_id))
+    await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, user_id))
+    await client.db_conn.commit()
         
     await interaction.followup.send(f"✅ **Force-Forget Successful:** All memory and chat history for {target_user.mention} has been permanently purged.")
 
@@ -491,48 +541,46 @@ async def cmd_memory(interaction: discord.Interaction, action: app_commands.Choi
 
     if action.value == 'clear':
         register_deletion(str(interaction.user.id))
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
-            await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
-            await db.commit()
+        await client.db_conn.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
+        await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
+        await client.db_conn.commit()
         await interaction.followup.send("🗑️ **Forget successful.** All your core memories and recent chat history have been erased.")
         return
 
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
-        active_users = list(set([str(r[0]) for r in await cursor.fetchall()] + [str(interaction.user.id)]))
+    cursor = await client.db_conn.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
+    active_users = list(set([str(r[0]) for r in await cursor.fetchall()] + [str(interaction.user.id)]))
+    
+    if action.value == 'read' and target_user:
+        target_name = target_user.lower()
+        found_users = []
+        if active_users:
+            placeholders = ','.join('?' * len(active_users))
+            params = [server_id] + active_users
+            cursor = await client.db_conn.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+            for row in await cursor.fetchall():
+                if target_name in row[0].lower():
+                    found_users.append({"name": row[0], "facts": row[1]})
         
-        if action.value == 'read' and target_user:
-            target_name = target_user.lower()
-            found_users = []
-            if active_users:
-                placeholders = ','.join('?' * len(active_users))
-                params = [server_id] + active_users
-                cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
-                for row in await cursor.fetchall():
-                    if target_name in row[0].lower():
-                        found_users.append({"name": row[0], "facts": row[1]})
-            
-            if not found_users:
-                memory_text = f"I couldn't find any memories for '{target_user}'."
-            elif len(found_users) == 1:
-                memory_text = f"**Facts known about {found_users[0]['name']}:**\n{found_users[0]['facts']}"
-            else:
-                names_list = "\n".join([f"• {u['name']}" for u in found_users])
-                memory_text = f"⚠️ Found multiple users matching '{target_user}'. Please be more specific:\n{names_list}"
+        if not found_users:
+            memory_text = f"I couldn't find any memories for '{target_user}'."
+        elif len(found_users) == 1:
+            memory_text = f"**Facts known about {found_users[0]['name']}:**\n{found_users[0]['facts']}"
         else:
-            memory_text = "**Tracked Active Users**\n\n"
-            found_any = False
-            if active_users:
-                placeholders = ','.join('?' * len(active_users))
-                params = [server_id] + active_users
-                cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
-                for row in await cursor.fetchall():
-                    if row[1] and row[1] != "No core memories yet.":
-                        memory_text += f"• {row[0]}\n"
-                        found_any = True
-            if not found_any: 
-                memory_text += "*No core memories found for active users in this chat.*"
+            names_list = "\n".join([f"• {u['name']}" for u in found_users])
+            memory_text = f"⚠️ Found multiple users matching '{target_user}'. Please be more specific:\n{names_list}"
+    else:
+        memory_text = "**Tracked Active Users**\n\n"
+        found_any = False
+        if active_users:
+            placeholders = ','.join('?' * len(active_users))
+            params = [server_id] + active_users
+            cursor = await client.db_conn.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+            for row in await cursor.fetchall():
+                if row[1] and row[1] != "No core memories yet.":
+                    memory_text += f"• {row[0]}\n"
+                    found_any = True
+        if not found_any: 
+            memory_text += "*No core memories found for active users in this chat.*"
     
     # Output chunker for slash commands
     remaining_text = memory_text
@@ -575,15 +623,19 @@ async def extract_message_context(message, clean_message, user_name):
     if pdf_attachments:
         async with safe_typing(message.channel):
             for pdf in pdf_attachments:
-                pdf_bytes = await pdf.read()
-                pdf_text = await asyncio.to_thread(extract_pdf_text, pdf_bytes)
-                
-                if len(pdf_text) > MAX_TEXT_EXTRACTION_LENGTH: 
-                    pdf_text = pdf_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated due to length limit]"
+                try:
+                    pdf_bytes = await pdf.read()
+                    pdf_text = await asyncio.to_thread(extract_pdf_text, pdf_bytes)
                     
-                logging.info(f"📎 AI successfully extracted UPLOADED PDF: {pdf.filename}")
-                ephemeral_context += f"\n\n[Extracted PDF Content from {pdf.filename}]:\n{pdf_text}"
-                clean_message += f"\n[System note: User attached PDF '{pdf.filename}']"
+                    if len(pdf_text) > MAX_TEXT_EXTRACTION_LENGTH: 
+                        pdf_text = pdf_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated due to length limit]"
+                        
+                    logging.info(f"📎 AI successfully extracted UPLOADED PDF: {pdf.filename}")
+                    ephemeral_context += f"\n\n[Extracted PDF Content from {pdf.filename}]:\n{pdf_text}"
+                    clean_message += f"\n[System note: User attached PDF '{pdf.filename}']"
+                except discord.HTTPException:
+                    logging.warning(f"⚠️ Discord CDN failed to provide PDF: {pdf.filename}")
+                    clean_message += f"\n[System note: The attached PDF '{pdf.filename}' could not be downloaded from Discord's servers.]"
 
     # 4. Replied-to Context Retrieval
     if message.reference and message.reference.message_id:
@@ -601,14 +653,17 @@ async def extract_message_context(message, clean_message, user_name):
         except Exception as e: 
             logging.warning(f"⚠️ Could not fetch the replied message: {e}")
 
-    # 5. URL Scraping
+    # 5. URL Scraping (Concurrent)
     url_pattern = r'(https?://[^\s<>]+)'
     found_urls = re.findall(url_pattern, clean_message)
     if found_urls:
         scraped_texts = []
         async with safe_typing(message.channel):
-            for url in found_urls:
-                url_result = await fetch_url_content(url)
+            # Fetch all URLs at the exact same time
+            fetch_tasks = [fetch_url_content(url) for url in found_urls]
+            results = await asyncio.gather(*fetch_tasks)
+            
+            for url, url_result in zip(found_urls, results):
                 if url_result["type"] == "image": 
                     image_attachments.append(URLImageAttachment(url_result["data"]))
                 elif url_result["type"] == "text": 
@@ -634,16 +689,34 @@ async def build_user_payloads(clean_message, ephemeral_context, image_attachment
         db_user_content_obj.append({"type": "text", "text": db_text_part}) 
         
         for img in image_attachments:
-            img_bytes = await img.read()
-            img_b64 = await asyncio.to_thread(process_image_bytes, img_bytes)
-            api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
-            db_user_content_obj.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+            try:
+                img_bytes = await img.read()
+                img_b64 = await asyncio.to_thread(process_image_bytes, img_bytes)
+                
+                if img_b64:
+                    api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
+                    db_user_content_obj.append({"type": "text", "text": f"[Image attached: {getattr(img, 'filename', 'URL_Image')}]"})
+                else:
+                    api_user_content.append({"type": "text", "text": f"\n[System note: The attached image '{getattr(img, 'filename', 'URL_Image')}' was corrupted and skipped.]"})
+                    db_user_content_obj.append({"type": "text", "text": "[Corrupted image skipped]"})
+            except discord.HTTPException:
+                api_user_content.append({"type": "text", "text": f"\n[System note: Discord servers failed to provide the image '{getattr(img, 'filename', 'URL_Image')}'.]"})
+                db_user_content_obj.append({"type": "text", "text": "[Failed to download image]"})
             
         for sticker in valid_stickers:
-            sticker_bytes = await sticker.read()
-            sticker_b64 = await asyncio.to_thread(process_sticker_bytes, sticker_bytes)
-            api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
-            db_user_content_obj.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
+            try:
+                sticker_bytes = await sticker.read()
+                sticker_b64 = await asyncio.to_thread(process_sticker_bytes, sticker_bytes)
+                
+                if sticker_b64:
+                    api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
+                    db_user_content_obj.append({"type": "text", "text": f"[Sticker attached: {sticker.name}]"})
+                else:
+                    api_user_content.append({"type": "text", "text": f"\n[System note: The attached sticker '{sticker.name}' was corrupted and skipped.]"})
+                    db_user_content_obj.append({"type": "text", "text": "[Corrupted sticker skipped]"})
+            except discord.HTTPException:
+                api_user_content.append({"type": "text", "text": f"\n[System note: Discord servers failed to provide the sticker '{sticker.name}'.]"})
+                db_user_content_obj.append({"type": "text", "text": "[Failed to download sticker]"})
     else: 
         api_user_content = ai_text_part
         db_user_content_obj = db_text_part 
@@ -652,30 +725,40 @@ async def build_user_payloads(clean_message, ephemeral_context, image_attachment
 
 async def build_ai_context(server_id, author_id, api_user_content):
     """Compiles the system prompt, handles memory injection, and builds the strict VRAM-safe history array."""
-    current_system_prompt = (f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\nCRITICAL INSTRUCTIONS:\n1. EXTREME BREVITY: Answer in 1-3 sentences unless asked otherwise.\n2. DOCUMENT ANALYSIS: You will receive webpage and PDF data in Markdown format. Use headers (#), lists (*), and bold text within that data to identify key information accurately.\n3. SEARCH POLICY: Only use `web_search` if the provided URL content or attachments do not contain the answer. If a URL is provided, prioritize its content first.\n4. MULTI-USER CHAT: Address users by their names when appropriate.\n5. MEMORY USAGE (CRITICAL): Use user facts silently to guide your context. NEVER repeat or summarize these facts back to the user unless they explicitly ask what you remember about them.\n6. STRICT RULE: Do not use emojis unless your persona requires it.")
+    current_system_prompt = (
+        f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. EXTREME BREVITY: Answer in 1-3 sentences unless asked otherwise.\n"
+        "2. DOCUMENT ANALYSIS: You will receive webpage and PDF data in Markdown format. Use headers (#), lists (*), and bold text within that data to identify key information accurately.\n"
+        "3. SEARCH POLICY: Only use `web_search` if the provided URL content or attachments do not contain the answer. If a URL is provided, prioritize its content first.\n"
+        "4. MULTI-USER CHAT: Address users by their names when appropriate.\n"
+        "5. MEMORY USAGE (CRITICAL): Use user facts silently to guide your context. NEVER repeat or summarize these facts back to the user unless they explicitly ask what you remember about them.\n"
+        "6. STRICT RULE: Do not use emojis unless your persona requires it.\n"
+        "7. MODEL INQUIRIES: If the user asks about your AI model, version, or underlying technology, politely tell them you don't have that information directly and ask them to use the `/status` command to view my current status.\n"
+        "8. IMAGE MEMORY: When a user uploads an image, ALWAYS begin your response with a brief, 1-sentence description of what you see before answering their prompt. This ensures the visual context is saved in our text history."
+    )
     
     # Inject user memories
     user_context_str = ""
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
-        active_user_ids = list(set([str(r[0]) for r in await cursor.fetchall()] + [author_id]))
-        
-        if active_user_ids:
-            placeholders = ','.join('?' * len(active_user_ids))
-            params = [server_id] + active_user_ids 
-            cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
-            for row in await cursor.fetchall():
-                if row[1] != "No core memories yet.": 
-                    user_context_str += f"- {row[0]}: {row[1]}\n"
-                    
-        # Check RAM cache first to avoid unnecessary disk I/O
-        if server_id in server_personas_cache:
-            base_persona = server_personas_cache[server_id]
-        else:
-            cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
-            row = await cursor.fetchone()
-            base_persona = row[0] if row and row[0] else DEFAULT_PERSONA
-            server_personas_cache[server_id] = base_persona # Save to cache for next time
+    cursor = await client.db_conn.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
+    active_user_ids = list(set([str(r[0]) for r in await cursor.fetchall()] + [author_id]))
+    
+    if active_user_ids:
+        placeholders = ','.join('?' * len(active_user_ids))
+        params = [server_id] + active_user_ids 
+        cursor = await client.db_conn.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+        for row in await cursor.fetchall():
+            if row[1] != "No core memories yet.": 
+                user_context_str += f"- {row[0]}: {row[1]}\n"
+                
+    # Check RAM cache first to avoid unnecessary disk I/O
+    if server_id in server_personas_cache:
+        base_persona = server_personas_cache[server_id]
+    else:
+        cursor = await client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
+        row = await cursor.fetchone()
+        base_persona = row[0] if row and row[0] else DEFAULT_PERSONA
+        server_personas_cache[server_id] = base_persona # Save to cache for next time
 
     if user_context_str: 
         current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT ACTIVE USERS (READ ONLY - DO NOT REPEAT):\n{user_context_str}"
@@ -684,32 +767,21 @@ async def build_ai_context(server_id, author_id, api_user_content):
     system_message = {"role": "system", "content": current_system_prompt}
 
     # Fetch and format chat history
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT role, content FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        api_history = []
-        for r in await cursor.fetchall():
-            try:
-                parsed_content = json.loads(r[1])
-                # CRITICAL: Memory Protection Filter
-                # This ensures we don't pass massive base64 image strings from older messages
-                # back into the context window, which would crash the AI due to VRAM limits.
-                if isinstance(parsed_content, list):
-                    if len(parsed_content) > 0 and not isinstance(parsed_content[0], dict): 
-                        parsed_content = r[1]
-                    else:
-                        scrubbed_content = []
-                        for item in parsed_content:
-                            if item.get("type") == "image_url": 
-                                scrubbed_content.append({"type": "text", "text": "[Image attached in previous message]"})
-                            else: 
-                                scrubbed_content.append(item)
-                        parsed_content = scrubbed_content
-                elif not isinstance(parsed_content, str): 
-                    parsed_content = str(parsed_content)
-            except (json.JSONDecodeError, TypeError): 
-                parsed_content = r[1]
-                
-            api_history.append({"role": r[0], "content": parsed_content})
+    cursor = await client.db_conn.execute("SELECT role, content FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+    api_history = []
+    for r in await cursor.fetchall():
+        try:
+            parsed_content = json.loads(r[1])
+            # The database is now clean by default! No base64 scrubbing needed.
+            if isinstance(parsed_content, list):
+                if len(parsed_content) > 0 and not isinstance(parsed_content[0], dict): 
+                    parsed_content = r[1]
+            elif not isinstance(parsed_content, str): 
+                parsed_content = str(parsed_content)
+        except (json.JSONDecodeError, TypeError): 
+            parsed_content = r[1]
+            
+        api_history.append({"role": r[0], "content": parsed_content})
         
     # CRITICAL: API Compatibility Fix
     # Many LLMs crash if they receive multiple messages from the same role in a row.
@@ -763,7 +835,7 @@ async def generate_ai_response(messages_to_send, message, disable_search, has_me
         api_kwargs["tool_choice"] = "auto"
 
     async with safe_typing(message.channel):
-        async with llm_queue:
+        async with client.llm_queue:
             try:
                 max_iterations, current_iteration, final_reply = MAX_TOOL_ITERATIONS, 0, ""
                 
@@ -835,31 +907,30 @@ async def generate_ai_response(messages_to_send, message, disable_search, has_me
 
 async def save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply):
     """Saves atomic pairs to the DB, handles memory chunk eviction, and sends State-Aware Markdown messages to Discord."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        db_user_content = json.dumps(db_user_content_obj) if isinstance(db_user_content_obj, list) else str(db_user_content_obj)
-        await db.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "user", db_user_content, str(message.author.id), user_name))
-        await db.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "assistant", final_reply, str(message.author.id), user_name))
+    db_user_content = json.dumps(db_user_content_obj) if isinstance(db_user_content_obj, list) else str(db_user_content_obj)
+    await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "user", db_user_content, str(message.author.id), user_name))
+    await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "assistant", final_reply, str(message.author.id), user_name))
+    
+    cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
+    
+    # Trigger background memory summarization if capacity is reached
+    if (await cursor.fetchone())[0] >= MAX_HISTORY_LENGTH:
+        eviction_count = MAX_HISTORY_LENGTH // 2  
+        cursor = await client.db_conn.execute('''SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC LIMIT ?''', (server_id, eviction_count))
+        forgotten_rows = await cursor.fetchall()
         
-        cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
-        
-        # Trigger background memory summarization if capacity is reached
-        if (await cursor.fetchone())[0] >= MAX_HISTORY_LENGTH:
-            eviction_count = MAX_HISTORY_LENGTH // 2  
-            cursor = await db.execute('''SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC LIMIT ?''', (server_id, eviction_count))
-            forgotten_rows = await cursor.fetchall()
-            
-            if forgotten_rows:
-                forgotten_msgs = [{"role": r[1], "content": r[2], "user_id": r[3], "user_name": r[4]} for r in forgotten_rows]
-                users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten_msgs if msg.get("user_id")}
-                if users_in_forgotten:
-                    task = asyncio.create_task(process_memories_sequentially(server_id, users_in_forgotten, forgotten_msgs))
-                    background_tasks.add(task)
-                    task.add_done_callback(background_tasks.discard)
-                    
-                ids_to_delete = [r[0] for r in forgotten_rows]
-                placeholders = ','.join('?' * len(ids_to_delete))
-                await db.execute(f"DELETE FROM chat_history WHERE id IN ({placeholders})", ids_to_delete)
-        await db.commit()
+        if forgotten_rows:
+            forgotten_msgs = [{"role": r[1], "content": r[2], "user_id": r[3], "user_name": r[4]} for r in forgotten_rows]
+            users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten_msgs if msg.get("user_id")}
+            if users_in_forgotten:
+                task = asyncio.create_task(process_memories_concurrently(server_id, users_in_forgotten, forgotten_msgs))
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+                
+            ids_to_delete = [r[0] for r in forgotten_rows]
+            placeholders = ','.join('?' * len(ids_to_delete))
+            await client.db_conn.execute(f"DELETE FROM chat_history WHERE id IN ({placeholders})", ids_to_delete)
+    await client.db_conn.commit()
     
     # ==========================================
     # MARKDOWN CHUNKER LOGIC
@@ -920,31 +991,11 @@ async def save_and_send_response(message, server_id, user_name, db_user_content_
 
 @client.event
 async def on_ready():
-    # FIX: Instantiate asyncio primitives inside the running event loop
-    global memory_lock, llm_queue, synced_commands
-    if memory_lock is None: 
-        memory_lock = asyncio.Lock()
-    if llm_queue is None: 
-        llm_queue = asyncio.Semaphore(3)
-
-    await init_db()
-    
-    # Sync the slash commands to Discord ONLY ONCE per script execution
-    if not synced_commands:
-        await tree.sync()
-        synced_commands = True
-        logging.info('🔄 Slash commands synced globally!')
-    
     logging.info(f'✅ Logged in successfully as {client.user}')
-    logging.info('🌐 Database, Web Search, & Slash Commands enabled!')
+    logging.info('🌐 Bot is fully online and ready!')
 
 @client.event
 async def on_message(message):
-    # GUARANTEE: Ensure primitives exist even if a message arrives before on_ready fires
-    global memory_lock, llm_queue
-    if memory_lock is None: memory_lock = asyncio.Lock()
-    if llm_queue is None: llm_queue = asyncio.Semaphore(3)
-    
     if message.author == client.user or not client.user.mentioned_in(message) or not message.guild:
         return
 
@@ -955,7 +1006,12 @@ async def on_message(message):
     user_name = f"{message.author.display_name}_{str(message.author.id)[-4:]}"
 
     # Smart logger: Checks if there is text, media, or just an empty ping
-    log_content = clean_message if clean_message else ("[Media attached]" if message.attachments or message.stickers else "[Empty Ping]")
+    if clean_message:
+        # Truncate to 50 characters for a clean terminal
+        log_content = clean_message if len(clean_message) <= 50 else clean_message[:50] + "... [truncated]"
+    else:
+        log_content = "[Media attached]" if message.attachments or message.stickers else "[Empty Ping]"
+        
     logging.info(f"{message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
 
     # Substitute tagged users into the text for the AI's contextual awareness
@@ -982,25 +1038,19 @@ async def on_message(message):
     # Scans the raw message for any HTTP/HTTPS links to strictly disable web search
     disable_search = bool(re.search(r'(https?://[^\s<>]+)', clean_message)) or (ephemeral_context and "Extracted PDF Content" in ephemeral_context)
     has_media = bool(image_attachments or valid_stickers)
+
+    # --- START TIMER ---
+    start_time = datetime.now()
+    
     final_reply = await generate_ai_response(messages_to_send, message, disable_search, has_media)
 
     # 5. Pipeline: Finalizing State
     if final_reply:
+        # --- END TIMER & LOG ---
+        duration = (datetime.now() - start_time).total_seconds()
+        logging.info(f"✨ AI Response generated in {duration:.2f}s | Server: {message.guild.name}")
+
         await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply)
-
-# Intercept the default close method
-original_close = client.close
-
-async def graceful_shutdown():
-    logging.info("Shutdown signal received. Waiting for background memory tasks to finish...")
-    if background_tasks:
-        await asyncio.gather(*background_tasks, return_exceptions=True)
-        logging.info("All background tasks completed. Memories safely saved.")
-    logging.info("Disconnecting from Discord. Goodbye!")
-    await original_close()
-
-# Assign our custom shutdown sequence to the client
-client.close = graceful_shutdown
 
 if TOKEN: 
     client.run(TOKEN)
