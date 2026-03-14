@@ -11,6 +11,7 @@ from datetime import datetime
 import fitz  # PyMuPDF
 import aiohttp
 import discord
+from discord import app_commands
 import aiosqlite
 from PIL import Image
 from ddgs import DDGS
@@ -22,6 +23,10 @@ from dotenv import load_dotenv
 # ==========================================
 load_dotenv()
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+try:
+    BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
+except ValueError:
+    BOT_OWNER_ID = 0
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -43,6 +48,9 @@ lm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
+
+# --- SLASH COMMAND SETUP ---
+tree = app_commands.CommandTree(client)
 
 # ==========================================
 # GLOBAL STATE & CONFIGURATION
@@ -77,6 +85,7 @@ highest_token_count = 0
 background_tasks = set()                            
 pending_deletions = {}                              
 server_personas_cache = {}                          # RAM cache for server personas
+synced_commands = False
 
 # FIX: Initialized as None to prevent Python 3.8/3.9 event loop crashes
 memory_lock = None                                  
@@ -323,286 +332,224 @@ async def process_memories_sequentially(server_id, users_dict, forgotten_message
         await asyncio.sleep(CHUNK_MESSAGE_DELAY)
 
 # ==========================================
-# 5. PIPELINE MODULES
+# 5. SLASH COMMANDS
 # ==========================================
 
-async def handle_text_commands(message, clean_message, server_id):
-    """Handles all Discord textual slash/admin commands."""
-    global highest_token_count
-    cmd = clean_message.lower()
-
-    if cmd == 'help':
-        help_text_main = f"""**How to interact with me:**
-
-**General Chat**
+@tree.command(name="help", description="Learn how to interact with the AI and view system limits.")
+async def cmd_help(interaction: discord.Interaction):
+    help_text = f"""**How to interact with me:**
 • **`@{client.user.name} [message]`** - Chat, ask questions, or analyze attached files and links.
+• **Reply to me** and tag me to seamlessly resume an exact topic.
 
-**Persona Management**
-• **`@{client.user.name} role`** - View the active AI personality for this server.
-• **`@{client.user.name} role [prompt]`** - Assign a new personality and start a fresh conversation.
-• **`@{client.user.name} role clear`** - Restore the default neutral personality.
+**Slash Commands:**
+• **`/help`** - Display this guide and system limits.
+• **`/status`** - Check bot diagnostics, ping, and AI model status.
+• **`/role`** - View, change, or clear the AI's personality for this server. /role clear to set back to default.
+• **`/memory`** - View tracked users, read specific memories, or clear your own data.
+• **`/clear`** - Clear the temporary conversation history (core facts retained).
+• **`/force-forget`** - *(Admin/Owner)* Purge all stored data for a specific user.
+• **`/admin_wipe_server`** - *(Admin/Owner)* Factory reset all data for this server.
 
-**Memory & Context**
-• **`@{client.user.name} clear`** - Clear the current conversation history (core facts retained).
-• **`@{client.user.name} memory`** - List all users who have saved core memories in this server.
-• **`@{client.user.name} memory [name]`** - Read the permanent facts I have learned about a specific user.
-• **`@{client.user.name} memory clear`** - Delete your own personal memories and chat history.
-
-**System**
-• **`@{client.user.name} status`** - Check bot health, latency, active model, and memory usage.
-• **`@{client.user.name} help`** - Display this command list.
-"""
-
-        app_info = await client.application_info()
-        if message.author.id == app_info.owner.id:
-            help_text_main += f"""
-**Bot Owner Commands:**
-• **`@{client.user.name} force-forget [name]`** - (Admin) Purge all stored data for a specific user.
-• **`@{client.user.name} wipe-server-memories`** - (Admin) Complete factory reset of all data for this server.
-"""
-
-        good_to_know_text = f"""**Feature Overview:**
+**Feature Overview:**
 > **Smart Memory:** I retain the last {MAX_HISTORY_LENGTH} messages. Important user facts are extracted before old messages are forgotten.
-> **Autonomous Web Search:** I will search the internet to answer questions about current events or missing facts.
+> **Autonomous Web Search:** I will autonomously search the internet to answer questions about current events.
 > **Media & URL Parsing:** Attach PDFs/images, or drop a URL in the chat. I will automatically scrape and analyze it.
-> **Contextual Replies:** Reply to an old message and tag me to seamlessly resume that exact topic.
-> **System Limits:** Files capped at {MAX_FILE_SIZE // (1024*1024)}MB. PDFs limited to {MAX_PDF_PAGES} pages. Web scraping capped at {MAX_TEXT_EXTRACTION_LENGTH} characters.
+> **System Limits:** Files capped at {MAX_FILE_SIZE // (1024*1024)}MB. PDFs limited to {MAX_PDF_PAGES} pages. Web scraping/PDF capped at {MAX_TEXT_EXTRACTION_LENGTH} chars.
 """
-        try:
-            await message.reply(help_text_main.strip())
-        except discord.HTTPException as http_exc:
-            if http_exc.code == 50035: 
-                await message.channel.send(f"<@{message.author.id}>\n{help_text_main.strip()}")
-            else: 
-                raise http_exc
+    await interaction.response.send_message(help_text, ephemeral=True)
 
-        try:
-            await message.channel.send(good_to_know_text.strip())
-        except discord.Forbidden: 
-            pass
+@tree.command(name="status", description="Check bot diagnostics, ping, and AI model status.")
+async def cmd_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    ping_ms = round(client.latency * 1000)
+    try:
+        models_response = await lm_client.models.list()
+        current_model = models_response.data[0].id if models_response.data else "None"
+    except Exception: 
+        current_model = "Offline / Unreachable"
+        
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),))
+        history_length = (await cursor.fetchone())[0]
+        
+    diagnostics = f"**Bot Diagnostics & Status**\n\n• **Discord Ping:** `{ping_ms}ms`\n• **Loaded AI Model:** `{current_model}`\n• **Peak Context Used:** `{highest_token_count} tokens`\n• **Current History Length:** `{history_length}/{MAX_HISTORY_LENGTH} messages`"
+    await interaction.followup.send(diagnostics)
 
-        return True
+@tree.command(name="role", description="View or change the AI's personality for this server.")
+@app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
+async def cmd_role(interaction: discord.Interaction, prompt: str = None):
+    server_id = str(interaction.guild_id)
+    await interaction.response.defer()
+    
+    if not prompt:
+        current_role = server_personas_cache.get(server_id, DEFAULT_PERSONA)
+        await interaction.followup.send(f"**Current Server Persona:**\n> *{current_role}*")
+        return
 
-    if cmd == 'role':
-        async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
-            row = await cursor.fetchone()
-            current_role = row[0] if row and row[0] else None
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Backup history before wipe
+        cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+        rows = await cursor.fetchall()
+        if rows:
+            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
+            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+            task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
             
-        if current_role:
-            await message.reply(f"**Current Server Persona:**\n> *{current_role}*")
+        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+        
+        if prompt.lower() == 'clear':
+            await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
+            server_personas_cache[server_id] = DEFAULT_PERSONA
+            await interaction.followup.send(f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}")
         else:
-            await message.reply(f"**Current Server Persona:**\n> *(Default) {DEFAULT_PERSONA}*")
-        return True
+            await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, prompt))
+            server_personas_cache[server_id] = prompt
+            await interaction.followup.send(f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{prompt}*")
+        await db.commit()
 
-    if cmd.startswith('role '):
-        new_prompt = clean_message[5:].strip() 
-        async with aiosqlite.connect(DB_FILE) as db:
-            # Backup current memory before assigning new role
-            cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-            rows = await cursor.fetchall()
+@tree.command(name="clear", description="Clear the current conversation history (core facts retained).")
+@app_commands.default_permissions(manage_messages=True)
+async def cmd_clear(interaction: discord.Interaction):
+    server_id = str(interaction.guild_id)
+    await interaction.response.defer()
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+        rows = await cursor.fetchall()
+        if rows:
+            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
+            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
+            task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
             
-            if rows:
-                history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-                users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-                task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
-                background_tasks.add(task)
-                task.add_done_callback(background_tasks.discard)
-                
-            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-            
-            if new_prompt.lower() == 'clear':
-                await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
-                await db.commit()
-                server_personas_cache[server_id] = DEFAULT_PERSONA # Instantly update RAM cache
-                await message.reply(f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}")
-            else:
-                if not new_prompt:
-                    await message.reply(f"Please provide a prompt! Example: `@{client.user.name} role You are a pirate.`")
-                    return True
-                    
-                await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt))
-                await db.commit()
-                server_personas_cache[server_id] = new_prompt # Instantly update RAM cache
-                await message.reply(f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{new_prompt}*")
-        return True
+        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+        await db.commit()
+    await interaction.followup.send("🗑️ Server conversation history cleared! *(Recent memories saved)*")
 
-    if cmd == 'clear':
+@tree.command(name="admin_wipe_server", description="[ADMIN/OWNER] Complete factory reset of all data for this server.")
+async def cmd_wipe_server(interaction: discord.Interaction):
+    # Check if the user is the Bot Owner OR a Server Admin
+    is_owner = (interaction.user.id == BOT_OWNER_ID)
+    is_admin = interaction.permissions.administrator
+    
+    if not (is_owner or is_admin):
+        await interaction.response.send_message("⛔ You must be a Server Admin or the Bot Owner to run this.", ephemeral=True)
+        return
+
+    # DEFER IMMEDIATELY to prevent Discord API timeouts if the database is busy
+    await interaction.response.defer(ephemeral=True)
+
+    server_id = str(interaction.guild_id)
+    register_deletion(f"wipe_{server_id}")
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM core_memories WHERE server_id = ?", (server_id,))
+        await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+        await db.commit()
+        
+    await interaction.followup.send("☢️ **SERVER WIPED.** All core memories and chat histories for **this specific server** have been erased.")
+
+
+@tree.command(name="force-forget", description="[ADMIN/OWNER] Purge all stored data for a specific user.")
+@app_commands.describe(target_user="The user whose memory you want to erase")
+async def cmd_force_forget(interaction: discord.Interaction, target_user: discord.User): # Changed to discord.User!
+    # Check if the user is the Bot Owner OR a Server Admin
+    is_owner = (interaction.user.id == BOT_OWNER_ID)
+    is_admin = interaction.permissions.administrator
+    
+    if not (is_owner or is_admin):
+        await interaction.response.send_message("⛔ You must be a Server Admin or the Bot Owner to run this.", ephemeral=True)
+        return
+
+    # DEFER IMMEDIATELY to prevent Discord API timeouts if the database is busy
+    await interaction.response.defer(ephemeral=True)
+
+    server_id = str(interaction.guild_id)
+    user_id = str(target_user.id)
+    
+    register_deletion(user_id)
+    
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, user_id))
+        await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, user_id))
+        await db.commit()
+        
+    await interaction.followup.send(f"✅ **Force-Forget Successful:** All memory and chat history for {target_user.mention} has been permanently purged.")
+
+@tree.command(name="memory", description="View tracked users, read specific memories, or clear your own data.")
+@app_commands.describe(action="Choose an action", target_user="Name of the user to search for (if reading)")
+@app_commands.choices(action=[
+    app_commands.Choice(name="List active users", value="list"),
+    app_commands.Choice(name="Read a user's memory", value="read"),
+    app_commands.Choice(name="Clear my own memory", value="clear")
+])
+async def cmd_memory(interaction: discord.Interaction, action: app_commands.Choice[str], target_user: str = None):
+    server_id = str(interaction.guild_id)
+    await interaction.response.defer(ephemeral=(action.value == "clear"))
+
+    if action.value == 'clear':
+        register_deletion(str(interaction.user.id))
         async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-            rows = await cursor.fetchall()
-            
-            if rows:
-                history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-                users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-                task = asyncio.create_task(process_memories_sequentially(server_id, users_in_history, history_to_save))
-                background_tasks.add(task)
-                task.add_done_callback(background_tasks.discard)
-                
-            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+            await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
+            await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, str(interaction.user.id)))
             await db.commit()
-            
-        await message.reply("🗑️ Server conversation history cleared! *(Recent memories saved)*")
-        return True
+        await interaction.followup.send("🗑️ **Forget successful.** All your core memories and recent chat history have been erased.")
+        return
 
-    if cmd == 'status':
-        ping_ms = round(client.latency * 1000)
-        status_msg = await message.reply("Fetching diagnostics...")
-        try:
-            models_response = await lm_client.models.list()
-            current_model = models_response.data[0].id if models_response.data else "None"
-        except Exception: 
-            current_model = f"Offline / Unreachable"
-            
-        async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
-            history_length = (await cursor.fetchone())[0]
-            
-        diagnostics = (f"**Bot Diagnostics & Status**\n\n• **Discord Ping:** `{ping_ms}ms`\n• **Loaded AI Model:** `{current_model}`\n• **Peak Context Used:** `{highest_token_count} tokens`\n• **Current History Length:** `{history_length}/{MAX_HISTORY_LENGTH} messages`")
-        await status_msg.edit(content=diagnostics)
-        return True
-
-    if cmd.startswith('force-forget'):
-        app_info = await client.application_info()
-        if message.author.id != app_info.owner.id:
-            await message.reply("⛔ **Permission denied.** Only the bot owner can use this command.")
-            return True
+    async with aiosqlite.connect(DB_FILE) as db:
+        cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
+        active_users = list(set([str(r[0]) for r in await cursor.fetchall()] + [str(interaction.user.id)]))
         
-        command_parts = cmd.split()
-        if len(command_parts) < 2:
-            await message.reply(f"Please provide the name of the user you want to erase. Example: `@{client.user.name} force-forget john`")
-            return True
-            
-        target_name = " ".join(command_parts[1:]).lower()
-        
-        async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT DISTINCT user_id, user_name FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
-            history_users = await cursor.fetchall()
-            
-            cursor = await db.execute("SELECT DISTINCT user_id, user_name FROM core_memories WHERE server_id = ?", (server_id,))
-            memory_users = await cursor.fetchall()
-            
-            all_users = {row[0]: row[1] for row in history_users + memory_users if row[1]}
+        if action.value == 'read' and target_user:
+            target_name = target_user.lower()
             found_users = []
+            if active_users:
+                placeholders = ','.join('?' * len(active_users))
+                params = [server_id] + active_users
+                cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+                for row in await cursor.fetchall():
+                    if target_name in row[0].lower():
+                        found_users.append({"name": row[0], "facts": row[1]})
             
-            for uid, uname in all_users.items():
-                if target_name in uname.lower():
-                    found_users.append({"id": uid, "name": uname})
-                    
             if not found_users:
-                await message.reply(f"⚠️ I couldn't find any saved data for a user matching '{target_name}'.")
-                return True
-            
-            if len(found_users) > 1:
-                names_list = "\n".join([f"• {u['name']}" for u in found_users])
-                await message.reply(f"⚠️ Found multiple users matching '{target_name}'. Please be more specific:\n{names_list}")
-                return True
-                
-            target_id = str(found_users[0]['id'])
-            target_display_name = found_users[0]['name']
-            
-            register_deletion(target_id)
-            await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, target_id))
-            await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, target_id))
-            await db.commit()
-            
-        await message.reply(f"🗑️ **Admin Override Executed.** All data for **{target_display_name}** has been permanently erased.")
-        return True
-
-    if cmd == 'wipe-server-memories':
-        app_info = await client.application_info()
-        if message.author.id != app_info.owner.id:
-            await message.reply("⛔ **Permission denied.** Only the bot owner can use this command.")
-            return True
-            
-        register_deletion(f"wipe_{server_id}")
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("DELETE FROM core_memories WHERE server_id = ?", (server_id,))
-            await db.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-            await db.commit()
-            
-        await message.reply("☢️ **SERVER WIPED.** All core memories and chat histories for **this specific server** have been erased.")
-        return True
-
-    if cmd.startswith('memory'):
-        command_parts = cmd.split()
-        if len(command_parts) == 2 and command_parts[1] == 'clear':
-            register_deletion(str(message.author.id))
-            async with aiosqlite.connect(DB_FILE) as db:
-                await db.execute("DELETE FROM core_memories WHERE server_id = ? AND user_id = ?", (server_id, str(message.author.id)))
-                await db.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, str(message.author.id)))
-                await db.commit()
-            await message.reply("🗑️ **Forget successful.** All your core memories and recent chat history have been erased.")
-            return True
-
-        async with aiosqlite.connect(DB_FILE) as db:
-            cursor = await db.execute("SELECT DISTINCT user_id FROM chat_history WHERE server_id = ? AND user_id IS NOT NULL", (server_id,))
-            active_users = [str(r[0]) for r in await cursor.fetchall()]
-            active_users.append(str(message.author.id))
-            active_users = list(set(active_users))
-            
-            if len(command_parts) > 1:
-                target_name = " ".join(command_parts[1:]).lower()
-                found_users = []
-                
-                if active_users:
-                    placeholders = ','.join('?' * len(active_users))
-                    params = [server_id] + active_users
-                    cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
-                    for row in await cursor.fetchall():
-                        if target_name in row[0].lower():
-                            found_users.append({"name": row[0], "facts": row[1]})
-                
-                if not found_users:
-                    memory_text = f"I couldn't find any memories for '{target_name}'."
-                elif len(found_users) == 1:
-                    memory_text = f"**Facts known about {found_users[0]['name']}:**\n{found_users[0]['facts']}"
-                else:
-                    names_list = "\n".join([f"• {u['name']}" for u in found_users])
-                    memory_text = f"⚠️ Found multiple users matching '{target_name}'. Please be more specific:\n{names_list}"
+                memory_text = f"I couldn't find any memories for '{target_user}'."
+            elif len(found_users) == 1:
+                memory_text = f"**Facts known about {found_users[0]['name']}:**\n{found_users[0]['facts']}"
             else:
-                memory_text = f"**Tracked Active Users**\nType `@{client.user.name} memory [name]` to search.\nType `@{client.user.name} memory clear` to erase your own data.\n\n"
-                found_any = False
-                if active_users:
-                    placeholders = ','.join('?' * len(active_users))
-                    params = [server_id] + active_users
-                    cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
-                    for row in await cursor.fetchall():
-                        if row[1] and row[1] != "No core memories yet.":
-                            memory_text += f"• {row[0]}\n"
-                            found_any = True
-                if not found_any: 
-                    memory_text += "*No core memories found for active users in this chat.*"
-        
-        # Output chunker logic
-        remaining_text = memory_text
-        is_first = True
-        while len(remaining_text) > 0:
-            split_index = remaining_text.rfind('\n', 0, DISCORD_CHUNK_LIMIT) if len(remaining_text) > DISCORD_CHUNK_LIMIT else len(remaining_text)
+                names_list = "\n".join([f"• {u['name']}" for u in found_users])
+                memory_text = f"⚠️ Found multiple users matching '{target_user}'. Please be more specific:\n{names_list}"
+        else:
+            memory_text = "**Tracked Active Users**\n\n"
+            found_any = False
+            if active_users:
+                placeholders = ','.join('?' * len(active_users))
+                params = [server_id] + active_users
+                cursor = await db.execute(f"SELECT user_name, facts FROM core_memories WHERE server_id = ? AND user_id IN ({placeholders})", params)
+                for row in await cursor.fetchall():
+                    if row[1] and row[1] != "No core memories yet.":
+                        memory_text += f"• {row[0]}\n"
+                        found_any = True
+            if not found_any: 
+                memory_text += "*No core memories found for active users in this chat.*"
+    
+    # Output chunker for slash commands
+    remaining_text = memory_text
+    while len(remaining_text) > 0:
+        split_index = remaining_text.rfind('\n', 0, DISCORD_CHUNK_LIMIT) if len(remaining_text) > DISCORD_CHUNK_LIMIT else len(remaining_text)
+        if split_index == -1: split_index = DISCORD_CHUNK_LIMIT
+        elif split_index < len(remaining_text): split_index += 1
             
-            if split_index == -1: 
-                split_index = DISCORD_CHUNK_LIMIT
-            elif split_index < len(remaining_text):
-                split_index += 1 # <--- Swallow the newline!
-                
-            chunk = remaining_text[:split_index]
-            remaining_text = remaining_text[split_index:]
-            try:
-                if is_first:
-                    try: 
-                        await message.reply(chunk)
-                    except discord.HTTPException as http_exc:
-                        if http_exc.code == 50035: 
-                            await message.channel.send(f"<@{message.author.id}> {chunk}")
-                    is_first = False
-                else:
-                    async with safe_typing(message.channel): 
-                        await asyncio.sleep(CHUNK_MESSAGE_DELAY)
-                    await message.channel.send(chunk)
-            except discord.Forbidden: 
-                break
-        return True
-    return False
+        chunk = remaining_text[:split_index]
+        remaining_text = remaining_text[split_index:]
+        
+        # Safely fires multiple times while maintaining ephemeral/thread privacy!
+        await interaction.followup.send(chunk)
+
+# ==========================================
+# 6. PIPELINE MODULES
+# ==========================================
 
 async def extract_message_context(message, clean_message, user_name):
     """Filters attachments, extracts PDFs, parses replied messages, and scrapes URLs."""
@@ -968,21 +915,28 @@ async def save_and_send_response(message, server_id, user_name, db_user_content_
             break
 
 # ==========================================
-# 6. DISCORD EVENTS (The Clean Monolith)
+# 7. DISCORD EVENTS (The Clean Monolith)
 # ==========================================
 
 @client.event
 async def on_ready():
-    # FIX: Instantiate asyncio primitives inside the running event loop for Python 3.8/3.9 compatibility
-    global memory_lock, llm_queue
+    # FIX: Instantiate asyncio primitives inside the running event loop
+    global memory_lock, llm_queue, synced_commands
     if memory_lock is None: 
         memory_lock = asyncio.Lock()
     if llm_queue is None: 
         llm_queue = asyncio.Semaphore(3)
 
     await init_db()
+    
+    # Sync the slash commands to Discord ONLY ONCE per script execution
+    if not synced_commands:
+        await tree.sync()
+        synced_commands = True
+        logging.info('🔄 Slash commands synced globally!')
+    
     logging.info(f'✅ Logged in successfully as {client.user}')
-    logging.info('🌐 Database & Autonomous Web Search enabled!')
+    logging.info('🌐 Database, Web Search, & Slash Commands enabled!')
 
 @client.event
 async def on_message(message):
@@ -1001,7 +955,7 @@ async def on_message(message):
     user_name = f"{message.author.display_name}_{str(message.author.id)[-4:]}"
 
     # Smart logger: Checks if there is text, media, or just an empty ping
-    log_content = clean_message if clean_message else ("[Media attached]" if message.attachments or message.stickers else "[Empty Ping / Help Trigger]")
+    log_content = clean_message if clean_message else ("[Media attached]" if message.attachments or message.stickers else "[Empty Ping]")
     logging.info(f"{message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
 
     # Substitute tagged users into the text for the AI's contextual awareness
@@ -1010,29 +964,27 @@ async def on_message(message):
             memory_formatted_name = f"{mentioned_user.display_name}_{str(mentioned_user.id)[-4:]}"
             clean_message = clean_message.replace(f"<@{mentioned_user.id}>", f"@{memory_formatted_name}").replace(f"<@!{mentioned_user.id}>", f"@{memory_formatted_name}")
 
-    # 1. Pipeline: Command Interception
-    if await handle_text_commands(message, clean_message, server_id): 
-        return
-
-    # 2. Pipeline: Data Extraction (PDFs, URLs, Files)
+    # 1. Pipeline: Data Extraction (PDFs, URLs, Files)
     clean_message, image_attachments, valid_stickers, ephemeral_context = await extract_message_context(message, clean_message, user_name)
+    
+    # UX SAVE: If a user pings the bot with literally no text and no files, gently point them to the new Slash Commands.
     if not clean_message.strip() and not image_attachments and not valid_stickers:
-        await handle_text_commands(message, "help", server_id) 
+        await message.reply(f"Hello! I've been upgraded to use Slash Commands. Type `/help` to see what I can do!") 
         return
 
-    # 3. Pipeline: Base64 Encoding & Payload Generation
+    # 2. Pipeline: Base64 Encoding & Payload Generation
     api_user_content, db_user_content_obj = await build_user_payloads(clean_message, ephemeral_context, image_attachments, valid_stickers, user_name)
 
-    # 4. Pipeline: VRAM Scrubbing & Prompt Assembly
+    # 3. Pipeline: VRAM Scrubbing & Prompt Assembly
     messages_to_send = await build_ai_context(server_id, str(message.author.id), api_user_content)
 
-    # 5. Pipeline: AI Generation & Tool Execution
+    # 4. Pipeline: AI Generation & Tool Execution
     # Scans the raw message for any HTTP/HTTPS links to strictly disable web search
     disable_search = bool(re.search(r'(https?://[^\s<>]+)', clean_message)) or (ephemeral_context and "Extracted PDF Content" in ephemeral_context)
     has_media = bool(image_attachments or valid_stickers)
     final_reply = await generate_ai_response(messages_to_send, message, disable_search, has_media)
 
-    # 6. Pipeline: Finalizing State
+    # 5. Pipeline: Finalizing State
     if final_reply:
         await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply)
 
