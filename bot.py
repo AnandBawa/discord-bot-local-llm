@@ -3,6 +3,7 @@ import io
 import re
 import json
 import base64
+import logging
 import asyncio
 import contextlib
 from datetime import datetime
@@ -21,6 +22,17 @@ from dotenv import load_dotenv
 # ==========================================
 load_dotenv()
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("bot.log", encoding='utf-8'),
+        logging.StreamHandler() # Also prints to the terminal
+    ]
+)
 
 LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'http://localhost:1234/v1')
 LLM_API_KEY = os.getenv('LLM_API_KEY', 'lm-studio')
@@ -64,10 +76,11 @@ DEFAULT_PERSONA = "You are a neutral, conversational AI."
 highest_token_count = 0                             
 background_tasks = set()                            
 pending_deletions = {}                              
+server_personas_cache = {}                          # RAM cache for server personas
 
 # FIX: Initialized as None to prevent Python 3.8/3.9 event loop crashes
 memory_lock = None                                  
-llm_queue = None                                    
+llm_queue = None                                  
 
 # ==========================================
 # 1. CORE DATABASE & UTILITY FUNCTIONS
@@ -174,7 +187,7 @@ async def perform_web_search(query):
         clean_query = clean_query.replace(variation, "")
     optimized_query = f"{' '.join(clean_query.split())} {current_date}"
 
-    print(f"🔍 AI initiated web search for: '{optimized_query}'")
+    logging.info(f"🔍 AI initiated web search for: '{optimized_query}'")
     try:
         results = await asyncio.to_thread(lambda: list(DDGS().text(optimized_query, max_results=WEB_SEARCH_MAX_RESULTS)))
         if not results: 
@@ -189,14 +202,14 @@ async def perform_web_search(query):
     
 async def fetch_url_content(url):
     """Fetches a URL via Jina Reader to convert webpages directly to Markdown."""
-    print(f"📡 Jina attempting to fetch: {url}")
+    logging.info(f"📡 Jina attempting to fetch: {url}")
     try:
         jina_url = f"https://r.jina.ai/{url}"
         async with aiohttp.ClientSession() as session:
             jina_headers = {"X-Return-Format": "markdown", "X-No-Cache": "true"}
             async with session.get(jina_url, timeout=SCRAPER_TIMEOUT, headers=jina_headers) as response:
                 if response.status != 200:
-                    print(f"❌ Jina Fetch Failed (HTTP {response.status})")
+                    logging.warning(f"❌ Jina Fetch Failed (HTTP {response.status})")
                     return {"type": "error", "data": f"Failed to access URL (HTTP {response.status})"}
                 
                 # Pre-flight check on declared file size
@@ -294,14 +307,14 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
             # Save memory unless an admin issued a wipe command during generation
             if new_memory != existing_memory and new_memory:
                 if pending_deletions.get(str(user_id), 0) > task_start_time or pending_deletions.get(f"wipe_{server_id}", 0) > task_start_time:
-                    print(f"[Memory] Aborted save for {user_name} due to mid-generation wipe request.")
+                    logging.info(f"[Memory] Aborted save for {user_name} due to mid-generation wipe request.")
                     return
                 async with aiosqlite.connect(DB_FILE) as db:
                     await db.execute('''INSERT INTO core_memories (server_id, user_id, user_name, facts) VALUES (?, ?, ?, ?) ON CONFLICT(server_id, user_id) DO UPDATE SET facts=excluded.facts, user_name=excluded.user_name''', (server_id, str(user_id), user_name, new_memory))
                     await db.commit()
-                print(f"[Memory] Core memory updated for {user_name} in server {server_id}.")
+                logging.info(f"[Memory] Core memory updated for {user_name} in server {server_id}.")
         except Exception as e: 
-            print(f"Failed to update core memory for {user_name}: {e}")
+            logging.error(f"Failed to update core memory for {user_name}: {e}")
 
 async def process_memories_sequentially(server_id, users_dict, forgotten_messages):
     """Processes background memories sequentially to avoid API throttling."""
@@ -401,6 +414,7 @@ async def handle_text_commands(message, clean_message, server_id):
             if new_prompt.lower() == 'clear':
                 await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
                 await db.commit()
+                server_personas_cache[server_id] = DEFAULT_PERSONA # Instantly update RAM cache
                 await message.reply(f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}")
             else:
                 if not new_prompt:
@@ -409,6 +423,7 @@ async def handle_text_commands(message, clean_message, server_id):
                     
                 await db.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt))
                 await db.commit()
+                server_personas_cache[server_id] = new_prompt # Instantly update RAM cache
                 await message.reply(f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{new_prompt}*")
         return True
 
@@ -619,7 +634,7 @@ async def extract_message_context(message, clean_message, user_name):
                 if len(pdf_text) > MAX_TEXT_EXTRACTION_LENGTH: 
                     pdf_text = pdf_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated due to length limit]"
                     
-                print(f"📎 AI successfully extracted UPLOADED PDF: {pdf.filename}")
+                logging.info(f"📎 AI successfully extracted UPLOADED PDF: {pdf.filename}")
                 ephemeral_context += f"\n\n[Extracted PDF Content from {pdf.filename}]:\n{pdf_text}"
                 clean_message += f"\n[System note: User attached PDF '{pdf.filename}']"
 
@@ -637,7 +652,7 @@ async def extract_message_context(message, clean_message, user_name):
             image_attachments.extend([att for att in replied_msg.attachments if att.content_type and att.content_type.startswith('image/')])
             valid_stickers.extend([s for s in replied_msg.stickers if s.format != discord.StickerFormatType.lottie])
         except Exception as e: 
-            print(f"⚠️ Could not fetch the replied message: {e}")
+            logging.warning(f"⚠️ Could not fetch the replied message: {e}")
 
     # 5. URL Scraping
     url_pattern = r'(https?://[^\s<>]+)'
@@ -706,9 +721,14 @@ async def build_ai_context(server_id, author_id, api_user_content):
                 if row[1] != "No core memories yet.": 
                     user_context_str += f"- {row[0]}: {row[1]}\n"
                     
-        cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
-        row = await cursor.fetchone()
-        base_persona = row[0] if row and row[0] else DEFAULT_PERSONA
+        # Check RAM cache first to avoid unnecessary disk I/O
+        if server_id in server_personas_cache:
+            base_persona = server_personas_cache[server_id]
+        else:
+            cursor = await db.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
+            row = await cursor.fetchone()
+            base_persona = row[0] if row and row[0] else DEFAULT_PERSONA
+            server_personas_cache[server_id] = base_persona # Save to cache for next time
 
     if user_context_str: 
         current_system_prompt += f"\n\nCRITICAL CONTEXT ABOUT ACTIVE USERS (READ ONLY - DO NOT REPEAT):\n{user_context_str}"
@@ -859,7 +879,7 @@ async def generate_ai_response(messages_to_send, message, disable_search, has_me
                 return final_reply or response_message.content or "⚠️ *System error: Empty response.*"
             except Exception as e:
                 error_str = str(e).lower()
-                print(f"Generation Error: {e}")
+                logging.error(f"Generation Error: {e}")
                 if has_media and ("400" in error_str or "vision" in error_str or "image" in error_str):
                     await message.reply("⚠️ **Compatibility Error:** Your local AI model does not support image analysis. Please use text only, or load a Multimodal Vision model.")
                 else: 
@@ -961,8 +981,8 @@ async def on_ready():
         llm_queue = asyncio.Semaphore(3)
 
     await init_db()
-    print(f'✅ Logged in successfully as {client.user}')
-    print('🌐 Database & Autonomous Web Search enabled!')
+    logging.info(f'✅ Logged in successfully as {client.user}')
+    logging.info('🌐 Database & Autonomous Web Search enabled!')
 
 @client.event
 async def on_message(message):
@@ -982,7 +1002,7 @@ async def on_message(message):
 
     # Smart logger: Checks if there is text, media, or just an empty ping
     log_content = clean_message if clean_message else ("[Media attached]" if message.attachments or message.stickers else "[Empty Ping / Help Trigger]")
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
+    logging.info(f"{message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
 
     # Substitute tagged users into the text for the AI's contextual awareness
     for mentioned_user in message.mentions:
@@ -1015,6 +1035,20 @@ async def on_message(message):
     # 6. Pipeline: Finalizing State
     if final_reply:
         await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply)
+
+# Intercept the default close method
+original_close = client.close
+
+async def graceful_shutdown():
+    logging.info("Shutdown signal received. Waiting for background memory tasks to finish...")
+    if background_tasks:
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        logging.info("All background tasks completed. Memories safely saved.")
+    logging.info("Disconnecting from Discord. Goodbye!")
+    await original_close()
+
+# Assign our custom shutdown sequence to the client
+client.close = graceful_shutdown
 
 if TOKEN: 
     client.run(TOKEN)
