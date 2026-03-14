@@ -78,7 +78,7 @@ WEB_SEARCH_MAX_RESULTS = 3                          # Number of DuckDuckGo snipp
 DISCORD_CHUNK_LIMIT = 1980                          # Safe limit for Discord's 2000 char cap
 CHUNK_MESSAGE_DELAY = 1.5                           # Wait time (seconds) between chunks
 WIPE_REQUEST_EXPIRY = 3600                          # Seconds to hold a data-deletion lock
-DEFAULT_PERSONA = "You are a neutral, conversational AI." 
+DEFAULT_PERSONA = "You are a neutral, conversational AI."       # Default server persona if none is set
 
 # --- INTERNAL STATE (Do not modify) ---
 highest_token_count = 0                             
