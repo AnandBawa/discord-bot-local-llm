@@ -1,15 +1,15 @@
 # Discord AI Agent
 
-A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interface seamlessly with local LLMs (via LM Studio or similar OpenAI-compatible APIs), this agent features long-term memory management, autonomous web searching, document parsing, and image analysis capabilities.
+A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interface seamlessly with local LLMs (via LM Studio or similar OpenAI-compatible APIs), this agent features long-term memory management, autonomous web searching, document parsing, native Slash Commands (`/`), and image analysis capabilities.
 
 ## Key Features
 
 - **Intelligent Memory Management:** Uses SQLite (`aiosqlite`) to maintain a rolling chat history and automatically summarizes older conversations into permanent "core memories" for each user, preventing LLM context window overflow.
-- **Multimodal Capabilities:** Safely processes user-uploaded images and Discord stickers using PIL (Pillow), downscaling them to conserve VRAM. Unsupported file formats are elegantly intercepted, prompting the AI to politely request supported formats (Images/PDFs).
+- **Multimodal Capabilities:** Safely processes user-uploaded images and Discord stickers using `PIL` (Pillow), downscaling them to conserve VRAM. Unsupported file formats are elegantly intercepted, prompting the AI to politely request supported formats (Images/PDFs).
 - **Autonomous Web Search:** Integrates the DuckDuckGo search engine (`ddgs`) as an automated tool. The AI can independently query the web to answer questions about current events or missing facts.
-- **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (fitz) and seamlessly converts shared URLs into readable Markdown using the Jina Reader API (r.jina.ai). It features strict context-locking to prevent AI hallucinations when processing documents, and safely intercepts unsupported binary files (like audio or zip archives) to conserve bandwidth.
+- **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`fitz`) and seamlessly converts shared URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). It features strict context-locking to prevent AI hallucinations when processing documents, and safely intercepts unsupported binary files (like audio or zip archives) to conserve bandwidth.
+- **Native Slash Commands:** Utilizes Discord's modern UI (`/commands`) for clean, spam-free interactions and role-based access control.
 - **Markdown-Aware Message Chunking:** Safely bypasses Discord's 2,000-character limit by intelligently splitting long responses without breaking Markdown code blocks.
-- **Custom Personas:** Administrators can define custom system prompts on a per-server basis.
 
 ## Prerequisites
 
@@ -24,15 +24,13 @@ A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interf
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows use: venv\Scripts\activate
-
 ```
 
 2. **Install dependencies:**
-   Create a `requirements.txt` file or run the following pip command directly. Note that `ddgs` is used for web searching:
+   Create a `requirements.txt` file or run the following pip command directly:
 
 ```bash
 pip install discord.py openai python-dotenv aiosqlite PyMuPDF Pillow aiohttp ddgs
-
 ```
 
 3. **Configure Environment Variables:**
@@ -43,39 +41,33 @@ DISCORD_BOT_TOKEN=your_discord_bot_token_here
 LLM_BASE_URL=http://localhost:1234/v1
 LLM_API_KEY=lm-studio
 LLM_MODEL_NAME=local-model
-
+BOT_OWNER_ID=your_discord_user_id_here
 ```
 
 4. **Run the Bot:**
 
 ```bash
 python bot.py
-
 ```
 
 ## Bot Commands
 
-The bot responds to natural language when @mentioned, but also supports the following specific text commands:
+The bot features two distinct ways to interact: standard conversational tagging, and native Slash Commands (`/`).
 
-### General & Persona
+### General Chat
 
-- **`@BotName [message]`**: Chat or ask questions. The bot will automatically analyze any attached files or links.
-- **`@BotName role`**: View the active AI personality for the server.
-- **`@BotName role [prompt]`**: Assign a new personality to the bot and start a fresh conversation.
-- **`@BotName role clear`**: Restore the bot to its default neutral personality.
+- **`@BotName [message]`**: Chat or ask questions natively in the channel. The bot will automatically analyze any attached files or links.
+- **Reply to the Bot**: Reply directly to one of the bot's messages and tag it to seamlessly continue an exact train of thought.
 
-### Memory Management
+### Slash Commands (`/`)
 
-- **`@BotName clear`**: Clear the current conversation history (core facts are safely retained).
-- **`@BotName memory`**: List all users who have saved core memories in the server.
-- **`@BotName memory [name]`**: Read the permanent facts the AI has learned about a specific user.
-- **`@BotName memory clear`**: Delete your own personal memories and chat history from the server.
-
-### System & Administration
-
-- **`@BotName status`**: Check bot latency, the active LLM model, peak token usage, and active memory capacity.
-- **`@BotName force-forget [name]`**: _(Bot Owner Only)_ Purge all stored data for a specific user across the server.
-- **`@BotName wipe-server-memories`**: _(Bot Owner Only)_ Complete factory reset of all core memories and chat history for the server.
+- **`/help`**: Display the interactive guide and view current system limits (Ephemeral - only visible to you).
+- **`/status`**: Check bot diagnostics, ping, active AI model, and current chat history capacity.
+- **`/role`**: View the active AI personality, or assign a new personality and start a fresh conversation. Type `clear` to restore the neutral default.
+- **`/memory`**: Opens an interactive menu to list tracked users, read the permanent facts the AI has learned about a specific user, or securely delete your own data.
+- **`/clear`**: Clear the current server's temporary conversation history (core facts are safely retained).
+- **`/force-forget`**: _(Admin/Owner Only)_ Purge all stored date for a specific user.
+- **`/admin_wipe_server`**: _(Admin/Owner Only)_ Complete factory reset of all core memories and chat history for the entire server.
 
 ## Advanced Configuration
 
