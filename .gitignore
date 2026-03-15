@@ -206,7 +206,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-venv_bot/
+venv_bot
 global_data.json
 core_memories.json
 bot_database.*
+bot_database.db
+chroma_storage
+bot.log
+test*
