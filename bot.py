@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import requests
 import time
+import math
 import hashlib
 import ipaddress
 import uuid
@@ -908,7 +909,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 **Slash Commands:**
 • **`/help`** - Display this guide.
-• **`/status`** - Check diagnostics, supported inputs, and limits.
+• **`/status`** - See bot status, supported inputs, and limits.
 • **`/role`** - View, change, or clear the AI's personality.
 • **`/remember`** - Save a fact about yourself for this server.\n• **`/memory`** - List users, read saved facts, or clear your own memory.
 • **`/clear`** - Clear the temporary conversation history (core facts retained).
@@ -917,48 +918,52 @@ async def cmd_help(interaction: discord.Interaction):
 """
     await interaction.response.send_message(help_text, ephemeral=True)
 
-@tree.command(name="status", description="Check diagnostics, supported inputs, and limits.")
+@tree.command(name="status", description="See bot status, supported inputs, and limits.")
 async def cmd_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
-    ping_ms = round(client.latency * 1000)
-    
-    # 1. Ping the local AI node (Using our 2.0s fail-fast timeout!)
+    latency = client.latency
+    ping = f"{round(latency * 1000)} ms" if math.isfinite(latency) else "Not available yet"
     try:
-        await client.lm_client.models.list()
-        active_llm = f"🟢 Local ({client.config.model})"
-        active_emb = f"🟢 Local ({client.config.embedding_model})"
+        await asyncio.wait_for(client.lm_client.models.list(), timeout=5.0)
+        server_status = "Responding"
     except Exception:
-        # 2. If local fails, check if we have a cloud failover ready
-        if client.fallback_client:
-            active_llm = f"🟡 Cloud Fallback ({client.config.fallback_model})"
-            active_emb = f"🟡 Cloud Fallback (jina-embeddings-v5-text-small)"
-        else:
-            active_llm = "🔴 Offline (No fallback configured)"
-            active_emb = "🔴 Offline (No fallback configured)"
-        
-    # 3. Fetch Database Stats
-    cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),))
-    history_length = (await cursor.fetchone())[0]
-        
-    vision_status = "Enabled (requires a vision-capable chat model)" if client.config.vision_enabled else "Disabled in bot settings"
+        server_status = "Check failed"
+
+    chat_backup = f"Configured ({client.config.fallback_model or 'model not set'})" if client.fallback_client else "Not configured"
+    memory_backup = "Configured (Jina)" if client.config.embedding_key else "Not configured"
+    async with client.db_lock:
+        cursor = await client.db_conn.execute(
+            "SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),),
+        )
+        history_length = (await cursor.fetchone())[0]
+    vision = "Enabled; the chat model must support images" if client.config.vision_enabled else "Disabled in bot settings"
+    tokens = f"{client.highest_token_count:,} tokens (input + output)" if client.highest_token_count else "No usage reported yet"
 
     diagnostics = (
-        f"**Bot Diagnostics & Status**\n\n"
-        f"• **Discord Ping:** `{ping_ms}ms`\n"
-        f"• **Active LLM:** `{active_llm}`\n"
-        f"• **Active Embeddings:** `{active_emb}`\n"
-        f"• **Peak Context Used:** `{client.highest_token_count} tokens`\n"
-        f"• **Current History:** `{history_length}/{MAX_HISTORY_LENGTH} messages`\n\n"
-        "**Inputs & Capabilities**\n"
-        "• **Text & code:** Send directly in messages.\n"
-        f"• **Images & stickers:** {vision_status}.\n"
-        f"• **PDFs:** Text extraction from the first {MAX_PDF_PAGES} pages; scanned pages are not read.\n"
-        "• **Web:** Public webpage/image links; web search requires a chat model with tool calling.\n"
-        f"• **File limit:** {MAX_FILE_SIZE / (1024 * 1024):g} MiB per image/PDF.\n"
-        f"• **Document text limit:** {MAX_TEXT_EXTRACTION_LENGTH:,} characters per PDF/webpage.\n"
-        "• **Unsupported:** Audio/video, other file attachments, and Lottie stickers."
+        "**Bot status**\n"
+        f"• **Discord ping:** {ping}\n"
+        f"• **Primary AI server:** {server_status}\n"
+        f"• **Chat model (configured):** `{client.config.model}`\n"
+        f"• **Memory search model (configured):** `{client.config.embedding_model}`\n"
+        f"• **Chat backup:** {chat_backup}\n"
+        f"• **Memory search backup:** {memory_backup}\n"
+        "The server check does not test model responses or backups.\n"
+        f"• **This server's history:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
+        f"• **Largest reported AI request:** {tokens}\n"
+        "Request usage covers all servers since the bot started.\n\n"
+        "**What you can send**\n"
+        "• **Text and code:** Type or paste it into a message.\n"
+        f"• **Images and stickers:** {vision}. Some animated stickers cannot be read.\n"
+        "• **PDFs:** Reads text you can select or copy. Scanned page images are not read.\n"
+        "• **Links:** Public webpages and image links.\n"
+        "• **Web search:** Searches with source links when the chat model can use tools.\n\n"
+        "**Limits**\n"
+        f"• **Image/PDF size:** About {MAX_FILE_SIZE / 1_000_000:.1f} MB per file.\n"
+        f"• **PDF pages:** Reads the first {MAX_PDF_PAGES} pages.\n"
+        f"• **Document text:** Reads up to {MAX_TEXT_EXTRACTION_LENGTH:,} characters per PDF or webpage.\n"
+        "• **Other uploads:** Audio, video, Word/Excel files, and text-file attachments are not supported."
     )
-    await interaction.followup.send(diagnostics)
+    await send_chunked_message(interaction, diagnostics, is_interaction_followup=True)
 
 @tree.command(name="role", description="View or change the AI's personality for this server.")
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
