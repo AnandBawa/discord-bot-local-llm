@@ -8,7 +8,7 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 - **Explicit Memory:** `/remember` saves a fact immediately in SQLite while the background worker indexes it in Chroma. Members can view saved facts or clear their own memory through `/memory`; facts remain shared within the server.
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
 - **Cloud Fallback:** Chat and memory extraction share local/cloud routing. Embeddings have an independent failure cooldown. A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
-- **Image Analysis:** Passes images and Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
+- **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
@@ -111,8 +111,10 @@ The bot features two distinct ways to interact: standard conversational tagging,
 
 ### General Chat
 
-- **`@BotName [message]`**: Chat or ask questions natively in the channel. The bot will automatically analyze any attached files or links.
+- **`@BotName [message]`**: Chat or ask questions in the channel. The bot can analyze supported attachments and public links.
 - **Reply to the Bot**: A reply whose referenced message is delivered or cached is recognised without an extra tag. Tag the bot if the reference is unavailable. Without Read Message History, it can use its saved conversation but cannot fetch missing Discord messages or their attachments.
+
+Unsupported file attachments and oversized images/PDFs are skipped, with a note passed to the chat model; remaining text and supported attachments are processed normally. The explanation to the user depends on the model, so there is no guaranteed rejection message. Unsupported animated stickers are silently skipped; a mention with only such a sticker receives the generic `/help` greeting.
 
 ### Slash Commands (`/`)
 
