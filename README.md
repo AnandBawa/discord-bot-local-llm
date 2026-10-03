@@ -117,7 +117,7 @@ The bot features two distinct ways to interact: standard conversational tagging,
 ### Slash Commands (`/`)
 
 - **`/help`**: Display the command guide (Ephemeral - only visible to you).
-- **`/status`**: Show the primary server connection check, configured chat/memory models and backups, server history, and largest reported AI request. The connection check has a five-second timeout and does not verify model responses or backups. Request usage includes input and output across all servers since startup. Also lists supported inputs, the image setting, file/page/text limits, and unsupported uploads in plain language. Images and web search depend on the chat model's capabilities.
+- **`/status`**: Show ping, server history, chat/memory models, supported inputs, and key limits. Model lines reflect each service's most recent successful request across the bot; fallback appears on the relevant model line only after successful use. Before first use, the configured primary models are shown. The command makes no provider requests. Images and web search require a compatible chat model.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Extraction input from the previous conversation is retained until processing succeeds. Type `clear` to restore the neutral default.
 - **`/remember fact:...`**: Save a fact about yourself immediately, up to 500 characters. The confirmation is private; the saved fact is shared server memory.
 - **`/memory`**: List tracked users, read facts (your own by default), or clear your own saved facts and conversation data in the current server. `target_user` applies only to reading.

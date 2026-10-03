@@ -50,34 +50,83 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                                  {"user_id": user, "server_id": server, "user_name": name})
         return key
 
-    async def test_status_distinguishes_server_response_and_configured_backups(self):
+    async def test_status_reports_independent_models_from_successful_requests(self):
         self.client.config.model = "primary-chat"
-        self.client.config.embedding_model = "primary-embedding"
-        self.client.config.fallback_model = "backup-chat"
-        models = self.client.lm_client.models = SimpleNamespace(list=AsyncMock(return_value=[]))
+        self.client.config.embedding_model = "primary-memory"
+        self.client.config.fallback_model = "fallback-chat"
+        cloud = AsyncMock(return_value=self.completion("Answer"))
+        self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
+        models = self.client.lm_client.models = SimpleNamespace(list=AsyncMock())
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.123):
-            for responding in (True, False):
-                for chat_backup in (True, False):
-                    for memory_backup in (True, False):
-                        with self.subTest(responding=responding, chat_backup=chat_backup, memory_backup=memory_backup):
-                            models.list.side_effect = None if responding else RuntimeError("server check failed")
-                            self.client.fallback_client = SimpleNamespace(close=AsyncMock()) if chat_backup else None
-                            self.client.config.embedding_key = "synthetic" if memory_backup else ""
-                            interaction = self.interaction()
-                            await self.bot.cmd_status.callback(interaction)
-                            text = interaction.followup.send.call_args.args[0]
-                            self.assertIn("**Primary AI server:** " + ("Responding" if responding else "Check failed"), text)
-                            self.assertIn("**Chat model (configured):** `primary-chat`", text)
-                            self.assertIn("**Memory search model (configured):** `primary-embedding`", text)
-                            self.assertIn("**Chat backup:** " + ("Configured (backup-chat)" if chat_backup else "Not configured"), text)
-                            self.assertIn("**Memory search backup:** " + ("Configured (Jina)" if memory_backup else "Not configured"), text)
-                            self.assertIn("does not test model responses or backups", text)
-        self.assertEqual(models.list.await_count, 8)
-        self.create.assert_not_awaited()
+            for chat_fallback, memory_fallback in ((True, False), (False, True), (True, True), (False, False)):
+                with self.subTest(chat_fallback=chat_fallback, memory_fallback=memory_fallback):
+                    self.client.chat_dead_until = 0
+                    self.create.side_effect = RuntimeError("chat unavailable") if chat_fallback else None
+                    primary = SimpleNamespace(model_name="primary-memory", embed=Mock(return_value=[[1.0, 0.0]]))
+                    primary.embed.side_effect = RuntimeError("embedding unavailable") if memory_fallback else None
+                    fallback = SimpleNamespace(model_name="fallback-memory", embed=Mock(return_value=[[1.0, 0.0]]))
+                    self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
+                    await self.bot.request_completion(messages=[])
+                    self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
+                    # Expiry does not change which provider actually handled the last request.
+                    self.client.chat_dead_until = self.client.custom_ef.dead_until = 0
+                    interaction = self.interaction()
+                    await self.bot.cmd_status.callback(interaction)
+                    text = interaction.followup.send.call_args.args[0]
+                    self.assertIn("**Chat model:** `" + ("fallback-chat (fallback)" if chat_fallback else "primary-chat") + "`", text)
+                    self.assertIn("**Memory model:** `" + ("fallback-memory (fallback)" if memory_fallback else "primary-memory") + "`", text)
+                    self.assertNotIn("backup:", text.lower())
+        models.list.assert_not_awaited()
 
-    async def test_status_reports_scoped_history_usage_and_configured_input_limits(self):
-        self.client.lm_client.models = SimpleNamespace(list=AsyncMock(return_value=[]))
-        self.client.highest_token_count = 4096
+    async def test_status_keeps_primary_models_until_fallback_succeeds(self):
+        self.client.config.model = "primary-chat"
+        self.client.config.embedding_model = "primary-memory"
+        self.client.config.fallback_model = "fallback-chat"
+        cloud = AsyncMock(side_effect=RuntimeError("fallback unavailable"))
+        self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
+        primary = SimpleNamespace(model_name="primary-memory", embed=Mock(side_effect=RuntimeError("primary unavailable")))
+        fallback = SimpleNamespace(model_name="fallback-memory", embed=Mock(side_effect=RuntimeError("fallback unavailable")))
+        self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
+        self.client.lm_client.models = SimpleNamespace(list=AsyncMock(side_effect=AssertionError("Status must not probe providers")))
+        with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1):
+            for failed_attempt in (False, True):
+                if failed_attempt:
+                    self.create.side_effect = RuntimeError("primary unavailable")
+                    with self.assertRaises(RuntimeError):
+                        await self.bot.request_completion(messages=[])
+                    with self.assertRaises(RuntimeError):
+                        self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
+                interaction = self.interaction()
+                await self.bot.cmd_status.callback(interaction)
+                text = interaction.followup.send.call_args.args[0]
+                self.assertIn("**Chat model:** `primary-chat`", text)
+                self.assertIn("**Memory model:** `primary-memory`", text)
+                self.assertNotIn("fallback-chat", text)
+                self.assertNotIn("fallback-memory", text)
+            cloud.side_effect = fallback.embed.side_effect = None
+            cloud.return_value = self.completion("Answer")
+            fallback.embed.return_value = [[1.0, 0.0]]
+            # Both requests now go straight to fallback during their separate cooldowns.
+            await self.bot.request_completion(messages=[])
+            self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
+            interaction = self.interaction()
+            await self.bot.cmd_status.callback(interaction)
+            text = interaction.followup.send.call_args.args[0]
+            self.assertIn("**Chat model:** `fallback-chat (fallback)`", text)
+            self.assertIn("**Memory model:** `fallback-memory (fallback)`", text)
+            self.client.chat_dead_until = self.client.custom_ef.dead_until = 0
+            self.create.side_effect = primary.embed.side_effect = None
+            primary.embed.return_value = [[1.0, 0.0]]
+            await self.bot.request_completion(messages=[])
+            self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
+            interaction = self.interaction()
+            await self.bot.cmd_status.callback(interaction)
+            text = interaction.followup.send.call_args.args[0]
+            self.assertIn("**Chat model:** `primary-chat`", text)
+            self.assertIn("**Memory model:** `primary-memory`", text)
+        self.client.lm_client.models.list.assert_not_awaited()
+
+    async def test_status_reports_scoped_history_and_configured_input_limits(self):
         await self.seed(count=2, server_id="1")
         await self.seed(count=4, server_id="2")
         with patch.object(self.bot, "MAX_FILE_SIZE", 4_000_000), \
@@ -90,39 +139,17 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                     interaction = self.interaction()
                     await self.bot.cmd_status.callback(interaction)
                     text = interaction.followup.send.call_args.args[0]
-                    self.assertIn("123 ms" if latency == 0.123 else "Not available yet", text)
-                    self.assertIn("Enabled; the chat model must support images" if vision else "Disabled in bot settings", text)
-                    self.assertIn("**This server's history:** 2/100 messages", text)
-                    self.assertIn("4,096 tokens (input + output)", text)
-                    self.assertIn("all servers since the bot started", text)
-                    self.assertIn("4.0 MB per file", text)
-                    self.assertIn("first 7 pages", text)
+                    self.assertIn("123 ms" if latency == 0.123 else "Unavailable", text)
+                    self.assertIn("**Images/stickers:** " + ("On" if vision else "Off"), text)
+                    self.assertIn("**History:** 2/100 messages", text)
+                    self.assertIn("4.0 MB per image/PDF", text)
+                    self.assertIn("7 PDF pages", text)
                     self.assertIn("12,345 characters", text)
-                    self.assertLessEqual(len(text), 2000)
-
-    async def test_status_delivers_when_server_probe_stalls(self):
-        cancelled = asyncio.Event()
-        async def stalled():
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cancelled.set()
-        self.client.lm_client.models = SimpleNamespace(list=AsyncMock(side_effect=stalled))
-        interaction = self.interaction()
-        with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1):
-            await asyncio.wait_for(self.bot.cmd_status.callback(interaction), timeout=6.0)
-        self.assertTrue(cancelled.is_set())
-        text = interaction.followup.send.call_args.args[0]
-        self.assertIn("**Primary AI server:** Check failed", text)
-        self.assertIn("What you can send", text)
-        self.assertIn("No usage reported yet", text)
+                    self.assertLess(len(text), 600)
 
     async def test_status_with_long_model_names_fits_discord_messages(self):
-        self.client.lm_client.models = SimpleNamespace(list=AsyncMock(return_value=[]))
         self.client.config.model = "chat-" + "a" * 2100
         self.client.config.embedding_model = "memory-" + "b" * 2100
-        self.client.fallback_client = SimpleNamespace(close=AsyncMock())
-        self.client.config.fallback_model = "backup-" + "c" * 2100
         interaction = self.interaction()
         interaction.channel = self.chat().channel
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1), \
@@ -132,10 +159,9 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 2000 for chunk in chunks))
         text = "".join(chunks)
-        for model in (self.client.config.model, self.client.config.embedding_model, self.client.config.fallback_model):
+        for model in (self.client.config.model, self.client.config.embedding_model):
             self.assertIn(model, text)
-        self.assertIn("What you can send", text)
-        self.assertTrue(text.endswith("not supported."))
+        self.assertTrue(text.endswith("compatible chat model."))
 
     async def test_missing_history_uses_normal_message_and_fits_discord_limit(self):
         message = self.chat(history=False)

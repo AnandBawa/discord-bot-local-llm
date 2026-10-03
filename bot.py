@@ -117,23 +117,29 @@ class ResilientEmbeddingFunction:
         self.primary_ef = primary_ef  
         self.fallback_ef = fallback_ef
         self.dead_until = 0.0
+        self.last_used_fallback = False
 
     def embed(self, input_texts: list[str], task: str) -> list[list[float]]:
         
         # 1. If the breaker is tripped, go straight to the cloud
         if time.monotonic() < self.dead_until and self.fallback_ef:
-            return self.fallback_ef.embed(input_texts, task)
+            result = self.fallback_ef.embed(input_texts, task)
+            self.last_used_fallback = True
+            return result
             
         # 2. Otherwise, try local
         try:
             result = self.primary_ef.embed(input_texts, task)
             self.dead_until = 0.0 # Reset breaker on success!
+            self.last_used_fallback = False
             return result
         except Exception as e:
             logging.warning(f"⚠️ Local Embedding failed: {e}. Tripping circuit breaker and routing to cloud...")
             self.dead_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
             if self.fallback_ef:
-                return self.fallback_ef.embed(input_texts, task)
+                result = self.fallback_ef.embed(input_texts, task)
+                self.last_used_fallback = True
+                return result
             raise
 
 class MyAIClient(discord.Client):
@@ -143,6 +149,7 @@ class MyAIClient(discord.Client):
         self.lm_client = None
         self.fallback_client = None
         self.chat_dead_until = 0.0
+        self.chat_last_used_fallback = False
         self.db_path = "bot_database.db"
         self.memory_path = "./chroma_storage"
         self.memory_lock = None
@@ -723,6 +730,7 @@ async def request_completion(*, prefer_fallback=False, **kwargs):
             use_fallback = True
     if use_fallback:
         response = await client.fallback_client.chat.completions.create(model=client.config.fallback_model, **kwargs)
+    client.chat_last_used_fallback = use_fallback
     usage = getattr(response, "usage", None)
     if usage and usage.total_tokens is not None:
         client.highest_token_count = max(client.highest_token_count, usage.total_tokens)
@@ -909,7 +917,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 **Slash Commands:**
 • **`/help`** - Display this guide.
-• **`/status`** - See bot status, supported inputs, and limits.
+• **`/status`** - See models, supported inputs, and limits.
 • **`/role`** - View, change, or clear the AI's personality.
 • **`/remember`** - Save a fact about yourself for this server.\n• **`/memory`** - List users, read saved facts, or clear your own memory.
 • **`/clear`** - Clear the temporary conversation history (core facts retained).
@@ -918,52 +926,35 @@ async def cmd_help(interaction: discord.Interaction):
 """
     await interaction.response.send_message(help_text, ephemeral=True)
 
-@tree.command(name="status", description="See bot status, supported inputs, and limits.")
+@tree.command(name="status", description="See models, supported inputs, and limits.")
 async def cmd_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     latency = client.latency
-    ping = f"{round(latency * 1000)} ms" if math.isfinite(latency) else "Not available yet"
-    try:
-        await asyncio.wait_for(client.lm_client.models.list(), timeout=5.0)
-        server_status = "Responding"
-    except Exception:
-        server_status = "Check failed"
-
-    chat_backup = f"Configured ({client.config.fallback_model or 'model not set'})" if client.fallback_client else "Not configured"
-    memory_backup = "Configured (Jina)" if client.config.embedding_key else "Not configured"
+    ping = f"{round(latency * 1000)} ms" if math.isfinite(latency) else "Unavailable"
+    chat_model = client.config.model
+    memory_model = client.config.embedding_model
+    if client.chat_last_used_fallback:
+        chat_model = f"{client.config.fallback_model} (fallback)"
+    if getattr(client.custom_ef, "last_used_fallback", False):
+        memory_model = f"{client.custom_ef.fallback_ef.model_name} (fallback)"
     async with client.db_lock:
         cursor = await client.db_conn.execute(
             "SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),),
         )
         history_length = (await cursor.fetchone())[0]
-    vision = "Enabled; the chat model must support images" if client.config.vision_enabled else "Disabled in bot settings"
-    tokens = f"{client.highest_token_count:,} tokens (input + output)" if client.highest_token_count else "No usage reported yet"
-
-    diagnostics = (
+    vision = "On" if client.config.vision_enabled else "Off"
+    status = (
         "**Bot status**\n"
-        f"• **Discord ping:** {ping}\n"
-        f"• **Primary AI server:** {server_status}\n"
-        f"• **Chat model (configured):** `{client.config.model}`\n"
-        f"• **Memory search model (configured):** `{client.config.embedding_model}`\n"
-        f"• **Chat backup:** {chat_backup}\n"
-        f"• **Memory search backup:** {memory_backup}\n"
-        "The server check does not test model responses or backups.\n"
-        f"• **This server's history:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
-        f"• **Largest reported AI request:** {tokens}\n"
-        "Request usage covers all servers since the bot started.\n\n"
-        "**What you can send**\n"
-        "• **Text and code:** Type or paste it into a message.\n"
-        f"• **Images and stickers:** {vision}. Some animated stickers cannot be read.\n"
-        "• **PDFs:** Reads text you can select or copy. Scanned page images are not read.\n"
-        "• **Links:** Public webpages and image links.\n"
-        "• **Web search:** Searches with source links when the chat model can use tools.\n\n"
-        "**Limits**\n"
-        f"• **Image/PDF size:** About {MAX_FILE_SIZE / 1_000_000:.1f} MB per file.\n"
-        f"• **PDF pages:** Reads the first {MAX_PDF_PAGES} pages.\n"
-        f"• **Document text:** Reads up to {MAX_TEXT_EXTRACTION_LENGTH:,} characters per PDF or webpage.\n"
-        "• **Other uploads:** Audio, video, Word/Excel files, and text-file attachments are not supported."
+        f"• **Ping:** {ping} | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
+        f"• **Chat model:** `{chat_model}`\n"
+        f"• **Memory model:** `{memory_model}`\n"
+        "• **Inputs:** Text/code, text PDFs, public links\n"
+        f"• **Images/stickers:** {vision} | **Web search:** Available\n"
+        f"• **Limits:** ~{MAX_FILE_SIZE / 1_000_000:.1f} MB per image/PDF; "
+        f"{MAX_PDF_PAGES} PDF pages; {MAX_TEXT_EXTRACTION_LENGTH:,} characters per document\n"
+        "Images and web search require a compatible chat model."
     )
-    await send_chunked_message(interaction, diagnostics, is_interaction_followup=True)
+    await send_chunked_message(interaction, status, is_interaction_followup=True)
 
 @tree.command(name="role", description="View or change the AI's personality for this server.")
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
