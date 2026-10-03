@@ -908,7 +908,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 **Slash Commands:**
 • **`/help`** - Display this guide.
-• **`/status`** - Check diagnostics and ping.
+• **`/status`** - Check diagnostics, supported inputs, and limits.
 • **`/role`** - View, change, or clear the AI's personality.
 • **`/remember`** - Save a fact about yourself for this server.\n• **`/memory`** - List users, read saved facts, or clear your own memory.
 • **`/clear`** - Clear the temporary conversation history (core facts retained).
@@ -917,7 +917,7 @@ async def cmd_help(interaction: discord.Interaction):
 """
     await interaction.response.send_message(help_text, ephemeral=True)
 
-@tree.command(name="status", description="Check bot diagnostics, ping, and AI model status.")
+@tree.command(name="status", description="Check diagnostics, supported inputs, and limits.")
 async def cmd_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     ping_ms = round(client.latency * 1000)
@@ -940,13 +940,23 @@ async def cmd_status(interaction: discord.Interaction):
     cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),))
     history_length = (await cursor.fetchone())[0]
         
+    vision_status = "Enabled (requires a vision-capable chat model)" if client.config.vision_enabled else "Disabled in bot settings"
+
     diagnostics = (
         f"**Bot Diagnostics & Status**\n\n"
         f"• **Discord Ping:** `{ping_ms}ms`\n"
         f"• **Active LLM:** `{active_llm}`\n"
         f"• **Active Embeddings:** `{active_emb}`\n"
         f"• **Peak Context Used:** `{client.highest_token_count} tokens`\n"
-        f"• **Current History:** `{history_length}/{MAX_HISTORY_LENGTH} messages`"
+        f"• **Current History:** `{history_length}/{MAX_HISTORY_LENGTH} messages`\n\n"
+        "**Inputs & Capabilities**\n"
+        "• **Text & code:** Send directly in messages.\n"
+        f"• **Images & stickers:** {vision_status}.\n"
+        f"• **PDFs:** Text extraction from the first {MAX_PDF_PAGES} pages; scanned pages are not read.\n"
+        "• **Web:** Public webpage/image links; web search requires a chat model with tool calling.\n"
+        f"• **File limit:** {MAX_FILE_SIZE / (1024 * 1024):g} MiB per image/PDF.\n"
+        f"• **Document text limit:** {MAX_TEXT_EXTRACTION_LENGTH:,} characters per PDF/webpage.\n"
+        "• **Unsupported:** Audio/video, other file attachments, and Lottie stickers."
     )
     await interaction.followup.send(diagnostics)
 
