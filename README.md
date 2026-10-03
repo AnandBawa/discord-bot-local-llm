@@ -1,20 +1,20 @@
 # Discord AI Bot
 
-A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interface seamlessly with local LLMs (via LM Studio, Ollama, or similar OpenAI-compatible APIs), this agent features a robust dual-database architecture for long-term semantic memory (RAG), autonomous web searching, document parsing, native Slash Commands (`/`), image analysis capabilities, and an advanced failover routing system.
+A Discord server bot with a shared conversation and persona, plus remembered facts associated with members. It connects to local OpenAI-compatible chat and embedding endpoints, with optional cloud fallback, web search, PDF extraction, and image analysis.
 
 ## Key Features
 
-- **Dual-Database Memory Architecture (RAG):** Uses a highly optimized two-tier memory system. **SQLite** (`aiosqlite` in WAL mode) acts as the bot's short-term memory to maintain chronological chat history. **ChromaDB** acts as a permanent, searchable Vector Database. Older conversations are automatically distilled into core facts and mathematically retrieved (RAG) when contextually relevant.
-- **Cloud Failover Routing:** Implements a strict fail-fast connection timeout. If your local LLM or Embedding node goes offline, the bot seamlessly routes requests to a configured cloud fallback API (like OpenAI or Jina) to ensure zero downtime.
-- **Multimodal Capabilities (with Vision Toggle):** Safely processes user-uploaded images and Discord stickers using `PIL` (Pillow), downscaling them to conserve VRAM. Vision can be globally toggled on or off via environment variables. Unsupported files are elegantly intercepted.
+- **Shared Server Memory:** SQLite stores chronological conversation history and retains input awaiting memory extraction. ChromaDB stores extracted text facts for semantic retrieval. Failed extraction is retried, including after restart.
+- **Cloud Fallback:** Tries local chat and embedding endpoints and can use configured cloud providers when requests fail.
+- **Image Analysis:** Passes images and Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Autonomous Web Search:** Integrates the DuckDuckGo search engine (`ddgs`) as an automated tool. The AI can independently query the web to answer questions about current events or missing facts.
-- **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`fitz`) and seamlessly converts shared URLs into readable Markdown using the Jina Reader API (`r.jina.ai`) with full browser spoofing to bypass firewalls.
-- **Advanced Logging:** Dual-stream logging system saves complete tracebacks to `bot.log` while intelligently truncating long AI responses in the terminal to keep your screen clean.
-- **Native Slash Commands:** Utilizes Discord's modern UI (`/commands`) for clean, spam-free interactions, memory management, and role-based access control.
+- **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
+- **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
+- **Slash Commands:** Provides commands for the shared persona, history, memory, and status. Members can change the server persona; force-forget and server-wipe commands require administrator or bot-owner access.
 
 ## Prerequisites
 
-- Python 3.8 or higher.
+- Python 3.12. The dependency snapshot is verified on Python 3.12 on Linux.
 - A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal). When creating the OAuth2 URL for bot invite, select **bot** and **application.commands** under **Scopes**, and **View Channels** and **Send Messages** under **Bot Permissions**.
 - An active LLM API endpoint (defaults to a local instance running on `http://localhost:1234/v1`).
 - A Text Generation model and a separate Text Embedding model (e.g., `jina-embeddings-v5-text-small`) loaded in your local inference server.
@@ -24,16 +24,20 @@ A highly scalable, multimodal, and autonomous Discord AI bot. Designed to interf
 1. **Set up the project directory and virtual environment:**
 
 ```bash
-python -m venv venv
-source venv/bin/activate # On Windows use: venv\Scripts\activate
+python3.12 -m venv venv_bot
+source venv_bot/bin/activate # On Windows use: venv_bot\Scripts\activate
 ```
 
 2. **Install dependencies:**
-   Run the following pip command to install the required libraries:
+   Install the checked package versions and their resolved dependencies:
 
 ```bash
-pip install discord.py openai python-dotenv aiosqlite PyMuPDF Pillow aiohttp ddgs chromadb httpx requests
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip check
 ```
+
+`requirements.txt` pins the latest stable application packages checked on October 3, 2026. `constraints.txt` pins their resolved dependencies. Some supporting packages have upper version limits imposed by the application packages; retain compatible versions when updating the snapshot.
 
 3. **Configure Environment Variables:**
    Create a `.env` file in the root directory and populate it with your credentials:
@@ -49,6 +53,7 @@ BOT_OWNER_ID=your_discord_user_id_here
 LLM_BASE_URL=http://localhost:1234/v1
 LLM_API_KEY=lm-studio
 LLM_MODEL_NAME=local-model
+# Use the exact embedding model identifier shown by your local server.
 EMB_MODEL_NAME=embedding-model
 VISION_ENABLED=True
 
@@ -70,6 +75,23 @@ MEMORY_DISTANCE_THRESHOLD=0.45
 python bot.py
 ```
 
+## Dependency Verification and Audit
+
+Run the isolated compatibility and regression checks:
+
+```bash
+python scripts/check_dependencies.py
+python scripts/check_regressions.py
+```
+
+The check uses synthetic messages, mocked API responses, and temporary databases. It verifies command registration, SDK timeouts and tool calls, SQLite history, Chroma memory, image processing, and PDF extraction without loading `.env` or logging in to Discord.
+
+The regression checks cover URL restrictions, forgetting during background work, and retaining failed extraction input. They use synthetic data, temporary databases, and a controlled local HTTP server; external socket connections are blocked.
+
+History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
+
+The [audit and improvement plan](docs/AUDIT.md) records findings, accepted server-wide behavior, implemented fixes, and deferred improvements.
+
 ## Bot Commands
 
 The bot features two distinct ways to interact: standard conversational tagging, and native Slash Commands (`/`).
@@ -83,15 +105,23 @@ The bot features two distinct ways to interact: standard conversational tagging,
 
 - **`/help`**: Display the interactive guide and view current system limits (Ephemeral - only visible to you).
 - **`/status`**: Check bot diagnostics, ping, active primary/fallback AI node status, and current chat history capacity.
-- **`/role`**: View the active AI personality, or assign a new personality and start a fresh conversation. Type `clear` to restore the neutral default.
+- **`/role`**: View the shared persona, or change it and start a fresh server conversation. Extraction input from the previous conversation is retained until processing succeeds. Type `clear` to restore the neutral default.
 - **`/memory`**: Opens an interactive menu to list tracked users, read the permanent vector facts the AI has learned about a specific user from ChromaDB, or securely delete your own data.
-- **`/clear`**: Clear the current server's temporary conversation history in SQLite (ChromaDB core facts are safely retained).
-- **`/force-forget`**: _(Admin/Owner Only)_ Purge all stored data for a specific user across both SQLite and ChromaDB.
-- **`/admin_wipe_server`**: _(Admin/Owner Only)_ Complete factory reset of all vector memories and chat history for the entire server.
+- **`/clear`**: Reset the visible server conversation and queue its text for memory extraction. Existing ChromaDB facts are retained.
+- **`/force-forget`**: _(Admin/Owner Only)_ Delete a user's attributed history, retained extraction input, and ChromaDB facts in the current server.
+- **`/admin_wipe_server`**: _(Admin/Owner Only)_ Delete vector memories, chat history, and retained extraction input for the current server. The stored persona is retained.
+
+## Embedding Models
+
+The local embedding model is selected by `EMB_MODEL_NAME`. Its model family, dimensionality, and preprocessing must match the API adapter when both providers share an index. The [audit's embedding note](docs/AUDIT.md#f04-embedding-fallback-can-mix-incompatible-vectors) records the task/preprocessing concern.
+
+Jina v5 Omni Small adds image, audio, video, and PDF embeddings. Jina documents matching text embeddings between corresponding Text and Omni models, so a model-name change alone is not expected to improve this bot's text-fact retrieval. Using Omni's media capabilities would require indexing the attachments themselves and retaining their references. The bot continues to use Text Small. See [Jina's model documentation](https://jina.ai/embeddings/).
+
+As checked on October 3, 2026, Omni is available through Jina's API. Full multimodal support in standard LM Studio has not been verified; Jina's [GGUF instructions](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-retrieval-GGUF#install-llamacpp-with-multimodal-patches) require a patched llama.cpp build. Task settings, dimensions, and the local quantization should be checked before treating providers as interchangeable.
 
 ## Advanced Configuration
 
-Hardware limits, API parameters, and system behaviors are entirely modular. You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section at the top of `bot.py` to match your specific hardware constraints. Key configurable parameters include:
+You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section of `bot.py`. Key settings include:
 
 **Model & Context Limits:**
 
@@ -106,8 +136,8 @@ Hardware limits, API parameters, and system behaviors are entirely modular. You 
 
 **Hardware & Parsing Limits:**
 
-- `MAX_FILE_SIZE` (Default: 10MB) - Hard limit for Discord attachments and Jina URL scraping.
-- `MAX_PDF_PAGES` (Default: 15) - Maximum pages read from a PDF to prevent context window overflow.
+- `MAX_FILE_SIZE` (Default: 10MB) - Size limit used for direct attachment checks and URL downloads.
+- `MAX_PDF_PAGES` (Default: 15) - Maximum pages read from a PDF.
 - `MAX_TEXT_EXTRACTION_LENGTH` (Default: 40000) - Character limit for text extracted from URLs or PDFs.
 - `MAX_IMAGE_DIMENSION` (Default: 1024) - Images are resized to this maximum width/height to save VRAM.
 - `IMAGE_COMPRESSION_QUALITY` (Default: 85) - Pillow JPEG compression quality.
@@ -118,6 +148,6 @@ Hardware limits, API parameters, and system behaviors are entirely modular. You 
 
 - `DISCORD_CHUNK_LIMIT` (Default: 1980) - Max character limit per Discord message chunk.
 - `CHUNK_MESSAGE_DELAY` (Default: 1.5) - Seconds to wait between sending chunks to avoid rate limits.
-- `WIPE_REQUEST_EXPIRY` (Default: 3600) - Seconds before a pending memory deletion request expires.
+- `MEMORY_RETRY_INTERVAL` (Default: 60) - Seconds to wait before retrying retained memory extraction input.
 - `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for a server.
 - `CIRCUIT_BREAKER_COOLDOWN` (Default: 60) - Seconds to automatically bypass the local node and route straight to the cloud fallback after a local failure is detected.

@@ -7,11 +7,13 @@ import logging
 import asyncio
 import contextlib
 import requests
-import httpx
 import time
+import hashlib
+import ipaddress
 from datetime import datetime
+from urllib.parse import urlsplit
 
-import fitz  # PyMuPDF
+import pymupdf
 import aiohttp
 import discord
 from discord import app_commands
@@ -21,7 +23,7 @@ from chromadb import Documents, EmbeddingFunction, Embeddings
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 from ddgs import DDGS
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Timeout
 from dotenv import load_dotenv
 
 # ==========================================
@@ -80,7 +82,7 @@ CIRCUIT_BREAKER_COOLDOWN = 60.0  # Seconds to bypass the local node after a fail
 local_node_dead_until = 0.0      # Timestamp tracker
 
 # 2 seconds to detect an offline server, 120 seconds to wait for a slow local AI reply
-llm_timeout = httpx.Timeout(120.0, connect=2.0)
+llm_timeout = Timeout(120.0, connect=2.0)
 
 lm_client = AsyncOpenAI(
     base_url=LLM_BASE_URL, 
@@ -175,8 +177,10 @@ class MyAIClient(discord.Client):
         
         # --- NEW: Internal State moved from global scope ---
         self.highest_token_count = 0                             
-        self.background_tasks = set()                            
-        self.pending_deletions = {}                              
+        self.memory_worker = None
+        self.memory_wakeup = asyncio.Event()
+        self.pending_deletions = {}
+        self.conversation_versions = {}
         self.server_personas_cache = {}
 
     async def setup_hook(self):
@@ -223,17 +227,15 @@ class MyAIClient(discord.Client):
         )
         
         await tree.sync()
+        self.memory_worker = asyncio.create_task(retry_pending_memories())
         logging.info('🔄 Databases loaded and Slash Commands synced globally!')
 
     async def close(self):
-        logging.info("Shutdown signal received. Waiting for background memory tasks to finish...")
-        if self.background_tasks:
-            logging.info(f"Waiting for {len(self.background_tasks)} memory tasks to finish...")
-            try:
-                # Give background tasks 10 seconds to finish before forcing a kill
-                await asyncio.wait_for(asyncio.gather(*self.background_tasks, return_exceptions=True), timeout=10.0)
-            except asyncio.TimeoutError:
-                logging.warning("Shutdown timeout reached. Killing pending memory tasks.")
+        logging.info("Stopping memory extraction; unfinished input remains saved for retry.")
+        if self.memory_worker:
+            self.memory_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.memory_worker
             
         if self.db_conn:
             await self.db_conn.close()
@@ -242,11 +244,12 @@ class MyAIClient(discord.Client):
         await super().close()
 
     def register_deletion(self, key):
-        current_time = datetime.now().timestamp()
-        self.pending_deletions[key] = current_time
-        stale_keys = [k for k, v in self.pending_deletions.items() if current_time - v > WIPE_REQUEST_EXPIRY]
-        for k in stale_keys:
-            del self.pending_deletions[k]
+        # Versions never expire while an older task could still be running.
+        self.pending_deletions[key] = self.pending_deletions.get(key, 0) + 1
+
+    def memory_version(self, server_id, user_id):
+        return (self.pending_deletions.get(f"wipe_{server_id}", 0),
+                self.pending_deletions.get(f"{server_id}_{user_id}", 0))
 
 client = MyAIClient(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -279,7 +282,7 @@ WEB_SEARCH_MAX_RESULTS = 3          # Number of DuckDuckGo search result snippet
 # --- DISCORD & SYSTEM LIMITS ---
 DISCORD_CHUNK_LIMIT = 1980          # Max character limit per Discord message (safely below Discord's 2000 limit)
 CHUNK_MESSAGE_DELAY = 1.5           # Seconds to wait between sending message chunks to avoid Discord rate limits
-WIPE_REQUEST_EXPIRY = 3600          # Seconds before a pending memory deletion request expires from the cache
+MEMORY_RETRY_INTERVAL = 60         # Retry retained extraction input after a transient failure
 DEFAULT_PERSONA = "You are a neutral, conversational AI." # Fallback system prompt if no custom role is set for a server                             
 
 # ==========================================
@@ -289,7 +292,60 @@ DEFAULT_PERSONA = "You are a neutral, conversational AI." # Fallback system prom
 async def init_db(db_conn):
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS server_config (server_id TEXT PRIMARY KEY, prompt TEXT)''')
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, role TEXT, content TEXT, user_id TEXT, user_name TEXT)''')
+    await db_conn.execute('''CREATE TABLE IF NOT EXISTS pending_memories (id INTEGER PRIMARY KEY, server_id TEXT, role TEXT, content TEXT, user_id TEXT, user_name TEXT)''')
     await db_conn.commit()
+
+@contextlib.asynccontextmanager
+async def history_transaction():
+    async with client.db_lock:
+        try:
+            yield
+            await client.db_conn.commit()
+        except BaseException:
+            await client.db_conn.rollback()
+            raise
+
+async def retain_history_for_memory(server_id, rows):
+    """Move input out of visible history in the caller's SQLite transaction."""
+    if not rows:
+        return
+    await client.db_conn.executemany(
+        "INSERT INTO pending_memories (id, server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?, ?)",
+        [(row[0], server_id, *row[1:]) for row in rows],
+    )
+    await client.db_conn.executemany("DELETE FROM chat_history WHERE id = ?", [(row[0],) for row in rows])
+
+async def finish_memory_write(function, **kwargs):
+    """Keep the memory lock held until a thread finishes, even on cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(function, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancellation must survive a failed write (or another cancellation).
+        while not task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            task.result()
+        raise
+
+async def forget_memories(server_id, user_id=None):
+    # Always take locks in this order. Writers check their version under these locks.
+    async with client.memory_lock:
+        async with history_transaction():
+            key = f"wipe_{server_id}" if user_id is None else f"{server_id}_{user_id}"
+            clause, args = "server_id = ?", (server_id,)
+            where = {"server_id": server_id}
+            if user_id is not None:
+                clause += " AND user_id = ?"
+                args += (user_id,)
+                where = {"$and": [{"server_id": server_id}, {"user_id": user_id}]}
+            await client.db_conn.execute(f"DELETE FROM chat_history WHERE {clause}", args)
+            await client.db_conn.execute(f"DELETE FROM pending_memories WHERE {clause}", args)
+            await finish_memory_write(client.memory_collection.delete, where=where)
+            client.register_deletion(key)
+            # Also invalidate requests that started while deletion was awaiting Chroma.
+            client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
 
 @contextlib.asynccontextmanager
 async def safe_typing(channel):
@@ -318,12 +374,13 @@ class URLImageAttachment:
 def clean_json_response(text):
     """Utility to strip markdown wrappers from LLM JSON outputs."""
     try:
-        match = re.search(r'\[.*\]', text, re.DOTALL)
+        text = text.strip()
+        match = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
         if match:
-            return json.loads(match.group(0))
+            text = match.group(1)
         return json.loads(text)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as exc:
+        raise ValueError("Memory extraction did not return valid JSON") from exc
     
 async def send_chunked_message(target, text: str, is_interaction_followup=False):
     """Chunks and sends long texts to bypass Discord's character limit."""
@@ -376,7 +433,7 @@ async def send_chunked_message(target, text: str, is_interaction_followup=False)
 def extract_pdf_text(pdf_bytes):
     text = ""
     try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
             for i, page in enumerate(doc):
                 if i >= MAX_PDF_PAGES:
                     text += "\n...[Additional pages skipped to save memory]"
@@ -442,6 +499,23 @@ async def perform_web_search(query):
     except Exception as e: 
         return f"Search error: {e}"
     
+class BlockedURL(ValueError):
+    pass
+
+class PublicURLConnector(aiohttp.TCPConnector):
+    """Validate the exact DNS/IP results used to connect, including redirects."""
+    async def _resolve_host(self, host, port, *args, **kwargs):
+        addresses = await super()._resolve_host(host, port, *args, **kwargs)
+        if not addresses:
+            raise BlockedURL("The URL has no public destination.")
+        for result in addresses:
+            address = ipaddress.ip_address(result["host"])
+            if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                address = address.ipv4_mapped
+            if not address.is_global or address.is_multicast or address.is_reserved:
+                raise BlockedURL("Only public internet URLs are allowed.")
+        return addresses
+
 async def fetch_url_content(url):
     direct_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.pdf') 
     is_direct_file = url.split('?')[0].lower().endswith(direct_extensions)
@@ -450,9 +524,20 @@ async def fetch_url_content(url):
     log_msg = f"📥 Fetching direct file: {url}" if is_direct_file else f"📡 Jina attempting to fetch: {url}"
     
     logging.info(log_msg)
-    
+
     try:
-        async with aiohttp.ClientSession() as session:
+        parsed_url = urlsplit(url)
+        if (parsed_url.scheme not in ("http", "https") or not parsed_url.hostname
+                or parsed_url.username is not None or parsed_url.password is not None
+                or "%" in parsed_url.hostname):
+            raise BlockedURL("Use an HTTP or HTTPS URL without credentials or scoped addresses.")
+        async with asyncio.timeout(SCRAPER_TIMEOUT), aiohttp.ClientSession(
+            connector=PublicURLConnector(), trust_env=False,
+        ) as session:
+            # Validate the original URL even when Jina will fetch the webpage.
+            await session.connector._resolve_host(
+                parsed_url.hostname, parsed_url.port or (443 if parsed_url.scheme == "https" else 80),
+            )
             # Full browser spoofing to bypass 403 Forbidden firewalls, 
             # but NO 'Accept-Encoding' so aiohttp safely decompresses the data automatically!
             headers = {
@@ -465,7 +550,7 @@ async def fetch_url_content(url):
             if not is_direct_file:
                 headers.update({"X-Return-Format": "markdown", "X-No-Cache": "true"})
                 
-            async with session.get(target_url, timeout=SCRAPER_TIMEOUT, headers=headers) as response:
+            async with session.get(target_url, timeout=SCRAPER_TIMEOUT, headers=headers, max_redirects=5) as response:
                 if response.status not in (200, 206):
                     return {"type": "error", "data": f"Failed to access URL (HTTP {response.status})"}
                 
@@ -503,6 +588,8 @@ async def fetch_url_content(url):
                 else:
                     return {"type": "error", "data": f"Unsupported URL media type ({content_type})."}
                     
+    except BlockedURL as e:
+        return {"type": "error", "data": f"URL blocked: {e}"}
     except asyncio.TimeoutError:
         return {"type": "error", "data": "The website took too long to respond."}
     except Exception as e:
@@ -523,8 +610,11 @@ AVAILABLE_TOOLS = {"web_search": perform_web_search}
 # 4. CHROMA VECTOR MEMORY MANAGEMENT
 # ==========================================
 
-async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
-    task_start_time = datetime.now().timestamp()
+async def update_user_memory(server_id, user_id, user_name, forgotten_messages, expected_version=None):
+    if expected_version is None:
+        expected_version = client.memory_version(server_id, user_id)
+    if expected_version != client.memory_version(server_id, user_id):
+        return True  # The input was deliberately deleted, not an extraction failure.
             
     chat_log = ""
     for msg in forgotten_messages:
@@ -584,23 +674,31 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
                     raise e # Crash normally if no fallback is configured
                     
         content = response.choices[0].message.content
-        new_memory_json = content.strip() if content else "[]"
-        
+        if not content or getattr(response.choices[0], "finish_reason", None) in ("length", "content_filter"):
+            raise ValueError("Memory extraction returned an empty or incomplete response")
+        new_memory_json = content.strip()
+
         facts_list = clean_json_response(new_memory_json)
-        
-        if facts_list and isinstance(facts_list, list):
-            if client.pending_deletions.get(f"{server_id}_{user_id}", 0) > task_start_time or client.pending_deletions.get(f"wipe_{server_id}", 0) > task_start_time:
-                return
+        if not isinstance(facts_list, list) or not all(isinstance(fact, str) and fact.strip() for fact in facts_list):
+            raise ValueError("Memory extraction must return an array of non-empty strings")
+        facts_list = list(dict.fromkeys(fact.strip() for fact in facts_list))
+
+        if facts_list:
+            if expected_version != client.memory_version(server_id, user_id):
+                return True
             
             # --- NEW: Semantic Deduplication Pipeline ---
             unique_facts = []
+            fact_ids = []
             
             # 1. Embed the raw facts to query the database
             raw_embeddings = await asyncio.to_thread(
-                client.custom_ef.embed, 
-                facts_list, 
+                client.custom_ef.embed,
+                facts_list,
                 "retrieval.query" # Use query task to search existing memories
             )
+            if len(raw_embeddings) != len(facts_list):
+                raise ValueError("Embedding service returned an incomplete batch")
             
             # 2. Check each new fact against the user's existing database
             for i, (fact, emb) in enumerate(zip(facts_list, raw_embeddings)):
@@ -626,23 +724,26 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
                 # 4. If it passed the check, format it for permanent storage
                 current_date = datetime.now().strftime('%Y-%m-%d')
                 unique_facts.append(f"[Recorded on {current_date}]: {fact}")
+                fact_ids.append(f"{server_id}_{user_id}_{hashlib.sha256(fact.encode()).hexdigest()}")
                 
             # 5. Save ONLY the unique facts to ChromaDB
             if unique_facts:
-                timestamp = datetime.now().timestamp()
-                fact_ids = [f"{server_id}_{user_id}_{timestamp}_{i}" for i in range(len(unique_facts))]
                 metadatas = [{"server_id": server_id, "user_id": str(user_id), "user_name": user_name} for _ in unique_facts]
 
                 # Re-embed the final timestamped strings for permanent storage
                 doc_embeddings = await asyncio.to_thread(
-                    client.custom_ef.embed, 
-                    unique_facts, 
+                    client.custom_ef.embed,
+                    unique_facts,
                     "retrieval.passage"
                 )
-                
-                async with client.memory_lock: 
-                    await asyncio.to_thread(
-                        client.memory_collection.add,
+                if len(doc_embeddings) != len(unique_facts):
+                    raise ValueError("Embedding service returned an incomplete batch")
+
+                async with client.memory_lock:
+                    if expected_version != client.memory_version(server_id, user_id):
+                        return True
+                    await finish_memory_write(
+                        client.memory_collection.upsert,
                         documents=unique_facts,
                         embeddings=doc_embeddings,
                         metadatas=metadatas,
@@ -651,16 +752,49 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages):
                 logging.info(f"💾 [Memory] Added {len(unique_facts)} new vector facts for {user_name}.")
             else:
                 logging.info(f"♻️ [Memory] No new unique facts to add for {user_name}.")
-            
-    except Exception as e: 
-        logging.error(f"Failed to update vector memory for {user_name}: {e}")
+        return True
 
-async def process_memories_concurrently(server_id, users_dict, forgotten_messages):
-    tasks = []
-    for uid, uname in users_dict.items():
-        tasks.append(update_user_memory(server_id, uid, uname, forgotten_messages))
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    except Exception as e:
+        logging.error(f"Failed to update vector memory for {user_name}: {e}")
+        return False
+
+async def process_pending_memories():
+    async with client.db_lock:
+        cursor = await client.db_conn.execute(
+            "SELECT server_id, user_id FROM pending_memories WHERE user_id IS NOT NULL AND user_id != '' "
+            "GROUP BY server_id, user_id ORDER BY MIN(id)"
+        )
+        users = await cursor.fetchall()
+    for server_id, user_id in users:
+        async with client.db_lock:
+            version = client.memory_version(server_id, user_id)
+            cursor = await client.db_conn.execute(
+                "SELECT id, role, content, user_id, user_name FROM pending_memories "
+                "WHERE server_id = ? AND user_id = ? ORDER BY id LIMIT ?",
+                (server_id, user_id, MAX_HISTORY_LENGTH),
+            )
+            rows = await cursor.fetchall()
+        if not rows:
+            continue
+        messages = [{"role": r[1], "content": r[2], "user_id": r[3]} for r in rows]
+        if await update_user_memory(server_id, user_id, rows[-1][4] or user_id, messages, version):
+            async with history_transaction():
+                await client.db_conn.executemany("DELETE FROM pending_memories WHERE id = ?", [(r[0],) for r in rows])
+            if len(rows) == MAX_HISTORY_LENGTH:
+                client.memory_wakeup.set()
+
+async def retry_pending_memories():
+    """One worker in the bot process retries retained input, including after restart."""
+    while True:
+        client.memory_wakeup.clear()
+        try:
+            await process_pending_memories()
+        except Exception:
+            logging.exception("Memory extraction retry failed; input remains saved.")
+        try:
+            await asyncio.wait_for(client.memory_wakeup.wait(), timeout=MEMORY_RETRY_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
 # ==========================================
 # 5. SLASH COMMANDS
@@ -727,29 +861,20 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
         await interaction.followup.send(f"**Current Server Persona:**\n> *{current_role}*")
         return
 
-    async with client.db_lock:
-        cursor = await client.db_conn.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        rows = await cursor.fetchall()
-        if rows:
-            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-            task = asyncio.create_task(process_memories_concurrently(server_id, users_in_history, history_to_save))
-            client.background_tasks.add(task)
-            task.add_done_callback(client.background_tasks.discard)
-            
-        await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
+    async with history_transaction():
+        cursor = await client.db_conn.execute("SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+        await retain_history_for_memory(server_id, await cursor.fetchall())
         
         if prompt.lower() == 'clear':
             await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
             client.server_personas_cache[server_id] = DEFAULT_PERSONA
-            reply_text = f"✅ Server persona removed and history cleared! *(Recent memories saved)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}"
+            reply_text = f"✅ Server persona removed and history cleared! *(Memory extraction queued)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}"
         else:
             await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, prompt))
             client.server_personas_cache[server_id] = prompt
-            reply_text = f"✅ Saved server persona and cleared history for a fresh start! *(Recent memories saved)*\n> *{prompt}*"
-            
-        await client.db_conn.commit()
-
+            reply_text = f"✅ Saved server persona and cleared history for a fresh start! *(Memory extraction queued)*\n> *{prompt}*"
+        client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
+    client.memory_wakeup.set()
     await interaction.followup.send(reply_text)
 
 @tree.command(name="clear", description="Clear the current conversation history (core facts retained).")
@@ -758,20 +883,12 @@ async def cmd_clear(interaction: discord.Interaction):
     server_id = str(interaction.guild_id)
     await interaction.response.defer()
 
-    async with client.db_lock:
-        cursor = await client.db_conn.execute("SELECT role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        rows = await cursor.fetchall()
-        if rows:
-            history_to_save = [{"role": r[0], "content": r[1], "user_id": r[2], "user_name": r[3]} for r in rows]
-            users_in_history = {msg["user_id"]: msg["user_name"] for msg in history_to_save if msg.get("user_id")}
-            task = asyncio.create_task(process_memories_concurrently(server_id, users_in_history, history_to_save))
-            client.background_tasks.add(task)
-            task.add_done_callback(client.background_tasks.discard)
-            
-        await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-        await client.db_conn.commit()
-        
-    await interaction.followup.send("🗑️ Server conversation history cleared! *(Recent memories saved)*")
+    async with history_transaction():
+        cursor = await client.db_conn.execute("SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
+        await retain_history_for_memory(server_id, await cursor.fetchall())
+        client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
+    client.memory_wakeup.set()
+    await interaction.followup.send("🗑️ Server conversation history cleared! *(Memory extraction queued)*")
 
 @tree.command(name="admin_wipe_server", description="[ADMIN/OWNER] Complete factory reset of all data for this server.")
 async def cmd_wipe_server(interaction: discord.Interaction):
@@ -781,15 +898,7 @@ async def cmd_wipe_server(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     server_id = str(interaction.guild_id)
-    client.register_deletion(f"wipe_{server_id}")
-    
-    # Wipe ChromaDB Vector Memory
-    async with client.memory_lock: 
-        await asyncio.to_thread(client.memory_collection.delete, where={"server_id": server_id})
-    # Wipe SQLite History
-    async with client.db_lock:
-        await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ?", (server_id,))
-        await client.db_conn.commit()
+    await forget_memories(server_id)
         
     await interaction.followup.send("☢️ **SERVER WIPED.** All core memories and chat histories for **this specific server** have been erased.")
 
@@ -804,14 +913,7 @@ async def cmd_force_forget(interaction: discord.Interaction, target_user: discor
     await interaction.response.defer(ephemeral=True)
     server_id = str(interaction.guild_id)
     user_id = str(target_user.id)
-    client.register_deletion(f"{server_id}_{user_id}")
-    
-    async with client.memory_lock: 
-        await asyncio.to_thread(client.memory_collection.delete, where={"$and": [{"server_id": server_id}, {"user_id": user_id}]})
-        
-    async with client.db_lock:
-        await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, user_id))
-        await client.db_conn.commit()
+    await forget_memories(server_id, user_id)
         
     await interaction.followup.send(f"✅ **Force-Forget Successful:** All memory and chat history for {target_user.mention} has been permanently purged.")
 
@@ -828,13 +930,7 @@ async def cmd_memory(interaction: discord.Interaction, action: app_commands.Choi
     await interaction.response.defer(ephemeral=(action.value == "clear"))
 
     if action.value == 'clear':
-        client.register_deletion(f"{server_id}_{user_id}")
-        async with client.memory_lock:
-            await asyncio.to_thread(client.memory_collection.delete, where={"$and": [{"server_id": server_id}, {"user_id": user_id}]})
-            
-        async with client.db_lock:
-            await client.db_conn.execute("DELETE FROM chat_history WHERE server_id = ? AND user_id = ?", (server_id, user_id))
-            await client.db_conn.commit()
+        await forget_memories(server_id, user_id)
             
         await interaction.followup.send("🗑️ **Forget successful.** All your core memories and recent chat history have been erased.")
         return
@@ -1238,11 +1334,15 @@ async def generate_ai_response(messages_to_send, message, disable_search, has_me
                     await message.reply("Oops! I couldn't process that. Please check my terminal for details.")
                 return None
 
-async def save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply):
+async def save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply, expected_version=None):
     db_user_content = json.dumps(db_user_content_obj) if isinstance(db_user_content_obj, list) else str(db_user_content_obj)
+    if expected_version is None:
+        expected_version = client.conversation_versions.get(server_id, 0)
     
     # --- NEW: Apply the lock to the entire database transaction block ---
-    async with client.db_lock:
+    async with history_transaction():
+        if expected_version != client.conversation_versions.get(server_id, 0):
+            return
         await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "user", db_user_content, str(message.author.id), user_name))
         await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "assistant", final_reply, str(message.author.id), user_name))
         
@@ -1254,20 +1354,8 @@ async def save_and_send_response(message, server_id, user_name, db_user_content_
             forgotten_rows = await cursor.fetchall()
             
             if forgotten_rows:
-                forgotten_msgs = [{"role": r[1], "content": r[2], "user_id": r[3], "user_name": r[4]} for r in forgotten_rows]
-                users_in_forgotten = {msg["user_id"]: msg["user_name"] for msg in forgotten_msgs if msg.get("user_id")}
-                if users_in_forgotten:
-                    task = asyncio.create_task(process_memories_concurrently(server_id, users_in_forgotten, forgotten_msgs))
-                    client.background_tasks.add(task)
-                    task.add_done_callback(client.background_tasks.discard)
-                    
-                ids_to_delete = [r[0] for r in forgotten_rows]
-                placeholders = ','.join('?' * len(ids_to_delete))
-                await client.db_conn.execute(f"DELETE FROM chat_history WHERE id IN ({placeholders})", ids_to_delete)
-        
-        # IMPORTANT: Commit happens INSIDE the lock so the next thread sees the updated count
-        await client.db_conn.commit()
-    # --- END OF LOCK BLOCK ---
+                await retain_history_for_memory(server_id, forgotten_rows)
+                client.memory_wakeup.set()
     
     await send_chunked_message(message, final_reply)
 
@@ -1296,6 +1384,7 @@ async def on_message(message):
         return
 
     server_id = str(message.guild.id)
+    conversation_version = client.conversation_versions.get(server_id, 0)
     bot_mention = f'<@{client.user.id}>'
     bot_nickname_mention = f'<@!{client.user.id}>' 
     clean_message = message.content.replace(bot_mention, '').replace(bot_nickname_mention, '').strip()
@@ -1340,7 +1429,7 @@ async def on_message(message):
     if final_reply:
         duration = (datetime.now() - start_time).total_seconds()
         logging.info(f"✨ AI Response generated in {duration:.2f}s | Server: {message.guild.name}")
-        await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply)
+        await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply, conversation_version)
 
 if TOKEN: 
     client.run(TOKEN)

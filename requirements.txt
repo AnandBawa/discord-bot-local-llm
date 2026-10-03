@@ -1,0 +1,14 @@
+# Latest stable application dependencies checked on 2026-10-03.
+# constraints.txt records their resolved dependencies for Python 3.12 on Linux.
+-c constraints.txt
+
+aiosqlite==0.22.1
+aiohttp==3.14.3
+chromadb==1.5.9
+ddgs==9.16.0
+discord.py==2.7.1
+openai==3.24.0
+Pillow==12.3.0
+PyMuPDF==1.28.2
+python-dotenv==1.2.4
+requests==2.34.2
