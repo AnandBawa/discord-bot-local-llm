@@ -41,10 +41,18 @@ class MemoryStore:
         for key, document, metadata in zip(ids, documents, metadatas):
             self.facts[key] = (document, metadata)
 
-    def delete(self, *, where):
+    @staticmethod
+    def matches(metadata, where):
         filters = where.get("$and", [where])
+        return all(all(metadata.get(k) == v for k, v in part.items()) for part in filters)
+
+    def get(self, *, where, include):
+        rows = [(key, doc, meta) for key, (doc, meta) in self.facts.items() if self.matches(meta, where)]
+        return {"ids": [r[0] for r in rows], "documents": [r[1] for r in rows], "metadatas": [r[2] for r in rows]}
+
+    def delete(self, *, where=None, ids=None):
         for key, (_, metadata) in list(self.facts.items()):
-            if all(all(metadata.get(k) == v for k, v in part.items()) for part in filters):
+            if (ids is None or key in ids) and (where is None or self.matches(metadata, where)):
                 del self.facts[key]
 
 

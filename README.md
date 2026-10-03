@@ -5,17 +5,20 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 ## Key Features
 
 - **Shared Server Memory:** SQLite stores chronological conversation history and retains input awaiting memory extraction. ChromaDB stores extracted text facts for semantic retrieval. Failed extraction is retried, including after restart.
+- **Explicit Memory:** `/remember` saves a fact immediately. Members can select, correct, or delete their own individual facts through `/memory`; facts remain shared within the server. SQLite retains explicit changes while the background worker updates Chroma.
+- **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
 - **Cloud Fallback:** Tries local chat and embedding endpoints and can use configured cloud providers when requests fail.
 - **Image Analysis:** Passes images and Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
-- **Autonomous Web Search:** Integrates the DuckDuckGo search engine (`ddgs`) as an automated tool. The AI can independently query the web to answer questions about current events or missing facts.
+- **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
 - **Slash Commands:** Provides commands for the shared persona, history, memory, and status. Members can change the server persona; force-forget and server-wipe commands require administrator or bot-owner access.
+- **Permission-Aware Replies:** Uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
 
 ## Prerequisites
 
 - Python 3.12. The dependency snapshot is verified on Python 3.12 on Linux.
-- A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal). When creating the OAuth2 URL for bot invite, select **bot** and **application.commands** under **Scopes**, and **View Channels** and **Send Messages** under **Bot Permissions**.
+- A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal). When creating the OAuth2 URL for bot invite, select **bot** and **application.commands** under **Scopes**, and **View Channels** and **Send Messages** under **Bot Permissions**. For threads/posts, also grant **Send Messages in Threads**. **Read Message History** enables native replies and fetching referenced messages; the bot falls back to ordinary messages when it is missing. Effective permissions include channel overrides. See [Discord's message permissions](https://docs.discord.com/developers/resources/message#create-message).
 - An active LLM API endpoint (defaults to a local instance running on `http://localhost:1234/v1`).
 - A Text Generation model and a separate Text Embedding model (e.g., `jina-embeddings-v5-text-small`) loaded in your local inference server.
 
@@ -82,13 +85,18 @@ Run the isolated compatibility and regression checks:
 ```bash
 python scripts/check_dependencies.py
 python scripts/check_regressions.py
+python scripts/check_features.py
 ```
 
 The check uses synthetic messages, mocked API responses, and temporary databases. It verifies command registration, SDK timeouts and tool calls, SQLite history, Chroma memory, image processing, and PDF extraction without loading `.env` or logging in to Discord.
 
 The regression checks cover URL restrictions, forgetting during background work, and retaining failed extraction input. They use synthetic data, temporary databases, and a controlled local HTTP server; external socket connections are blocked.
 
+The feature checks cover missing Discord permissions, search queries and sources, explicit memory edits/deletions and retries, and conversation ordering across servers. The dependency check also exercises corrections and retry after a failed database acknowledgement with real temporary SQLite and Chroma storage.
+
 History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
+
+Explicit facts and corrections use two additional SQLite tables, `memory_overrides` and `memory_suppressions`, created automatically at startup. Existing Chroma facts remain readable and editable. Restart the bot to load the updated code and sync the new slash-command options; this does not require re-inviting it to servers where its slash commands already work.
 
 The [audit and improvement plan](docs/AUDIT.md) records findings, accepted server-wide behavior, implemented fixes, and deferred improvements.
 
@@ -99,17 +107,31 @@ The bot features two distinct ways to interact: standard conversational tagging,
 ### General Chat
 
 - **`@BotName [message]`**: Chat or ask questions natively in the channel. The bot will automatically analyze any attached files or links.
-- **Reply to the Bot**: Reply directly to one of the bot's messages and tag it to seamlessly continue an exact train of thought.
+- **Reply to the Bot**: A reply whose referenced message is delivered or cached is recognised without an extra tag. Tag the bot if the reference is unavailable. Without Read Message History, it can use its saved conversation but cannot fetch missing Discord messages or their attachments.
 
 ### Slash Commands (`/`)
 
-- **`/help`**: Display the interactive guide and view current system limits (Ephemeral - only visible to you).
+- **`/help`**: Display the command guide (Ephemeral - only visible to you).
 - **`/status`**: Check bot diagnostics, ping, active primary/fallback AI node status, and current chat history capacity.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Extraction input from the previous conversation is retained until processing succeeds. Type `clear` to restore the neutral default.
-- **`/memory`**: Opens an interactive menu to list tracked users, read the permanent vector facts the AI has learned about a specific user from ChromaDB, or securely delete your own data.
+- **`/remember fact:...`**: Save a fact about yourself immediately, up to 500 characters. The confirmation is private; the saved fact is shared server memory.
+- **`/memory`**: List tracked users, read facts (your own by default), edit/delete one of your facts, or clear your own data. The `memory_id` option offers your facts as suggestions. `target_user` applies only to reading; editing/deletion always checks the invoking member's identity and current server.
 - **`/clear`**: Reset the visible server conversation and queue its text for memory extraction. Existing ChromaDB facts are retained.
 - **`/force-forget`**: _(Admin/Owner Only)_ Delete a user's attributed history, retained extraction input, and ChromaDB facts in the current server.
 - **`/admin_wipe_server`**: _(Admin/Owner Only)_ Delete vector memories, chat history, and retained extraction input for the current server. The stored persona is retained.
+
+Examples of the new memory actions:
+
+```text
+/remember fact:I prefer Python for small scripts.
+/memory action:read
+/memory action:edit memory_id:<select a fact> fact:I now prefer Rust for CLI tools.
+/memory action:delete memory_id:<select a fact>
+```
+
+An edit immediately replaces the selected saved fact; a deletion immediately hides it from recall and the memory list. Chroma updates retry if indexing fails. Up to 20 recent pending explicit facts are included directly in chat context while waiting for indexing. Running extraction jobs retry against the latest corrections, and normalized hashes prevent the same old fact text being extracted again after restart. This is not a semantic ban on every possible paraphrase: model-generated facts still need occasional review. A single-fact deletion does not erase conversation text that mentioned it; use the existing clear-my-memory action for that member's saved conversation and facts.
+
+The per-server conversation queue also covers context loading and saving replies. Slow requests delay later turns in that server. Clear, forget, persona changes, and explicit memory changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
 
 ## Embedding Models
 
@@ -126,7 +148,7 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 **Model & Context Limits:**
 
 - `MAX_HISTORY_LENGTH` (Default: 100) - Maximum messages kept in active SQLite chat history before vector summarization.
-- `MAX_TOOL_ITERATIONS` (Default: 3) - Maximum consecutive tool calls (e.g., searches) the AI can make in one turn.
+- `MAX_TOOL_ITERATIONS` (Default: 3) - Maximum tool-call rounds in one turn; each round may contain multiple searches.
 - `LLM_TEMPERATURE` (Default: 1.0) - Controls the creativity and randomness of standard chat responses.
 - `LLM_MAX_TOKENS` (Default: 4096) - Maximum token length for standard chat responses.
 - `MEMORY_TEMPERATURE` (Default: 0.1) - Creativity for fact extraction (kept low to ensure strict factual JSON output).
@@ -149,5 +171,6 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 - `DISCORD_CHUNK_LIMIT` (Default: 1980) - Max character limit per Discord message chunk.
 - `CHUNK_MESSAGE_DELAY` (Default: 1.5) - Seconds to wait between sending chunks to avoid rate limits.
 - `MEMORY_RETRY_INTERVAL` (Default: 60) - Seconds to wait before retrying retained memory extraction input.
+- `MANUAL_MEMORY_CONTEXT_LIMIT` (Default: 20) - Maximum pending explicit facts included directly in chat context before indexing completes.
 - `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for a server.
 - `CIRCUIT_BREAKER_COOLDOWN` (Default: 60) - Seconds to automatically bypass the local node and route straight to the cloud fallback after a local failure is detected.

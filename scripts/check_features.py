@@ -1,0 +1,372 @@
+"""Offline checks for permission fallback, search, explicit memory, and turn ordering.
+
+Run: venv_bot/bin/python scripts/check_features.py
+Reuses the temporary SQLite/model fixtures; never loads .env or logs into Discord.
+"""
+
+import asyncio
+import contextlib
+import json
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+
+import aiosqlite
+import discord
+
+import check_regressions as fixtures
+
+
+class FeatureChecks(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = fixtures.BotChecks.asyncSetUp
+    asyncTearDown = fixtures.BotChecks.asyncTearDown
+    completion = staticmethod(fixtures.BotChecks.completion)
+    interaction = staticmethod(fixtures.BotChecks.interaction)
+    seed = fixtures.BotChecks.seed
+    count = fixtures.BotChecks.count
+    archive = fixtures.BotChecks.archive
+
+    def chat(self, server=1, author=42, content="Hello", history=True):
+        bot_user = SimpleNamespace(id=99)
+        self.client._connection.user = bot_user
+        channel = SimpleNamespace(
+            id=server * 10, name="general", send=AsyncMock(), fetch_message=AsyncMock(),
+            permissions_for=lambda member: SimpleNamespace(read_message_history=history),
+        )
+        @contextlib.asynccontextmanager
+        async def typing():
+            yield
+        channel.typing = typing
+        return SimpleNamespace(
+            author=SimpleNamespace(id=author, bot=False, display_name=f"Member{author}"),
+            guild=SimpleNamespace(id=server, name=f"Server{server}", me=bot_user),
+            channel=channel, mentions=[bot_user], reference=None,
+            content=f"<@99> {content}", attachments=[], stickers=[], reply=AsyncMock(),
+        )
+
+    def put_fact(self, key="legacy", text="Tester lives in Delhi", user="42", server="1"):
+        self.store.facts[key] = (f"[Recorded on 2026-01-01]: {text}",
+                                 {"user_id": user, "server_id": server, "user_name": "Tester"})
+        return self.bot.memory_handle(key)
+
+    async def test_missing_history_uses_normal_message_and_fits_discord_limit(self):
+        message = self.chat(history=False)
+        await self.bot.send_chunked_message(message, "```python\n" + "x" * 4100 + "\n```")
+        message.reply.assert_not_awaited()
+        self.assertGreater(message.channel.send.await_count, 1)
+        for call in message.channel.send.call_args_list:
+            self.assertLessEqual(len(call.args[0]), 2000)
+        first = message.channel.send.call_args_list[0]
+        self.assertTrue(first.args[0].startswith("<@42> "))
+        allowed = first.kwargs["allowed_mentions"].to_dict()
+        self.assertEqual(allowed["users"], [42])
+        self.assertEqual(allowed["parse"], [])
+
+    async def test_forbidden_or_deleted_native_reply_falls_back(self):
+        for error in (discord.Forbidden, discord.NotFound):
+            message = self.chat()
+            message.reply.side_effect = error(SimpleNamespace(status=403, reason="Denied"), "test")
+            await self.bot.send_chunked_message(message, "Answer")
+            self.assertEqual(message.channel.send.call_args.args[0], "<@42> Answer")
+
+    async def test_other_delivery_errors_are_not_silently_retried(self):
+        message = self.chat()
+        message.reply.side_effect = discord.HTTPException(SimpleNamespace(status=500, reason="Failure"), "test")
+        with self.assertRaises(discord.HTTPException):
+            await self.bot.reply_or_send(message, "Answer")
+        message.channel.send.assert_not_awaited()
+
+    async def test_reply_context_uses_delivered_message_without_history_fetch(self):
+        message = self.chat(history=False)
+        referenced = SimpleNamespace(author=SimpleNamespace(id=5, display_name="Other"),
+                                     content="Our project is Orion", attachments=[], stickers=[])
+        message.reference = SimpleNamespace(message_id=123, resolved=referenced, cached_message=None)
+        text, *_ = await self.bot.extract_message_context(message, "What name?", "Tester")
+        self.assertIn("Orion", text)
+        message.channel.fetch_message.assert_not_awaited()
+        message.reference.resolved = None
+        text, *_ = await self.bot.extract_message_context(message, "What name?", "Tester")
+        self.assertEqual(text, "What name?")
+        message.channel.fetch_message.assert_not_awaited()
+
+    async def test_search_preserves_query_and_returns_source_urls(self):
+        search = Mock(return_value=[{"title": "C++ docs", "href": "https://example.com/cpp", "body": "An excerpt"}])
+        with patch.object(self.bot, "DDGS", return_value=SimpleNamespace(text=search)):
+            for query in ('C++ std::vector "2010"', 'C# vs .NET', 'history of Python 1991'):
+                result = await self.bot.perform_web_search(query)
+                search.assert_called_with(query, max_results=self.bot.WEB_SEARCH_MAX_RESULTS)
+                self.assertIn("URL: https://example.com/cpp", result)
+
+    async def test_invalid_tool_arguments_return_recoverable_errors(self):
+        search = AsyncMock(return_value="result")
+        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+            for arguments in ('{}', '[]', 'null', '{broken', '{"query": 3}',
+                              '{"query":"ok","extra":true}', '{"query":" "}'):
+                result = await self.bot.execute_tool_call("web_search", arguments)
+                self.assertIn("Tool error", result)
+            self.assertIn("Tool error", await self.bot.execute_tool_call("unknown", '{"query":"ok"}'))
+            search.assert_not_awaited()
+
+    async def test_generation_keeps_sources_even_if_model_omits_citations(self):
+        call = SimpleNamespace(id="search-1", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
+        tool_message = SimpleNamespace(content=None, tool_calls=[call], model_dump=lambda **kwargs: {
+            "role": "assistant", "tool_calls": [],
+        })
+        answer_message = SimpleNamespace(content="The answer.", tool_calls=[])
+        self.create.side_effect = [SimpleNamespace(choices=[SimpleNamespace(message=m)], usage=None)
+                                   for m in (tool_message, answer_message)]
+        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=AsyncMock(return_value="URL: https://example.com/source\n")):
+            answer = await self.bot.generate_ai_response([], self.chat(), False, False)
+        self.assertIn("https://example.com/source", answer)
+        self.assertTrue(answer.startswith("The answer."))
+
+    async def test_supplied_document_still_allows_web_search(self):
+        message = self.chat()
+        with patch.object(self.bot, "extract_message_context", new=AsyncMock(return_value=(
+                "Question", [], [], "[Extracted PDF Content]: incomplete document"))), \
+                patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
+                patch.object(self.bot, "generate_ai_response", new=AsyncMock(return_value="Answer")) as generate:
+            await self.bot.on_message(message)
+            self.assertFalse(generate.call_args.args[2])
+
+    async def test_remember_saves_and_recalls_during_embedding_outage(self):
+        interaction = self.interaction()
+        interaction.user.display_name = "Tester"
+        await self.bot.cmd_remember.callback(interaction, "I prefer Python")
+        self.assertIn("Saved", interaction.followup.send.call_args.args[0])
+        with patch.object(self.client.custom_ef, "embed", side_effect=RuntimeError("offline")):
+            await self.bot.sync_manual_memories()
+            context = await self.bot.build_ai_context("1", "42", "What do I prefer?")
+        self.assertIn("I prefer Python", context[0]["content"])
+        self.assertEqual(await self.count("memory_overrides"), 1)
+        await self.client.db_conn.close()
+        self.client.db_conn = await aiosqlite.connect("check.sqlite3")
+        await self.bot.init_db(self.client.db_conn)
+        await self.bot.sync_manual_memories()
+        self.assertEqual(len(self.store.facts), 1)
+
+    async def test_edit_and_delete_are_scoped_to_own_fact_in_current_server(self):
+        own = self.put_fact()
+        other = self.put_fact("other", "Other likes Python", user="84")
+        elsewhere = self.put_fact("elsewhere", "Tester likes games", server="2")
+        for handle in (other, elsewhere, "invalid"):
+            with self.assertRaises(ValueError):
+                await self.bot.change_memory("1", "42", "Tester", "new fact", handle)
+        await self.bot.change_memory("1", "42", "Tester", "I live in Pune", own)
+        listed = await self.bot.list_memories("1", "42")
+        self.assertIn("Pune", listed["legacy"][0])
+        self.assertNotIn("Delhi", listed["legacy"][0])
+        await self.bot.sync_manual_memories()
+        self.assertIn("Pune", self.store.facts["legacy"][0])
+        await self.bot.change_memory("1", "42", "Tester", handle=own)
+        self.assertEqual(await self.bot.list_memories("1", "42"), {})
+        await self.bot.sync_manual_memories()
+        self.assertEqual(set(self.store.facts), {"other", "elsewhere"})
+
+    async def test_autocomplete_shows_only_own_facts_and_read_defaults_to_self(self):
+        own = self.put_fact()
+        self.put_fact("other", "Other likes Python", user="84")
+        self.put_fact("elsewhere", "Tester likes games", server="2")
+        choices = await self.bot.memory_autocomplete(self.interaction(), "Delhi")
+        self.assertEqual([choice.value for choice in choices], [own])
+        interaction = self.interaction()
+        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="read"))
+        text = interaction.followup.send.call_args.args[0]
+        self.assertIn(own, text)
+        self.assertNotIn("Other", text)
+
+    async def test_correction_survives_failed_indexing_and_filters_stale_retrieval(self):
+        handle = self.put_fact()
+        await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
+        result = {"ids": [["legacy"]], "documents": [[self.store.facts["legacy"][0]]],
+                  "metadatas": [[self.store.facts["legacy"][1]]], "distances": [[0.0]]}
+        with patch.object(self.store, "upsert", side_effect=RuntimeError("index failure")):
+            await self.bot.sync_manual_memories()
+        with patch.object(self.store, "query", return_value=result):
+            context = await self.bot.build_ai_context("1", "42", "Where does Tester live?")
+        self.assertNotIn("Delhi", context[0]["content"])
+        self.assertIn("Pune", context[0]["content"])
+        await self.bot.sync_manual_memories()
+        self.assertIn("Pune", self.store.facts["legacy"][0])
+
+    async def test_deleted_fact_is_not_regenerated_from_retained_input_after_restart(self):
+        handle = self.put_fact(text="Tester likes Python")
+        await self.seed()
+        await self.archive()
+        await self.bot.change_memory("1", "42", "Tester", handle=handle)
+        await self.client.db_conn.close()
+        self.client.db_conn = await aiosqlite.connect("check.sqlite3")
+        await self.bot.init_db(self.client.db_conn)
+        self.create.return_value = self.completion('["Tester likes Python", "Tester likes hiking"]')
+        await self.bot.process_pending_memories()
+        self.assertEqual(await self.count("pending_memories"), 0)
+        facts = await self.bot.list_memories("1", "42")
+        self.assertEqual(len(facts), 1)
+        self.assertIn("hiking", next(iter(facts.values()))[0])
+
+    async def test_edit_during_extraction_retries_input_against_latest_correction(self):
+        handle = self.put_fact(text="Tester likes Python")
+        await self.seed()
+        await self.archive()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def extract(**kwargs):
+            entered.set()
+            await release.wait()
+            return self.completion('["Tester likes Python", "Tester likes hiking"]')
+        self.create.side_effect = extract
+        task = asyncio.create_task(self.bot.process_pending_memories())
+        await asyncio.wait_for(entered.wait(), 2)
+        await self.bot.change_memory("1", "42", "Tester", "I prefer Rust", handle)
+        release.set()
+        await task
+        self.assertEqual(await self.count("pending_memories"), 2)
+        self.create.side_effect = None
+        self.create.return_value = self.completion('["Tester likes Python", "Tester likes hiking"]')
+        await self.bot.process_pending_memories()
+        facts = await self.bot.list_memories("1", "42")
+        text = str(facts)
+        self.assertIn("Rust", text)
+        self.assertIn("hiking", text)
+        self.assertNotIn("likes Python", text)
+
+    async def test_forget_during_manual_embedding_prevents_index_restoration(self):
+        await self.bot.change_memory("1", "42", "Tester", "I like Python")
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        def embed(*args):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise AssertionError("Unreleased embedding")
+            return [[1.0, 0.0]]
+        with patch.object(self.client.custom_ef, "embed", side_effect=embed):
+            task = asyncio.create_task(self.bot.sync_manual_memories())
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await self.bot.forget_memories("1", "42")
+            finally:
+                release.set()
+                await task
+        self.assertEqual(self.store.facts, {})
+        self.assertEqual(await self.count("memory_overrides"), 0)
+
+    async def test_failed_sqlite_correction_keeps_original_fact(self):
+        handle = self.put_fact()
+        await self.client.db_conn.execute(
+            "CREATE TEMP TRIGGER fail_edit BEFORE INSERT ON memory_overrides BEGIN SELECT RAISE(ABORT, 'failure'); END",
+        )
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
+        self.assertEqual(await self.count("memory_suppressions"), 0)
+        self.assertIn("Delhi", (await self.bot.list_memories("1", "42"))["legacy"][0])
+
+    async def test_turns_order_within_server_while_other_servers_progress(self):
+        first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(server=2)
+        entered, release, other_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        contexts = {}
+        async def context(server, author, payload):
+            cursor = await self.client.db_conn.execute("SELECT content FROM chat_history WHERE server_id = ? ORDER BY id", (server,))
+            contexts[(server, author)] = [row[0] for row in await cursor.fetchall()]
+            return []
+        async def generate(messages, message, *args):
+            if message is first:
+                entered.set()
+                await release.wait()
+                return "Orion confirmed"
+            if message is other:
+                other_done.set()
+            return "Answer"
+        with patch.object(self.bot, "build_ai_context", side_effect=context), \
+                patch.object(self.bot, "generate_ai_response", side_effect=generate):
+            a = asyncio.create_task(self.bot.on_message(first))
+            await asyncio.wait_for(entered.wait(), 2)
+            b = asyncio.create_task(self.bot.on_message(second))
+            c = asyncio.create_task(self.bot.on_message(other))
+            try:
+                await asyncio.wait_for(other_done.wait(), 2)
+                self.assertNotIn(("1", "84"), contexts)
+            finally:
+                release.set()
+                await asyncio.gather(a, b, c)
+        self.assertIn("Orion confirmed", contexts[("1", "84")])
+
+    async def test_clear_invalidates_running_and_queued_turns(self):
+        first, second = self.chat(), self.chat(author=84)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def generate(*args):
+            entered.set()
+            await release.wait()
+            return "Old answer"
+        with patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
+                patch.object(self.bot, "generate_ai_response", side_effect=generate) as model:
+            a = asyncio.create_task(self.bot.on_message(first))
+            await asyncio.wait_for(entered.wait(), 2)
+            b = asyncio.create_task(self.bot.on_message(second))
+            await asyncio.sleep(0)
+            await self.archive()
+            release.set()
+            await asyncio.gather(a, b)
+            self.assertEqual(model.await_count, 1)
+        self.assertEqual(await self.count("chat_history"), 0)
+        first.reply.assert_not_awaited()
+        second.reply.assert_not_awaited()
+
+    async def test_cancelled_turn_releases_server_for_next_request(self):
+        first, second = self.chat(), self.chat(author=84)
+        entered = asyncio.Event()
+        async def generate(messages, message, *args):
+            if message is first:
+                entered.set()
+                await asyncio.Event().wait()
+            return "Next answer"
+        with patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
+                patch.object(self.bot, "generate_ai_response", side_effect=generate):
+            a = asyncio.create_task(self.bot.on_message(first))
+            await asyncio.wait_for(entered.wait(), 2)
+            b = asyncio.create_task(self.bot.on_message(second))
+            a.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await a
+            await asyncio.wait_for(b, 2)
+        second.reply.assert_awaited_once_with("Next answer")
+
+    async def test_newer_edit_wins_over_slow_manual_index_write(self):
+        handle = await self.bot.change_memory("1", "42", "Tester", "I live in Delhi")
+        entered, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        def embed(*args):
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(5):
+                raise AssertionError("Unreleased embedding")
+            return [[1.0, 0.0]]
+        with patch.object(self.client.custom_ef, "embed", side_effect=embed):
+            task = asyncio.create_task(self.bot.sync_manual_memories())
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
+            finally:
+                release.set()
+                await task
+        self.assertEqual(self.store.facts, {})
+        await self.bot.sync_manual_memories()
+        self.assertIn("Pune", str(self.store.facts))
+        self.assertNotIn("Delhi", str(self.store.facts))
+
+    async def test_fact_commands_enforce_server_and_member_scope(self):
+        handle = self.put_fact()
+        interaction = self.interaction(user_id=84)
+        interaction.user.display_name = "Other"
+        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="delete"), memory_id=handle)
+        self.assertIn("Choose one of your", interaction.followup.send.call_args.args[0])
+        self.assertIn("legacy", self.store.facts)
+        owner = self.interaction()
+        owner.user.display_name = "Tester"
+        await self.bot.cmd_memory.callback(owner, SimpleNamespace(value="edit"), memory_id=handle, fact="I live in Pune")
+        self.assertIn("Updated", owner.followup.send.call_args.args[0])
+        await self.bot.forget_memories("1", "42")
+        self.assertEqual(await self.count("memory_overrides"), 0)
+        self.assertEqual(await self.count("memory_suppressions"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
