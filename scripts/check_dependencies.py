@@ -118,9 +118,11 @@ async def check_bot():
                     await bot.client.setup_hook()
                     names = {command.name for command in bot.tree.get_commands()}
                     assert {'help', 'status', 'role', 'clear', 'memory', 'remember', 'force-forget', 'admin_wipe_server'} <= names
-                    # Serialize the new option/autocomplete schema through the real Discord library.
+                    # Verify the published command schema no longer offers individual edits/deletions.
                     command = bot.tree.get_command('memory').to_dict(bot.tree)
-                    assert next(option for option in command['options'] if option['name'] == 'memory_id')['autocomplete']
+                    options = {option['name']: option for option in command['options']}
+                    assert set(options) == {'action', 'target_user'}
+                    assert {choice['value'] for choice in options['action']['choices']} == {'list', 'read', 'clear'}
                     print('PASS Discord command registration and database initialization')
 
                     channel = Channel()
@@ -146,36 +148,31 @@ async def check_bot():
                         assert 'Tester likes Python' in recalled[0]['content']
                         print('PASS embedding requests and Chroma memory write and retrieval')
 
-                        # Use real temporary Chroma and SQLite to check edits and deletions,
+                        # Use real temporary Chroma and SQLite to check explicit saves and full forget,
                         # including an indexing write whose SQLite acknowledgement fails.
                         bot.client.memory_worker.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await bot.client.memory_worker
                         bot.client.memory_worker = None
-                        facts = await bot.list_memories('1', '42')
-                        key = next(iter(facts))
-                        handle = bot.memory_handle(key)
-                        await bot.change_memory('1', '42', 'Tester', 'I prefer Rust', handle)
+                        key = await bot.remember_fact('1', '42', 'Tester', 'I like hiking')
                         await bot.client.db_conn.execute(
-                            "CREATE TEMP TRIGGER fail_index_ack BEFORE UPDATE OF indexed ON memory_overrides "
+                            "CREATE TEMP TRIGGER fail_index_ack BEFORE UPDATE OF indexed ON explicit_memories "
                             "BEGIN SELECT RAISE(ABORT, 'synthetic acknowledgement failure'); END",
                         )
                         await bot.sync_manual_memories()
-                        cursor = await bot.client.db_conn.execute('SELECT indexed FROM memory_overrides')
+                        cursor = await bot.client.db_conn.execute('SELECT indexed FROM explicit_memories')
                         assert (await cursor.fetchone())[0] == 0
-                        assert 'Rust' in (await bot.list_memories('1', '42'))[key][0]
+                        assert 'hiking' in (await bot.list_memories('1', '42'))[key][0]
                         await bot.client.db_conn.execute('DROP TRIGGER fail_index_ack')
                         await bot.sync_manual_memories()
-                        assert bot.client.memory_collection.count() == 1
-                        assert 'Rust' in bot.client.memory_collection.get(ids=[key])['documents'][0]
-                        await bot.change_memory('1', '42', 'Tester', handle=handle)
-                        await bot.sync_manual_memories()
+                        assert bot.client.memory_collection.count() == 2
+                        assert 'hiking' in bot.client.memory_collection.get(ids=[key])['documents'][0]
+                        await bot.forget_memories('1', '42')
                         assert bot.client.memory_collection.count() == 0
                         assert not await bot.list_memories('1', '42')
-                        await bot.forget_memories('1', '42')
-                        cursor = await bot.client.db_conn.execute('SELECT COUNT(*) FROM memory_suppressions')
+                        cursor = await bot.client.db_conn.execute('SELECT COUNT(*) FROM explicit_memories')
                         assert (await cursor.fetchone())[0] == 0
-                        print('PASS explicit memory correction/deletion, retry after failed acknowledgement, and scoped cleanup')
+                        print('PASS explicit memory save, retry after failed acknowledgement, and scoped cleanup')
 
                     with Image.new('RGBA', (1200, 600), (20, 40, 80, 255)) as image:
                         buffer = io.BytesIO()

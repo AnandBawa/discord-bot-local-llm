@@ -5,7 +5,7 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 ## Key Features
 
 - **Shared Server Memory:** SQLite stores chronological conversation history and retains input awaiting memory extraction. ChromaDB stores extracted text facts for semantic retrieval. Failed extraction is retried, including after restart.
-- **Explicit Memory:** `/remember` saves a fact immediately. Members can select, correct, or delete their own individual facts through `/memory`; facts remain shared within the server. SQLite retains explicit changes while the background worker updates Chroma.
+- **Explicit Memory:** `/remember` saves a fact immediately in SQLite while the background worker indexes it in Chroma. Members can view saved facts or clear their own memory through `/memory`; facts remain shared within the server.
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
 - **Cloud Fallback:** Tries local chat and embedding endpoints and can use configured cloud providers when requests fail.
 - **Image Analysis:** Passes images and Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
@@ -92,11 +92,11 @@ The check uses synthetic messages, mocked API responses, and temporary databases
 
 The regression checks cover URL restrictions, forgetting during background work, and retaining failed extraction input. They use synthetic data, temporary databases, and a controlled local HTTP server; external socket connections are blocked.
 
-The feature checks cover missing Discord permissions, search queries and sources, explicit memory edits/deletions and retries, and conversation ordering across servers. The dependency check also exercises corrections and retry after a failed database acknowledgement with real temporary SQLite and Chroma storage.
+The feature checks cover missing Discord permissions, search queries and sources, explicit memory saves and retries, scoped clearing, and conversation ordering across servers. The dependency check also exercises saving and retry after a failed database acknowledgement with real temporary SQLite and Chroma storage.
 
 History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
 
-Explicit facts and corrections use two additional SQLite tables, `memory_overrides` and `memory_suppressions`, created automatically at startup. Existing Chroma facts remain readable and editable. Restart the bot to load the updated code and sync the new slash-command options; this does not require re-inviting it to servers where its slash commands already work.
+Explicit facts use an `explicit_memories` SQLite table, created automatically at startup. Individual memory editing/deletion has been removed. Its former override and suppression tables are no longer used or migrated; the owner chose to reset the saved data. Restart the bot to load the updated code and sync the slash-command options; this does not require re-inviting it to servers where its slash commands already work.
 
 The [audit and improvement plan](docs/AUDIT.md) records findings, accepted server-wide behavior, implemented fixes, and deferred improvements.
 
@@ -115,21 +115,20 @@ The bot features two distinct ways to interact: standard conversational tagging,
 - **`/status`**: Check bot diagnostics, ping, active primary/fallback AI node status, and current chat history capacity.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Extraction input from the previous conversation is retained until processing succeeds. Type `clear` to restore the neutral default.
 - **`/remember fact:...`**: Save a fact about yourself immediately, up to 500 characters. The confirmation is private; the saved fact is shared server memory.
-- **`/memory`**: List tracked users, read facts (your own by default), edit/delete one of your facts, or clear your own data. The `memory_id` option offers your facts as suggestions. `target_user` applies only to reading; editing/deletion always checks the invoking member's identity and current server.
+- **`/memory`**: List tracked users, read facts (your own by default), or clear your own saved facts and conversation data in the current server. `target_user` applies only to reading.
 - **`/clear`**: Reset the visible server conversation and queue its text for memory extraction. Existing ChromaDB facts are retained.
 - **`/force-forget`**: _(Admin/Owner Only)_ Delete a user's attributed history, retained extraction input, and ChromaDB facts in the current server.
 - **`/admin_wipe_server`**: _(Admin/Owner Only)_ Delete vector memories, chat history, and retained extraction input for the current server. The stored persona is retained.
 
-Examples of the new memory actions:
+Memory command examples:
 
 ```text
 /remember fact:I prefer Python for small scripts.
 /memory action:read
-/memory action:edit memory_id:<select a fact> fact:I now prefer Rust for CLI tools.
-/memory action:delete memory_id:<select a fact>
+/memory action:list
 ```
 
-An edit immediately replaces the selected saved fact; a deletion immediately hides it from recall and the memory list. Chroma updates retry if indexing fails. Up to 20 recent pending explicit facts are included directly in chat context while waiting for indexing. Running extraction jobs retry against the latest corrections, and normalized hashes prevent the same old fact text being extracted again after restart. This is not a semantic ban on every possible paraphrase: model-generated facts still need occasional review. A single-fact deletion does not erase conversation text that mentioned it; use the existing clear-my-memory action for that member's saved conversation and facts.
+`/remember` adds a fact; it does not edit or replace existing facts. Indexing retries if the embedding service or Chroma is unavailable. Up to 20 recent pending explicit facts are included directly in chat context while waiting for indexing. `/memory action:clear` removes your saved facts, retained extraction input, and saved conversation in the current server. Individual fact editing and deletion are not available.
 
 The per-server conversation queue also covers context loading and saving replies. Slow requests delay later turns in that server. Clear, forget, persona changes, and explicit memory changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
 

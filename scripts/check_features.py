@@ -45,10 +45,10 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             content=f"<@99> {content}", attachments=[], stickers=[], reply=AsyncMock(),
         )
 
-    def put_fact(self, key="legacy", text="Tester lives in Delhi", user="42", server="1"):
+    def put_fact(self, key="existing", text="Tester lives in Delhi", user="42", server="1", name="Tester"):
         self.store.facts[key] = (f"[Recorded on 2026-01-01]: {text}",
-                                 {"user_id": user, "server_id": server, "user_name": "Tester"})
-        return self.bot.memory_handle(key)
+                                 {"user_id": user, "server_id": server, "user_name": name})
+        return key
 
     async def test_missing_history_uses_normal_message_and_fits_discord_limit(self):
         message = self.chat(history=False)
@@ -139,74 +139,57 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             await self.bot.sync_manual_memories()
             context = await self.bot.build_ai_context("1", "42", "What do I prefer?")
         self.assertIn("I prefer Python", context[0]["content"])
-        self.assertEqual(await self.count("memory_overrides"), 1)
+        self.assertEqual(await self.count("explicit_memories"), 1)
         await self.client.db_conn.close()
         self.client.db_conn = await aiosqlite.connect("check.sqlite3")
         await self.bot.init_db(self.client.db_conn)
         await self.bot.sync_manual_memories()
         self.assertEqual(len(self.store.facts), 1)
 
-    async def test_edit_and_delete_are_scoped_to_own_fact_in_current_server(self):
-        own = self.put_fact()
-        other = self.put_fact("other", "Other likes Python", user="84")
-        elsewhere = self.put_fact("elsewhere", "Tester likes games", server="2")
-        for handle in (other, elsewhere, "invalid"):
-            with self.assertRaises(ValueError):
-                await self.bot.change_memory("1", "42", "Tester", "new fact", handle)
-        await self.bot.change_memory("1", "42", "Tester", "I live in Pune", own)
-        listed = await self.bot.list_memories("1", "42")
-        self.assertIn("Pune", listed["legacy"][0])
-        self.assertNotIn("Delhi", listed["legacy"][0])
-        await self.bot.sync_manual_memories()
-        self.assertIn("Pune", self.store.facts["legacy"][0])
-        await self.bot.change_memory("1", "42", "Tester", handle=own)
-        self.assertEqual(await self.bot.list_memories("1", "42"), {})
-        await self.bot.sync_manual_memories()
-        self.assertEqual(set(self.store.facts), {"other", "elsewhere"})
+    async def test_removed_memory_actions_are_unavailable_and_cannot_mutate_data(self):
+        self.put_fact()
+        schema = self.bot.cmd_memory.to_dict(self.bot.tree)
+        options = {option["name"]: option for option in schema["options"]}
+        self.assertEqual(set(options), {"action", "target_user"})
+        self.assertEqual({choice["value"] for choice in options["action"]["choices"]},
+                         {"list", "read", "clear"})
+        for action in ("edit", "delete"):
+            interaction = self.interaction()
+            await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value=action))
+            self.assertIn("no longer available", interaction.followup.send.call_args.args[0])
+        self.assertEqual(await self.count("explicit_memories"), 0)
+        self.assertIn("Delhi", self.store.facts["existing"][0])
+        cursor = await self.client.db_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row[0] for row in await cursor.fetchall()}
+        self.assertTrue({"memory_overrides", "memory_suppressions"}.isdisjoint(tables))
 
-    async def test_autocomplete_shows_only_own_facts_and_read_defaults_to_self(self):
-        own = self.put_fact()
-        self.put_fact("other", "Other likes Python", user="84")
+    async def test_read_defaults_to_self_and_can_read_another_member_in_same_server(self):
+        self.put_fact()
+        self.put_fact("other", "Other likes Python", user="84", name="Other")
         self.put_fact("elsewhere", "Tester likes games", server="2")
-        choices = await self.bot.memory_autocomplete(self.interaction(), "Delhi")
-        self.assertEqual([choice.value for choice in choices], [own])
         interaction = self.interaction()
         await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="read"))
         text = interaction.followup.send.call_args.args[0]
-        self.assertIn(own, text)
+        self.assertIn("Delhi", text)
         self.assertNotIn("Other", text)
+        self.assertNotIn("games", text)
+        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="read"), target_user="Other")
+        text = interaction.followup.send.call_args.args[0]
+        self.assertIn("Other likes Python", text)
+        self.assertNotIn("games", text)
 
-    async def test_correction_survives_failed_indexing_and_filters_stale_retrieval(self):
-        handle = self.put_fact()
-        await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
-        result = {"ids": [["legacy"]], "documents": [[self.store.facts["legacy"][0]]],
-                  "metadatas": [[self.store.facts["legacy"][1]]], "distances": [[0.0]]}
+    async def test_explicit_memory_survives_failed_indexing_and_retries(self):
+        key = await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
         with patch.object(self.store, "upsert", side_effect=RuntimeError("index failure")):
             await self.bot.sync_manual_memories()
-        with patch.object(self.store, "query", return_value=result):
-            context = await self.bot.build_ai_context("1", "42", "Where does Tester live?")
-        self.assertNotIn("Delhi", context[0]["content"])
-        self.assertIn("Pune", context[0]["content"])
+        self.assertEqual(self.store.facts, {})
+        self.assertIn(key, await self.bot.list_memories("1", "42"))
+        context = await self.bot.build_ai_context("1", "42", "What do I like?")
+        self.assertIn("I like hiking", context[0]["content"])
         await self.bot.sync_manual_memories()
-        self.assertIn("Pune", self.store.facts["legacy"][0])
+        self.assertIn("I like hiking", self.store.facts[key][0])
 
-    async def test_deleted_fact_is_not_regenerated_from_retained_input_after_restart(self):
-        handle = self.put_fact(text="Tester likes Python")
-        await self.seed()
-        await self.archive()
-        await self.bot.change_memory("1", "42", "Tester", handle=handle)
-        await self.client.db_conn.close()
-        self.client.db_conn = await aiosqlite.connect("check.sqlite3")
-        await self.bot.init_db(self.client.db_conn)
-        self.create.return_value = self.completion('["Tester likes Python", "Tester likes hiking"]')
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 0)
-        facts = await self.bot.list_memories("1", "42")
-        self.assertEqual(len(facts), 1)
-        self.assertIn("hiking", next(iter(facts.values()))[0])
-
-    async def test_edit_during_extraction_retries_input_against_latest_correction(self):
-        handle = self.put_fact(text="Tester likes Python")
+    async def test_remember_during_extraction_retries_with_new_explicit_fact(self):
         await self.seed()
         await self.archive()
         entered, release = asyncio.Event(), asyncio.Event()
@@ -217,7 +200,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.create.side_effect = extract
         task = asyncio.create_task(self.bot.process_pending_memories())
         await asyncio.wait_for(entered.wait(), 2)
-        await self.bot.change_memory("1", "42", "Tester", "I prefer Rust", handle)
+        await self.bot.remember_fact("1", "42", "Tester", "I prefer Rust")
         release.set()
         await task
         self.assertEqual(await self.count("pending_memories"), 2)
@@ -228,10 +211,12 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         text = str(facts)
         self.assertIn("Rust", text)
         self.assertIn("hiking", text)
-        self.assertNotIn("likes Python", text)
+        self.assertIn("likes Python", text)
+        self.assertIn("I prefer Rust", self.create.call_args.kwargs["messages"][0]["content"])
+        self.assertEqual(await self.count("explicit_memories"), 1)
 
     async def test_forget_during_manual_embedding_prevents_index_restoration(self):
-        await self.bot.change_memory("1", "42", "Tester", "I like Python")
+        await self.bot.remember_fact("1", "42", "Tester", "I like Python")
         entered, release = asyncio.Event(), threading.Event()
         loop = asyncio.get_running_loop()
         def embed(*args):
@@ -248,17 +233,17 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await task
         self.assertEqual(self.store.facts, {})
-        self.assertEqual(await self.count("memory_overrides"), 0)
+        self.assertEqual(await self.count("explicit_memories"), 0)
 
-    async def test_failed_sqlite_correction_keeps_original_fact(self):
-        handle = self.put_fact()
+    async def test_failed_sqlite_save_leaves_existing_facts_intact(self):
+        self.put_fact()
         await self.client.db_conn.execute(
-            "CREATE TEMP TRIGGER fail_edit BEFORE INSERT ON memory_overrides BEGIN SELECT RAISE(ABORT, 'failure'); END",
+            "CREATE TEMP TRIGGER fail_save BEFORE INSERT ON explicit_memories BEGIN SELECT RAISE(ABORT, 'failure'); END",
         )
         with self.assertRaises(aiosqlite.IntegrityError):
-            await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
-        self.assertEqual(await self.count("memory_suppressions"), 0)
-        self.assertIn("Delhi", (await self.bot.list_memories("1", "42"))["legacy"][0])
+            await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
+        self.assertEqual(await self.count("explicit_memories"), 0)
+        self.assertIn("Delhi", (await self.bot.list_memories("1", "42"))["existing"][0])
 
     async def test_turns_order_within_server_while_other_servers_progress(self):
         first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(server=2)
@@ -330,42 +315,17 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(b, 2)
         second.reply.assert_awaited_once_with("Next answer")
 
-    async def test_newer_edit_wins_over_slow_manual_index_write(self):
-        handle = await self.bot.change_memory("1", "42", "Tester", "I live in Delhi")
-        entered, release = asyncio.Event(), threading.Event()
-        loop = asyncio.get_running_loop()
-        def embed(*args):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
-                raise AssertionError("Unreleased embedding")
-            return [[1.0, 0.0]]
-        with patch.object(self.client.custom_ef, "embed", side_effect=embed):
-            task = asyncio.create_task(self.bot.sync_manual_memories())
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                await self.bot.change_memory("1", "42", "Tester", "I live in Pune", handle)
-            finally:
-                release.set()
-                await task
-        self.assertEqual(self.store.facts, {})
+    async def test_remember_appends_and_clear_keeps_other_members_and_servers(self):
+        key = self.put_fact()
+        own = await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
+        other = await self.bot.remember_fact("1", "84", "Other", "I like Python")
+        elsewhere = await self.bot.remember_fact("2", "42", "Tester", "I like games")
+        self.assertEqual(set(await self.bot.list_memories("1", "42")), {key, own})
         await self.bot.sync_manual_memories()
-        self.assertIn("Pune", str(self.store.facts))
-        self.assertNotIn("Delhi", str(self.store.facts))
-
-    async def test_fact_commands_enforce_server_and_member_scope(self):
-        handle = self.put_fact()
-        interaction = self.interaction(user_id=84)
-        interaction.user.display_name = "Other"
-        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="delete"), memory_id=handle)
-        self.assertIn("Choose one of your", interaction.followup.send.call_args.args[0])
-        self.assertIn("legacy", self.store.facts)
-        owner = self.interaction()
-        owner.user.display_name = "Tester"
-        await self.bot.cmd_memory.callback(owner, SimpleNamespace(value="edit"), memory_id=handle, fact="I live in Pune")
-        self.assertIn("Updated", owner.followup.send.call_args.args[0])
-        await self.bot.forget_memories("1", "42")
-        self.assertEqual(await self.count("memory_overrides"), 0)
-        self.assertEqual(await self.count("memory_suppressions"), 0)
+        await self.bot.cmd_memory.callback(self.interaction(), SimpleNamespace(value="clear"), target_user="Other")
+        self.assertEqual(set(self.store.facts), {other, elsewhere})
+        self.assertEqual(await self.bot.list_memories("1", "42"), {})
+        self.assertEqual(await self.count("explicit_memories"), 2)
 
 
 if __name__ == "__main__":
