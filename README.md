@@ -4,10 +4,10 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 
 ## Key Features
 
-- **Shared Server Memory:** SQLite stores chronological conversation history and retains input awaiting memory extraction. ChromaDB stores extracted text facts for semantic retrieval. Failed extraction is retried, including after restart.
+- **Shared Server Memory:** SQLite stores chronological conversation history as plain text and retains input awaiting memory extraction. Attachment notes and image descriptions survive in history; image bytes are sent only with the current model request. ChromaDB stores extracted text facts for semantic retrieval. Failed extraction is retried, including after restart.
 - **Explicit Memory:** `/remember` saves a fact immediately in SQLite while the background worker indexes it in Chroma. Members can view saved facts or clear their own memory through `/memory`; facts remain shared within the server.
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
-- **Cloud Fallback:** Tries local chat and embedding endpoints and can use configured cloud providers when requests fail.
+- **Cloud Fallback:** Chat and memory extraction share local/cloud routing. Embeddings have an independent failure cooldown. A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
 - **Image Analysis:** Passes images and Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
@@ -78,6 +78,8 @@ MEMORY_DISTANCE_THRESHOLD=0.45
 python bot.py
 ```
 
+Startup loads `.env`, configures logging, and creates the provider clients and storage connections. Importing `bot.py` registers the bot's handlers without reading `.env`, creating a log/database, constructing model clients, or connecting to Discord. Tests can supply configuration, model clients, and temporary storage paths directly.
+
 ## Dependency Verification and Audit
 
 Run the isolated compatibility and regression checks:
@@ -86,6 +88,7 @@ Run the isolated compatibility and regression checks:
 python scripts/check_dependencies.py
 python scripts/check_regressions.py
 python scripts/check_features.py
+python scripts/check_refactor.py
 ```
 
 The check uses synthetic messages, mocked API responses, and temporary databases. It verifies command registration, SDK timeouts and tool calls, SQLite history, Chroma memory, image processing, and PDF extraction without loading `.env` or logging in to Discord.
@@ -93,6 +96,8 @@ The check uses synthetic messages, mocked API responses, and temporary databases
 The regression checks cover URL restrictions, forgetting during background work, and retaining failed extraction input. They use synthetic data, temporary databases, and a controlled local HTTP server; external socket connections are blocked.
 
 The feature checks cover missing Discord permissions, search queries and sources, explicit memory saves and retries, scoped clearing, and conversation ordering across servers. The dependency check also exercises saving and retry after a failed database acknowledgement with real temporary SQLite and Chroma storage.
+
+The refactor checks cover import/startup behavior, literal JSON history, image/sticker payloads, direct/replied attachment limits, failed downloads, persona recovery, transaction rollback/cancellation, shutdown cleanup, independent provider cooldowns, and tool-loop limits. The plain-text history format follows the owner's data reset; no decoder or migration for the former mixed text/JSON history is included.
 
 History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
 
@@ -157,7 +162,7 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 
 **Hardware & Parsing Limits:**
 
-- `MAX_FILE_SIZE` (Default: 10MB) - Size limit used for direct attachment checks and URL downloads.
+- `MAX_FILE_SIZE` (Default: 10MB) - Size limit for direct and replied-to image/PDF attachments and URL downloads.
 - `MAX_PDF_PAGES` (Default: 15) - Maximum pages read from a PDF.
 - `MAX_TEXT_EXTRACTION_LENGTH` (Default: 40000) - Character limit for text extracted from URLs or PDFs.
 - `MAX_IMAGE_DIMENSION` (Default: 1024) - Images are resized to this maximum width/height to save VRAM.
@@ -172,4 +177,4 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 - `MEMORY_RETRY_INTERVAL` (Default: 60) - Seconds to wait before retrying retained memory extraction input.
 - `MANUAL_MEMORY_CONTEXT_LIMIT` (Default: 20) - Maximum pending explicit facts included directly in chat context before indexing completes.
 - `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for a server.
-- `CIRCUIT_BREAKER_COOLDOWN` (Default: 60) - Seconds to automatically bypass the local node and route straight to the cloud fallback after a local failure is detected.
+- `CIRCUIT_BREAKER_COOLDOWN` (Default: 60) - Seconds to bypass a failed local service when its fallback is configured. Chat/extraction and embedding cooldowns are independent.

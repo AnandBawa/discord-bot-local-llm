@@ -109,13 +109,14 @@ async def check_bot():
                 spec = importlib.util.spec_from_file_location('bot_dependency_check', ROOT / 'bot.py')
                 bot = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(bot)
+                bot.client.config = bot.Config(environment)
                 bot.tree.sync = AsyncMock(return_value=[])
                 try:
-                    models = await bot.lm_client.models.list()
+                    await bot.client.setup_hook()
+                    models = await bot.client.lm_client.models.list()
                     assert models.data[0].id == 'local-model'
                     print('PASS SDK import, request serialization, and timeout configuration')
 
-                    await bot.client.setup_hook()
                     names = {command.name for command in bot.tree.get_commands()}
                     assert {'help', 'status', 'role', 'clear', 'memory', 'remember', 'force-forget', 'admin_wipe_server'} <= names
                     # Verify the published command schema no longer offers individual edits/deletions.
@@ -130,8 +131,8 @@ async def check_bot():
                     search = AsyncMock(return_value='Synthetic search result. Source: https://example.com/')
                     with patch('requests.post', side_effect=embed), patch.dict(bot.AVAILABLE_TOOLS, web_search=search):
                         content, stored = await bot.build_user_payloads('Hello', '', [], [], 'Tester')
-                        context = await bot.build_ai_context('1', '42', content)
-                        answer = await bot.generate_ai_response(context, message, False, False)
+                        context = await bot.build_ai_context('1', content)
+                        answer = await bot.generate_ai_response(context, message, False)
                         assert answer == 'Synthetic answer.'
                         search.assert_awaited_once_with(query='synthetic test')
                         await bot.save_and_send_response(message, '1', 'Tester', stored, answer)
@@ -144,7 +145,7 @@ async def check_bot():
                             {'role': 'user', 'content': 'I like Python', 'user_id': '42'},
                         ])
                         assert bot.client.memory_collection.count() == 1
-                        recalled = await bot.build_ai_context('1', '42', 'What do I like?')
+                        recalled = await bot.build_ai_context('1', 'What do I like?')
                         assert 'Tester likes Python' in recalled[0]['content']
                         print('PASS embedding requests and Chroma memory write and retrieval')
 
@@ -190,9 +191,6 @@ async def check_bot():
                     assert len(requests_seen) == 4
                 finally:
                     await bot.client.close()
-                    await bot.lm_client.close()
-                    if bot.fallback_client:
-                        await bot.fallback_client.close()
                     logging.shutdown()
         finally:
             os.chdir(previous_directory)

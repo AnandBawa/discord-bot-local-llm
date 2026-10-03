@@ -20,9 +20,7 @@ import discord
 from discord import app_commands
 import aiosqlite
 import chromadb 
-from chromadb import Documents, EmbeddingFunction, Embeddings
 from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 from ddgs import DDGS
 from openai import AsyncOpenAI, Timeout
 from dotenv import load_dotenv
@@ -30,74 +28,45 @@ from dotenv import load_dotenv
 # ==========================================
 # ENVIRONMENT & API SETUP
 # ==========================================
-load_dotenv()
-TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-try:
-    BOT_OWNER_ID = int(os.getenv('BOT_OWNER_ID', '0'))
-except ValueError:
-    BOT_OWNER_ID = 0
+class Config:
+    """Read configuration explicitly at startup; tests can pass an empty mapping."""
+    def __init__(self, env):
+        self.token = env.get("DISCORD_BOT_TOKEN", "")
+        try:
+            self.owner_id = int(env.get("BOT_OWNER_ID", "0"))
+        except ValueError:
+            self.owner_id = 0
+        self.base_url = env.get("LLM_BASE_URL", "http://localhost:1234/v1")
+        self.api_key = env.get("LLM_API_KEY", "lm-studio")
+        self.model = env.get("LLM_MODEL_NAME", "local-model")
+        self.embedding_model = env.get("EMB_MODEL_NAME", "local-model")
+        self.vision_enabled = env.get("VISION_ENABLED", "True").lower() in ("true", "1", "yes")
+        self.fallback_url = env.get("FALLBACK_BASE_URL", "")
+        self.fallback_key = env.get("FALLBACK_API_KEY", "")
+        self.fallback_model = env.get("FALLBACK_MODEL_NAME", "")
+        self.embedding_key = env.get("FALLBACK_EMB_API_KEY", "")
+        self.memory_distance = float(env.get("MEMORY_DISTANCE_THRESHOLD", "0.4"))
 
-# --- LOGGING SETUP ---
+
 class TerminalTruncatedFormatter(logging.Formatter):
-    """Custom formatter to truncate long terminal outputs."""
     def format(self, record):
-        formatted_message = super().format(record)
-        max_len = 100  # <-- Adjust this number to make terminal logs wider or narrower
-        if len(formatted_message) > max_len:
-            return formatted_message[:max_len] + "... [truncated]"
-        return formatted_message
+        text = super().format(record)
+        return text if len(text) <= 100 else text[:100] + "... [truncated]"
 
-log_format = '%(asctime)s | %(levelname)s | %(message)s'
-date_format = '%Y-%m-%d %H:%M:%S'
 
-# 1. File Handler (Keeps the FULL log intact for debugging)
-file_handler = logging.FileHandler("bot.log", encoding='utf-8')
-file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+def configure_logging():
+    log_format = "%(asctime)s | %(levelname)s | %(message)s"
+    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S"))
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(TerminalTruncatedFormatter(log_format, datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
+    for name in ("httpx", "httpx2", "openai", "httpcore", "primp", "ddgs"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    logging.getLogger("chromadb").setLevel(logging.ERROR)
 
-# 2. Terminal Handler (Truncates long messages to keep your screen clean)
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(TerminalTruncatedFormatter(log_format, datefmt=date_format))
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[file_handler, stream_handler]
-)
-
-# Silence noisy external libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.ERROR)
-logging.getLogger("primp").setLevel(logging.WARNING)
-logging.getLogger("ddgs").setLevel(logging.WARNING)
-
-LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'http://localhost:1234/v1')
-LLM_API_KEY = os.getenv('LLM_API_KEY', 'lm-studio')
-LLM_MODEL_NAME = os.getenv('LLM_MODEL_NAME', 'local-model')
-EMB_MODEL_NAME = os.getenv('EMB_MODEL_NAME', 'local-model')
-VISION_ENABLED = os.getenv('VISION_ENABLED', 'True').lower() in ('true', '1', 'yes')
-FALLBACK_BASE_URL = os.getenv('FALLBACK_BASE_URL', '')
-FALLBACK_API_KEY = os.getenv('FALLBACK_API_KEY', '')
-FALLBACK_MODEL_NAME = os.getenv('FALLBACK_MODEL_NAME', '')
-CIRCUIT_BREAKER_COOLDOWN = 60.0  # Seconds to bypass the local node after a failure
-local_node_dead_until = 0.0      # Timestamp tracker
-
-# 2 seconds to detect an offline server, 120 seconds to wait for a slow local AI reply
-llm_timeout = Timeout(120.0, connect=2.0)
-
-lm_client = AsyncOpenAI(
-    base_url=LLM_BASE_URL, 
-    api_key=LLM_API_KEY,
-    timeout=llm_timeout,
-    max_retries=0  # <-- Critical: Prevents the silent 2x retry loop!
-)
-
-fallback_client = None
-if FALLBACK_BASE_URL and FALLBACK_API_KEY:
-    fallback_client = AsyncOpenAI(base_url=FALLBACK_BASE_URL, api_key=FALLBACK_API_KEY)
-
-intents = discord.Intents.default()
-intents.message_content = True
+CIRCUIT_BREAKER_COOLDOWN = 60.0
 
 class JinaAPIEmbeddingFunction:
     """Custom explicit Jina API handler that accepts dynamic tasks."""
@@ -142,33 +111,39 @@ class LocalAPIEmbeddingFunction:
         return [item["embedding"] for item in response.json()["data"]]
 
 class ResilientEmbeddingFunction:
-    """Thread-safe fallback wrapper for manual embedding."""
+    """Embedding fallback with its own cooldown, independent of chat requests."""
     def __init__(self, primary_ef, fallback_ef=None):
         self.primary_ef = primary_ef  
-        self.fallback_ef = fallback_ef 
+        self.fallback_ef = fallback_ef
+        self.dead_until = 0.0
 
     def embed(self, input_texts: list[str], task: str) -> list[list[float]]:
-        global local_node_dead_until
         
         # 1. If the breaker is tripped, go straight to the cloud
-        if time.time() < local_node_dead_until and self.fallback_ef:
+        if time.monotonic() < self.dead_until and self.fallback_ef:
             return self.fallback_ef.embed(input_texts, task)
             
         # 2. Otherwise, try local
         try:
             result = self.primary_ef.embed(input_texts, task)
-            local_node_dead_until = 0.0 # Reset breaker on success!
+            self.dead_until = 0.0 # Reset breaker on success!
             return result
         except Exception as e:
             logging.warning(f"⚠️ Local Embedding failed: {e}. Tripping circuit breaker and routing to cloud...")
-            local_node_dead_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
+            self.dead_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
             if self.fallback_ef:
                 return self.fallback_ef.embed(input_texts, task)
-            raise e
+            raise
 
 class MyAIClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.config = Config({})
+        self.lm_client = None
+        self.fallback_client = None
+        self.chat_dead_until = 0.0
+        self.db_path = "bot_database.db"
+        self.memory_path = "./chroma_storage"
         self.memory_lock = None
         self.db_lock = None
         self.llm_queue = None
@@ -176,7 +151,6 @@ class MyAIClient(discord.Client):
         self.vector_db = None
         self.memory_collection = None
         
-        # --- NEW: Internal State moved from global scope ---
         self.highest_token_count = 0                             
         self.memory_worker = None
         self.memory_wakeup = asyncio.Event()
@@ -184,67 +158,55 @@ class MyAIClient(discord.Client):
         self.conversation_versions = {}
         self.conversation_locks = {}
         self.memory_save_versions = {}
-        self.server_personas_cache = {}
 
     async def setup_hook(self):
         self.memory_lock = asyncio.Lock()
         self.db_lock = asyncio.Lock()
         self.llm_queue = asyncio.Semaphore(3)
         
-        self.db_conn = await aiosqlite.connect(DB_FILE)
+        if self.lm_client is None:
+            self.lm_client = AsyncOpenAI(
+                base_url=self.config.base_url, api_key=self.config.api_key,
+                timeout=Timeout(120.0, connect=2.0), max_retries=0,
+            )
+        if self.fallback_client is None and self.config.fallback_url and self.config.fallback_key:
+            self.fallback_client = AsyncOpenAI(
+                base_url=self.config.fallback_url, api_key=self.config.fallback_key,
+                timeout=Timeout(120.0, connect=2.0), max_retries=0,
+            )
+        self.db_conn = await aiosqlite.connect(self.db_path)
         await self.db_conn.execute('PRAGMA journal_mode=WAL;')
-        await self.db_conn.commit()  # <--- NEW: Close the pending transaction
+        await self.db_conn.commit()
         
         logging.info("Vacuuming SQLite database...")
         await self.db_conn.execute('VACUUM;') 
         await init_db(self.db_conn)
         
-        # 1A. Primary Local Embedding Function (LM Studio) - Fail Fast
-        primary_ef = LocalAPIEmbeddingFunction(
-            api_key=LLM_API_KEY, 
-            base_url=LLM_BASE_URL, 
-            model_name=EMB_MODEL_NAME
-        )
-        
-        # 1B. Fallback Cloud Embedding Function (Jina API)
-        fallback_emb_key = os.getenv('FALLBACK_EMB_API_KEY', '')
-        fallback_ef = None
-        if fallback_emb_key:
-            fallback_ef = JinaAPIEmbeddingFunction(
-                api_key=fallback_emb_key,
-                model_name="jina-embeddings-v5-text-small"
-            )
-            
-        # 1C. Wrap them together
+        primary_ef = LocalAPIEmbeddingFunction(self.config.base_url, self.config.api_key, self.config.embedding_model)
+        fallback_ef = JinaAPIEmbeddingFunction(self.config.embedding_key) if self.config.embedding_key else None
         self.custom_ef = ResilientEmbeddingFunction(primary_ef, fallback_ef)
-        
-        self.vector_db = await asyncio.to_thread(chromadb.PersistentClient, path="./chroma_storage")
-        
-        # 2. IMPORTANT: Remove embedding_function=self.custom_ef
-        # We will now manually embed to ensure thread-safe task swapping
+        self.vector_db = await asyncio.to_thread(chromadb.PersistentClient, path=self.memory_path)
         self.memory_collection = await asyncio.to_thread(
-            self.vector_db.get_or_create_collection, 
-            name="user_memories",
-            embedding_function=None, # <-- THE PROPER FIX
-            metadata={"hnsw:space": "cosine"}
+            self.vector_db.get_or_create_collection, name="user_memories",
+            embedding_function=None, metadata={"hnsw:space": "cosine"},
         )
-        
         await tree.sync()
         self.memory_worker = asyncio.create_task(retry_pending_memories())
         logging.info('🔄 Databases loaded and Slash Commands synced globally!')
 
     async def close(self):
         logging.info("Stopping memory extraction; unfinished input remains saved for retry.")
-        if self.memory_worker:
-            self.memory_worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.memory_worker
-            
-        if self.db_conn:
-            await self.db_conn.close()
-            
-        logging.info("Disconnecting from Discord. Goodbye!")
-        await super().close()
+        # Run every cleanup even if a worker or resource close fails.
+        async with contextlib.AsyncExitStack() as cleanup:
+            cleanup.push_async_callback(super().close)
+            for resource in (self.fallback_client, self.lm_client, self.db_conn):
+                if resource is not None:
+                    cleanup.push_async_callback(resource.close)
+            if self.memory_worker:
+                self.memory_worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.memory_worker
+            logging.info("Disconnecting from Discord. Goodbye!")
 
     def register_deletion(self, key):
         # Versions never expire while an older task could still be running.
@@ -254,13 +216,14 @@ class MyAIClient(discord.Client):
         return (self.pending_deletions.get(f"wipe_{server_id}", 0),
                 self.pending_deletions.get(f"{server_id}_{user_id}", 0))
 
+intents = discord.Intents.default()
+intents.message_content = True
 client = MyAIClient(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # ==========================================
 # GLOBAL STATE & CONFIGURATION
 # ==========================================
-DB_FILE = "bot_database.db"
 
 # --- MODEL & CONTEXT LIMITS ---
 MAX_HISTORY_LENGTH = 100            # Max messages kept in SQLite short-term history before summarizing to vector memory
@@ -269,7 +232,6 @@ LLM_TEMPERATURE = 1.0               # Creativity/randomness of the AI's standard
 LLM_MAX_TOKENS = 4096               # Maximum output token length for standard chat responses
 MEMORY_TEMPERATURE = 0.1            # Creativity for fact extraction (kept very low to ensure strict, factual JSON output)
 MEMORY_MAX_TOKENS = 500             # Maximum output token length when the AI is generating the memory JSON array
-MEMORY_DISTANCE_THRESHOLD = float(os.getenv('MEMORY_DISTANCE_THRESHOLD', '0.4')) # Cosine distance threshold for RAG
 MEMORY_DEDUPLICATION_THRESHOLD = 0.15 # Strict threshold to prevent saving nearly identical facts
 MEMORY_MAX_MSG_CHARS = 2000         # Max characters per message fed into the background memory extractor
 
@@ -322,6 +284,24 @@ async def retain_history_for_memory(server_id, rows):
         [(row[0], server_id, *row[1:]) for row in rows],
     )
     await client.db_conn.executemany("DELETE FROM chat_history WHERE id = ?", [(row[0],) for row in rows])
+
+async def archive_history(server_id, limit=None):
+    """Archive selected rows inside the caller's existing history transaction."""
+    sql = "SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id"
+    args = [server_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(limit)
+    cursor = await client.db_conn.execute(sql, args)
+    await retain_history_for_memory(server_id, await cursor.fetchall())
+
+
+async def get_persona(server_id):
+    async with client.db_lock:
+        cursor = await client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
+        row = await cursor.fetchone()
+        return (row[0] if row else None) or DEFAULT_PERSONA
+
 
 async def finish_memory_write(function, **kwargs):
     """Keep the memory lock held until a thread finishes, even on cancellation."""
@@ -465,6 +445,12 @@ async def send_chunked_message(target, text: str, is_interaction_followup=False)
 # ==========================================
 # 2. MEDIA PROCESSING FUNCTIONS
 # ==========================================
+
+def truncate_document(text):
+    if len(text) > MAX_TEXT_EXTRACTION_LENGTH:
+        return text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated]"
+    return text
+
 
 def extract_pdf_text(pdf_bytes):
     text = ""
@@ -613,15 +599,11 @@ async def fetch_url_content(url):
                     return {"type": "image", "data": file_bytes}
                 elif 'pdf' in content_type or url_lower.endswith('.pdf'):
                     extracted_text = await asyncio.to_thread(extract_pdf_text, file_bytes)
-                    if len(extracted_text) > MAX_TEXT_EXTRACTION_LENGTH: 
-                        extracted_text = extracted_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated]"
-                    return {"type": "text", "data": f"[Extracted PDF Document]:\n{extracted_text}"}
+                    return {"type": "text", "data": f"[Extracted PDF Document]:\n{truncate_document(extracted_text)}"}
                 elif 'text' in content_type or 'json' in content_type or 'markdown' in content_type or 'xml' in content_type:
                     try:
                         text = file_bytes.decode('utf-8', errors='replace') 
-                        if len(text) > MAX_TEXT_EXTRACTION_LENGTH: 
-                            text = text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated]"
-                        return {"type": "text", "data": text}
+                        return {"type": "text", "data": truncate_document(text)}
                     except Exception:
                         return {"type": "error", "data": "Webpage content could not be decoded."}
                 else:
@@ -723,6 +705,29 @@ async def sync_manual_memories():
         except Exception as exc:
             logging.warning("Explicit memory indexing will retry: %s", type(exc).__name__)
 
+async def request_completion(*, prefer_fallback=False, **kwargs):
+    """Route chat/extraction calls; callers own the LLM concurrency slot."""
+    use_fallback = bool(client.fallback_client and (
+        prefer_fallback or time.monotonic() < client.chat_dead_until
+    ))
+    if not use_fallback:
+        try:
+            response = await client.lm_client.chat.completions.create(model=client.config.model, **kwargs)
+            client.chat_dead_until = 0.0
+        except Exception:
+            if client.fallback_client is None:
+                raise
+            logging.warning("Local chat request failed; using the configured fallback")
+            client.chat_dead_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+            use_fallback = True
+    if use_fallback:
+        response = await client.fallback_client.chat.completions.create(model=client.config.fallback_model, **kwargs)
+    usage = getattr(response, "usage", None)
+    if usage and usage.total_tokens is not None:
+        client.highest_token_count = max(client.highest_token_count, usage.total_tokens)
+    return response, use_fallback
+
+
 async def update_user_memory(server_id, user_id, user_name, forgotten_messages, expected_version=None):
     save_key = (server_id, str(user_id))
     save_version = client.memory_save_versions.get(save_key, 0)
@@ -738,19 +743,7 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
         if str(msg.get('user_id', '')) != str(user_id):
             continue
 
-        raw_content = msg['content']
-        try:
-            parsed_content = json.loads(raw_content)
-            if isinstance(parsed_content, list) and len(parsed_content) > 0 and isinstance(parsed_content[0], dict):
-                text_only = next((item.get("text", "[Text Missing]") for item in parsed_content if item.get("type") == "text"), "[Image data]")
-                raw_content = text_only
-            else: 
-                raw_content = str(parsed_content)
-        except (json.JSONDecodeError, TypeError): 
-            pass
-            
-        # Ensure it's a string, then check length against our new constant
-        raw_content_str = str(raw_content)
+        raw_content_str = msg['content']
         if len(raw_content_str) > MEMORY_MAX_MSG_CHARS:
             raw_content_str = raw_content_str[:MEMORY_MAX_MSG_CHARS] + "\n...[System Note: Content truncated for memory efficiency]"
             
@@ -772,27 +765,10 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
     
     try:
         async with client.llm_queue:
-            try:
-                # 1. Attempt local LLM
-                response = await lm_client.chat.completions.create(
-                    model=LLM_MODEL_NAME, 
-                    messages=[{"role": "user", "content": memory_prompt}], 
-                    temperature=MEMORY_TEMPERATURE, 
-                    max_tokens=MEMORY_MAX_TOKENS
-                )
-            except Exception as e:
-                # 2. Route to fallback if local fails
-                if fallback_client:
-                    logging.warning(f"⚠️ Local LLM failed during memory extraction ({e}). Routing to Fallback API...")
-                    response = await fallback_client.chat.completions.create(
-                        model=FALLBACK_MODEL_NAME, 
-                        messages=[{"role": "user", "content": memory_prompt}], 
-                        temperature=MEMORY_TEMPERATURE, 
-                        max_tokens=MEMORY_MAX_TOKENS
-                    )
-                else:
-                    raise e # Crash normally if no fallback is configured
-                    
+            response, _ = await request_completion(
+                messages=[{"role": "user", "content": memory_prompt}],
+                temperature=MEMORY_TEMPERATURE, max_tokens=MEMORY_MAX_TOKENS,
+            )
         content = response.choices[0].message.content
         if not content or getattr(response.choices[0], "finish_reason", None) in ("length", "content_filter"):
             raise ValueError("Memory extraction returned an empty or incomplete response")
@@ -809,7 +785,6 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
             if expected_version != client.memory_version(server_id, user_id):
                 return True
             
-            # --- NEW: Semantic Deduplication Pipeline ---
             unique_facts = []
             fact_ids = []
             
@@ -823,7 +798,7 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
                 raise ValueError("Embedding service returned an incomplete batch")
             
             # 2. Check each new fact against the user's existing database
-            for i, (fact, emb) in enumerate(zip(facts_list, raw_embeddings)):
+            for fact, emb in zip(facts_list, raw_embeddings):
                 try:
                     existing = await asyncio.to_thread(
                         client.memory_collection.query,
@@ -949,13 +924,13 @@ async def cmd_status(interaction: discord.Interaction):
     
     # 1. Ping the local AI node (Using our 2.0s fail-fast timeout!)
     try:
-        await lm_client.models.list()
-        active_llm = f"🟢 Local ({LLM_MODEL_NAME})"
-        active_emb = f"🟢 Local ({EMB_MODEL_NAME})"
+        await client.lm_client.models.list()
+        active_llm = f"🟢 Local ({client.config.model})"
+        active_emb = f"🟢 Local ({client.config.embedding_model})"
     except Exception:
         # 2. If local fails, check if we have a cloud failover ready
-        if fallback_client:
-            active_llm = f"🟡 Cloud Fallback ({FALLBACK_MODEL_NAME})"
+        if client.fallback_client:
+            active_llm = f"🟡 Cloud Fallback ({client.config.fallback_model})"
             active_emb = f"🟡 Cloud Fallback (jina-embeddings-v5-text-small)"
         else:
             active_llm = "🔴 Offline (No fallback configured)"
@@ -982,25 +957,23 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
     await interaction.response.defer()
     
     if not prompt:
-        current_role = client.server_personas_cache.get(server_id, DEFAULT_PERSONA)
+        current_role = await get_persona(server_id)
         await interaction.followup.send(f"**Current Server Persona:**\n> *{current_role}*")
         return
 
+    new_prompt = "" if prompt.lower() == "clear" else prompt
     async with history_transaction():
-        cursor = await client.db_conn.execute("SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        await retain_history_for_memory(server_id, await cursor.fetchall())
-        
-        if prompt.lower() == 'clear':
-            await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, ""))
-            client.server_personas_cache[server_id] = DEFAULT_PERSONA
-            reply_text = f"✅ Server persona removed and history cleared! *(Memory extraction queued)*\n\n**Current Persona:**\n> {DEFAULT_PERSONA}"
-        else:
-            await client.db_conn.execute("INSERT INTO server_config (server_id, prompt) VALUES (?, ?) ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, prompt))
-            client.server_personas_cache[server_id] = prompt
-            reply_text = f"✅ Saved server persona and cleared history for a fresh start! *(Memory extraction queued)*\n> *{prompt}*"
+        await archive_history(server_id)
+        await client.db_conn.execute(
+            "INSERT INTO server_config (server_id, prompt) VALUES (?, ?) "
+            "ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt),
+        )
         client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
     client.memory_wakeup.set()
-    await interaction.followup.send(reply_text)
+    action = "Saved server persona" if new_prompt else "Server persona removed"
+    await interaction.followup.send(
+        f"✅ {action} and history cleared! *(Memory extraction queued)*\n\n**Current Persona:**\n> {new_prompt or DEFAULT_PERSONA}"
+    )
 
 @tree.command(name="clear", description="Clear the current conversation history (core facts retained).")
 @app_commands.default_permissions(manage_messages=True)
@@ -1009,15 +982,14 @@ async def cmd_clear(interaction: discord.Interaction):
     await interaction.response.defer()
 
     async with history_transaction():
-        cursor = await client.db_conn.execute("SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-        await retain_history_for_memory(server_id, await cursor.fetchall())
+        await archive_history(server_id)
         client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
     client.memory_wakeup.set()
     await interaction.followup.send("🗑️ Server conversation history cleared! *(Memory extraction queued)*")
 
 @tree.command(name="admin_wipe_server", description="[ADMIN/OWNER] Complete factory reset of all data for this server.")
 async def cmd_wipe_server(interaction: discord.Interaction):
-    if not (interaction.user.id == BOT_OWNER_ID or interaction.permissions.administrator):
+    if not (interaction.user.id == client.config.owner_id or interaction.permissions.administrator):
         await interaction.response.send_message("⛔ You must be a Server Admin or the Bot Owner to run this.", ephemeral=True)
         return
 
@@ -1031,7 +1003,7 @@ async def cmd_wipe_server(interaction: discord.Interaction):
 @tree.command(name="force-forget", description="[ADMIN/OWNER] Purge all stored data for a specific user.")
 @app_commands.describe(target_user="The user whose memory you want to erase")
 async def cmd_force_forget(interaction: discord.Interaction, target_user: discord.User): 
-    if not (interaction.user.id == BOT_OWNER_ID or interaction.permissions.administrator):
+    if not (interaction.user.id == client.config.owner_id or interaction.permissions.administrator):
         await interaction.response.send_message("⛔ You must be a Server Admin or the Bot Owner to run this.", ephemeral=True)
         return
 
@@ -1095,142 +1067,103 @@ async def cmd_memory(interaction: discord.Interaction, action: app_commands.Choi
 # 6. PIPELINE MODULES
 # ==========================================
 
-async def extract_message_context(message, clean_message, user_name):
-    ephemeral_context = ""
-    image_attachments = []
-    
-    for att in message.attachments:
-        if att.content_type and att.content_type.startswith('image/'):
-            if att.size <= MAX_FILE_SIZE: 
-                image_attachments.append(att)
-            else: 
-                clean_message += f"\n[System note: Attached image '{att.filename}' ignored because it exceeds the limit.]"
-        elif not att.filename.lower().endswith('.pdf'):
-            clean_message += f"\n[System note: The user attached an unsupported file type '{att.filename}'. Politely inform them that you can only read Images, PDFs, and Web Links.]"
-
-    valid_stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
-    
-    pdf_attachments = [att for att in message.attachments if att.filename.lower().endswith('.pdf') and att.size <= MAX_FILE_SIZE]
-    if pdf_attachments:
-        async with safe_typing(message.channel):
-            for pdf in pdf_attachments:
+async def collect_attachments(source, channel, *, replied=False):
+    images, documents, notes = [], [], []
+    label = "replied " if replied else ""
+    for attachment in source.attachments:
+        kind = "image" if (attachment.content_type or "").startswith("image/") else (
+            "PDF" if attachment.filename.lower().endswith(".pdf") else None
+        )
+        if kind is None:
+            notes.append(f"[System note: Unsupported {label}file '{attachment.filename}'. Supported: images, PDFs, web links.]")
+        elif attachment.size > MAX_FILE_SIZE:
+            notes.append(f"[System note: {label.capitalize()}{kind} '{attachment.filename}' exceeds the size limit.]")
+        elif kind == "image":
+            images.append(attachment)
+        else:
+            async with safe_typing(channel):
                 try:
-                    pdf_bytes = await pdf.read()
-                    pdf_text = await asyncio.to_thread(extract_pdf_text, pdf_bytes)
-                    if len(pdf_text) > MAX_TEXT_EXTRACTION_LENGTH: 
-                        pdf_text = pdf_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated due to length limit]"
-                    logging.info(f"📎 AI successfully extracted UPLOADED PDF: {pdf.filename}")
-                    ephemeral_context += f"\n\n[Extracted PDF Content from {pdf.filename}]:\n{pdf_text}"
-                    clean_message += f"\n[System note: User attached PDF '{pdf.filename}']"
-                except discord.HTTPException:
-                    logging.warning(f"⚠️ Discord CDN failed to provide PDF: {pdf.filename}")
-                    clean_message += f"\n[System note: The attached PDF '{pdf.filename}' could not be downloaded from Discord's servers.]"
+                    text = await asyncio.to_thread(extract_pdf_text, await attachment.read())
+                    documents.append(f"[Extracted PDF Content from {label}{attachment.filename}]:\n{truncate_document(text)}")
+                    notes.append(f"[System note: {label.capitalize()}PDF attached: '{attachment.filename}']")
+                except (discord.HTTPException, aiohttp.ClientError, OSError):
+                    notes.append(f"[System note: The {label}PDF '{attachment.filename}' could not be downloaded.]")
+    stickers = [sticker for sticker in source.stickers if sticker.format != discord.StickerFormatType.lottie]
+    return images, stickers, documents, notes
 
+
+async def extract_message_context(message, clean_message, user_name):
+    sources = [(message, False)]
     if message.reference and message.reference.message_id:
         try:
             replied_msg = available_reference(message)
             if replied_msg is None and can_read_history(message):
                 replied_msg = await message.channel.fetch_message(message.reference.message_id)
-            if replied_msg is None:
-                raise LookupError("Referenced message unavailable with current permissions")
-            if replied_msg.content:
-                replied_user_name = f"{replied_msg.author.display_name}_{str(replied_msg.author.id)[-4:]}"
-                clean_message += f"\n\n[Context: {user_name} is replying to the following message by {replied_user_name}: \"{replied_msg.content}\"]"
-                if replied_msg.author == client.user:
-                    clean_message += "\n[System Directive: If you need more specific facts to answer this follow-up, you MUST output a web_search tool call. Do not guess.]"
-            
-            image_attachments.extend([att for att in replied_msg.attachments if att.content_type and att.content_type.startswith('image/')])
-            valid_stickers.extend([s for s in replied_msg.stickers if s.format != discord.StickerFormatType.lottie])
-            
-            # --- NEW: Extract and process PDFs from the replied message ---
-            replied_pdfs = [att for att in replied_msg.attachments if att.filename.lower().endswith('.pdf') and att.size <= MAX_FILE_SIZE]
-            if replied_pdfs:
-                async with safe_typing(message.channel):
-                    for pdf in replied_pdfs:
-                        try:
-                            pdf_bytes = await pdf.read()
-                            pdf_text = await asyncio.to_thread(extract_pdf_text, pdf_bytes)
-                            if len(pdf_text) > MAX_TEXT_EXTRACTION_LENGTH: 
-                                pdf_text = pdf_text[:MAX_TEXT_EXTRACTION_LENGTH] + "\n...[Content Truncated due to length limit]"
-                            logging.info(f"📎 AI successfully extracted REPLIED PDF: {pdf.filename}")
-                            ephemeral_context += f"\n\n[Extracted PDF Content from replied message ({pdf.filename})]:\n{pdf_text}"
-                        except discord.HTTPException:
-                            logging.warning(f"⚠️ Discord CDN failed to provide REPLIED PDF: {pdf.filename}")
-                            clean_message += f"\n[System note: The replied PDF '{pdf.filename}' could not be downloaded.]"
+            if replied_msg is not None:
+                if replied_msg.content:
+                    name = f"{replied_msg.author.display_name}_{str(replied_msg.author.id)[-4:]}"
+                    clean_message += f'\n\n[Context: {user_name} is replying to {name}: "{replied_msg.content}"]'
+                    if replied_msg.author == client.user:
+                        clean_message += "\n[System Directive: Use web_search if you need more facts for this follow-up. Do not guess.]"
+                sources.append((replied_msg, True))
+        except (discord.HTTPException, aiohttp.ClientError, OSError) as exc:
+            logging.warning("Could not fetch the replied message: %s", exc)
 
-        except Exception as e: 
-            logging.warning(f"⚠️ Could not fetch the replied message: {e}")
+    images, stickers, documents = [], [], []
+    for source, replied in sources:
+        source_images, source_stickers, source_documents, notes = await collect_attachments(
+            source, message.channel, replied=replied,
+        )
+        images.extend(source_images)
+        stickers.extend(source_stickers)
+        documents.extend(source_documents)
+        if notes:
+            clean_message += "\n" + "\n".join(notes)
 
-    url_pattern = r'(https?://[^\s<>]+)'
-    found_urls = re.findall(url_pattern, clean_message)
-    if found_urls:
-        scraped_texts = []
+    urls = re.findall(r'(https?://[^\s<>]+)', clean_message)
+    if urls:
         async with safe_typing(message.channel):
-            fetch_tasks = [fetch_url_content(url) for url in found_urls]
-            results = await asyncio.gather(*fetch_tasks)
-            for url, url_result in zip(found_urls, results):
-                if url_result["type"] == "image": 
-                    image_attachments.append(URLImageAttachment(url_result["data"]))
-                elif url_result["type"] == "text": 
-                    scraped_texts.append(f"\n\n[Extracted webpage content from {url}]:\n{url_result['data']}")
-                elif url_result["type"] == "error": 
-                    scraped_texts.append(f"\n\n[System note: Attempted to read {url} but failed: {url_result['data']}]")
-        if scraped_texts: 
-            ephemeral_context += "".join(scraped_texts)
+            results = await asyncio.gather(*(fetch_url_content(url) for url in urls))
+        for url, result in zip(urls, results):
+            if result["type"] == "image":
+                images.append(URLImageAttachment(result["data"]))
+            elif result["type"] == "text":
+                documents.append(f"[Extracted webpage content from {url}]:\n{result['data']}")
+            else:
+                documents.append(f"[System note: Attempted to read {url} but failed: {result['data']}]")
+    ephemeral_context = "\n\n" + "\n\n".join(documents) if documents else ""
+    return clean_message, images, stickers, ephemeral_context
 
-    return clean_message, image_attachments, valid_stickers, ephemeral_context
 
 async def build_user_payloads(clean_message, ephemeral_context, image_attachments, valid_stickers, user_name):
-    api_user_content = []
-    db_user_content_obj = [] 
-    
-    ai_text_part = f"{user_name}: {clean_message}{ephemeral_context}" if (clean_message or ephemeral_context) else f"{user_name}: What is in this image?"
-    db_text_part = f"{user_name}: {clean_message}" if clean_message else f"{user_name}: [Media attached]"
+    api_text = f"{user_name}: {clean_message}{ephemeral_context}" if (clean_message or ephemeral_context) else f"{user_name}: What is in this image?"
+    stored_notes = [f"{user_name}: {clean_message}" if clean_message else f"{user_name}: [Media attached]"]
+    if not image_attachments and not valid_stickers:
+        return api_text, stored_notes[0]
+    parts = [{"type": "text", "text": api_text}]
+    if not client.config.vision_enabled:
+        parts.append({"type": "text", "text": "[System note: Visual input is disabled. Tell the user you cannot see the attached images or stickers.]"})
+        stored_notes.append("[Media attached but Vision is disabled]")
+    else:
+        media = [(image, False) for image in image_attachments] + [(sticker, True) for sticker in valid_stickers]
+        for attachment, is_sticker in media:
+            kind = "Sticker" if is_sticker else "Image"
+            name = attachment.name if is_sticker else getattr(attachment, "filename", "URL_Image")
+            encoder = process_sticker_bytes if is_sticker else process_image_bytes
+            mime = f"image/{attachment.format.name}" if is_sticker else "image/jpeg"
+            try:
+                encoded = await asyncio.to_thread(encoder, await attachment.read())
+                note = f"[{kind} attached: {name}]" if encoded else f"[Corrupted {kind.lower()} '{name}' skipped]"
+                part = {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}} if encoded else {"type": "text", "text": note}
+            except (discord.HTTPException, aiohttp.ClientError, OSError):
+                note = f"[Failed to download {kind.lower()} '{name}']"
+                part = {"type": "text", "text": note}
+            parts.append(part)
+            stored_notes.append(note)
+    return parts, "\n".join(stored_notes)
 
-    if image_attachments or valid_stickers:
-        api_user_content.append({"type": "text", "text": ai_text_part})
-        db_user_content_obj.append({"type": "text", "text": db_text_part}) 
-        
-        # --- NEW: Check if Vision is enabled before processing ---
-        if not VISION_ENABLED:
-            api_user_content.append({"type": "text", "text": "\n[System note: The user attached an image or sticker, but your vision capabilities are currently disabled. Politely inform them you cannot see it.]"})
-            db_user_content_obj.append({"type": "text", "text": "[Media attached but Vision is disabled]"})
-        else:
-            # Proceed with normal image processing
-            for img in image_attachments:
-                try:
-                    img_bytes = await img.read()
-                    img_b64 = await asyncio.to_thread(process_image_bytes, img_bytes)
-                    if img_b64:
-                        api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
-                        db_user_content_obj.append({"type": "text", "text": f"[Image attached: {getattr(img, 'filename', 'URL_Image')}]"})
-                    else:
-                        api_user_content.append({"type": "text", "text": f"\n[System note: The attached image '{getattr(img, 'filename', 'URL_Image')}' was corrupted and skipped.]"})
-                        db_user_content_obj.append({"type": "text", "text": "[Corrupted image skipped]"})
-                except discord.HTTPException:
-                    api_user_content.append({"type": "text", "text": f"\n[System note: Discord servers failed to provide the image '{getattr(img, 'filename', 'URL_Image')}'.]"})
-                    db_user_content_obj.append({"type": "text", "text": "[Failed to download image]"})
-                
-            for sticker in valid_stickers:
-                try:
-                    sticker_bytes = await sticker.read()
-                    sticker_b64 = await asyncio.to_thread(process_sticker_bytes, sticker_bytes)
-                    if sticker_b64:
-                        api_user_content.append({"type": "image_url", "image_url": {"url": f"data:image/{sticker.format.name};base64,{sticker_b64}"}})
-                        db_user_content_obj.append({"type": "text", "text": f"[Sticker attached: {sticker.name}]"})
-                    else:
-                        api_user_content.append({"type": "text", "text": f"\n[System note: The attached sticker '{sticker.name}' was corrupted and skipped.]"})
-                        db_user_content_obj.append({"type": "text", "text": "[Corrupted sticker skipped]"})
-                except discord.HTTPException:
-                    api_user_content.append({"type": "text", "text": f"\n[System note: Discord servers failed to provide the sticker '{sticker.name}'.]"})
-                    db_user_content_obj.append({"type": "text", "text": "[Failed to download sticker]"})
-    else: 
-        api_user_content = ai_text_part
-        db_user_content_obj = db_text_part 
 
-    return api_user_content, db_user_content_obj
-
-async def build_ai_context(server_id, author_id, api_user_content):
+async def build_ai_context(server_id, api_user_content):
     explicit = await load_explicit_memories(server_id)
     current_system_prompt = (
         f"Today's date is {datetime.now().strftime('%B %d, %Y')}.\n"
@@ -1267,7 +1200,6 @@ async def build_ai_context(server_id, author_id, api_user_content):
                 query_embeddings=query_embeddings,
                 n_results=5,
                 where={"server_id": server_id},
-                include=["documents", "metadatas", "distances"] # <-- NEW: Request distances
             )
             
             if results and results['documents'] and results['documents'][0]:
@@ -1282,7 +1214,7 @@ async def build_ai_context(server_id, author_id, api_user_content):
                             # Pending explicit facts are supplied directly below.
                             continue
                         fact = f"[Explicitly saved] {document}"
-                    if distance < MEMORY_DISTANCE_THRESHOLD: 
+                    if distance < client.config.memory_distance:
                         uname = meta.get("user_name", "User")
                         user_context_str += f"- {uname}: {fact}\n"
                         logging.info(f"✅ [Memory INJECTED] Distance: {distance:.3f} | Fact: {fact}")
@@ -1297,13 +1229,7 @@ async def build_ai_context(server_id, author_id, api_user_content):
     if pending_facts:
         user_context_str += "\n".join(pending_facts) + "\n"
 
-    if server_id in client.server_personas_cache:
-        base_persona = client.server_personas_cache[server_id]
-    else:
-        cursor = await client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
-        row = await cursor.fetchone()
-        base_persona = row[0] if row and row[0] else DEFAULT_PERSONA
-        client.server_personas_cache[server_id] = base_persona 
+    base_persona = await get_persona(server_id)
 
     if user_context_str: 
         current_system_prompt += f"\n\nRELEVANT RECALLED FACTS ABOUT USERS (READ ONLY - SILENTLY USE THIS CONTEXT):\n{user_context_str}"
@@ -1312,175 +1238,92 @@ async def build_ai_context(server_id, author_id, api_user_content):
     system_message = {"role": "system", "content": current_system_prompt}
 
     cursor = await client.db_conn.execute("SELECT role, content FROM chat_history WHERE server_id = ? ORDER BY id ASC", (server_id,))
-    api_history = []
-    for r in await cursor.fetchall():
-        try:
-            parsed_content = json.loads(r[1])
-            if isinstance(parsed_content, list):
-                if len(parsed_content) > 0 and not isinstance(parsed_content[0], dict): 
-                    parsed_content = r[1]
-            elif not isinstance(parsed_content, str): 
-                parsed_content = str(parsed_content)
-        except (json.JSONDecodeError, TypeError): 
-            parsed_content = r[1]
-        api_history.append({"role": r[0], "content": parsed_content})
-        
-    cleaned_history = []
-    for msg in api_history:
-        if not cleaned_history:
-            if msg["role"] == "assistant": 
-                cleaned_history.append({"role": "user", "content": "[Conversation Started]"})
-            cleaned_history.append(msg)
-        else:
-            if cleaned_history[-1]["role"] == msg["role"]:
-                c1, c2 = cleaned_history[-1]["content"], msg["content"]
-                if isinstance(c1, str) and isinstance(c2, str): 
-                    cleaned_history[-1]["content"] = f"{c1}\n\n{c2}"
-                else:
-                    list1 = [{"type": "text", "text": c1}] if isinstance(c1, str) else c1.copy()
-                    list2 = [{"type": "text", "text": f"\n\n{c2}"}] if isinstance(c2, str) else c2.copy()
-                    cleaned_history[-1]["content"] = list1 + list2
-            else: 
-                cleaned_history.append(msg)
-                
-    if cleaned_history and cleaned_history[-1]["role"] == "user":
-        c1, c2 = cleaned_history[-1]["content"], api_user_content
-        if isinstance(c1, str) and isinstance(c2, str): 
-            cleaned_history[-1]["content"] = f"{c1}\n\n{c2}"
-        else:
-            list1 = [{"type": "text", "text": c1}] if isinstance(c1, str) else c1.copy()
-            list2 = [{"type": "text", "text": f"\n\n{c2}"}] if isinstance(c2, str) else c2.copy()
-            cleaned_history[-1]["content"] = list1 + list2
-    else: 
-        cleaned_history.append({"role": "user", "content": api_user_content})
-        
-    return [system_message] + cleaned_history
+    history = [{"role": role, "content": content} for role, content in await cursor.fetchall()]
+    history.append({"role": "user", "content": api_user_content})
+    return [system_message] + merge_history(history)
 
-async def generate_ai_response(messages_to_send, message, disable_search, has_media):
-    
-    api_kwargs = {
-        "model": LLM_MODEL_NAME, 
-        "messages": messages_to_send, 
-        "temperature": LLM_TEMPERATURE, 
-        "max_tokens": LLM_MAX_TOKENS
-    }
-    
-    if not disable_search:
-        api_kwargs["tools"] = tools_schema
-        api_kwargs["tool_choice"] = "auto"
-        
-    # --- NEW: Fallback Wrapper (Latency Optimized) ---
-    async def call_llm(**kwargs):
-        global local_node_dead_until
-        
-        # 1. If the breaker is tripped, OR we fell back in a previous loop, use cloud
-        if (time.time() < local_node_dead_until or api_kwargs.get("model") == FALLBACK_MODEL_NAME) and fallback_client:
-            kwargs["model"] = FALLBACK_MODEL_NAME
-            return await fallback_client.chat.completions.create(**kwargs)
-            
-        # 2. Otherwise, try local
-        try:
-            result = await lm_client.chat.completions.create(**kwargs)
-            local_node_dead_until = 0.0 # Reset breaker on success!
-            return result
-        except Exception as e:
-            if fallback_client:
-                logging.warning(f"⚠️ Local LLM failed ({e}). Tripping circuit breaker and routing to cloud...")
-                local_node_dead_until = time.time() + CIRCUIT_BREAKER_COOLDOWN
-                api_kwargs["model"] = FALLBACK_MODEL_NAME
-                kwargs["model"] = FALLBACK_MODEL_NAME
-                return await fallback_client.chat.completions.create(**kwargs)
-            raise e
 
+def merge_history(messages):
+    """Keep alternating roles without interpreting ordinary text as JSON."""
+    merged = []
+    if messages and messages[0]["role"] == "assistant":
+        merged.append({"role": "user", "content": "[Conversation Started]"})
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            left, right = merged[-1]["content"], message["content"]
+            if isinstance(left, str) and isinstance(right, str):
+                merged[-1]["content"] = f"{left}\n\n{right}"
+            else:
+                left_parts = [{"type": "text", "text": left}] if isinstance(left, str) else list(left)
+                right_parts = [{"type": "text", "text": f"\n\n{right}"}] if isinstance(right, str) else list(right)
+                merged[-1]["content"] = left_parts + right_parts
+        else:
+            merged.append(dict(message))
+    return merged
+
+
+async def generate_ai_response(messages_to_send, message, has_media):
+    used_fallback, source_urls = False, []
     async with safe_typing(message.channel):
         async with client.llm_queue:
             try:
-                max_iterations, current_iteration, final_reply = MAX_TOOL_ITERATIONS, 0, ""
-                source_urls = []
-                
-                # Use our new wrapper instead of lm_client directly
-                response = await call_llm(**api_kwargs)
-                
-                if response.usage and response.usage.total_tokens > client.highest_token_count: 
-                    client.highest_token_count = response.usage.total_tokens
-                    
-                response_message = response.choices[0].message
-                
-                while current_iteration < max_iterations:
-                    if response_message.tool_calls:
-                        msg_dump = response_message.model_dump(exclude_none=True)
-                        if "content" not in msg_dump: 
-                            msg_dump["content"] = "" 
-                        messages_to_send.append(msg_dump)
-                        
-                        search_tasks, tool_call_metadata = [], []
-                        for tool_call in response_message.tool_calls:
-                            search_tasks.append(execute_tool_call(
-                                tool_call.function.name, tool_call.function.arguments,
-                            ))
-                            tool_call_metadata.append(tool_call)
-
-                        if search_tasks:
-                            completed_results = await asyncio.gather(*search_tasks)
-                            for tool_call, result_text in zip(tool_call_metadata, completed_results):
-                                for url in re.findall(r"^URL: (https?://[^\s<>]+)$", result_text, re.MULTILINE):
-                                    if url not in source_urls:
-                                        source_urls.append(url)
-                                messages_to_send.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result_text})
-                        
-                        api_kwargs["messages"] = messages_to_send # Update the payload
-                        response = await call_llm(**api_kwargs) # Call the wrapper
-                        
-                        if response.usage and response.usage.total_tokens > client.highest_token_count: 
-                            client.highest_token_count = response.usage.total_tokens
-                            
-                        response_message = response.choices[0].message
-                        current_iteration += 1
-                    else:
-                        final_reply = response_message.content
+                for iteration in range(MAX_TOOL_ITERATIONS + 1):
+                    response, used_fallback = await request_completion(
+                        prefer_fallback=used_fallback, messages=messages_to_send,
+                        temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS,
+                        tools=tools_schema, tool_choice="auto",
+                    )
+                    response_message = response.choices[0].message
+                    calls = response_message.tool_calls
+                    if not calls:
                         break
-                
-                # Check if the AI got stuck in a tool loop
-                if current_iteration >= max_iterations and not final_reply and not response_message.content:
-                    return "⚠️ *I needed to search too many things at once to answer that. Could you be more specific?*"
-                
-                answer = final_reply or response_message.content or "⚠️ *System error: Empty response.*"
+                    if iteration == MAX_TOOL_ITERATIONS:
+                        if not response_message.content:
+                            return "⚠️ *I needed to search too many things at once to answer that. Could you be more specific?*"
+                        break
+                    msg_dump = response_message.model_dump(exclude_none=True)
+                    msg_dump.setdefault("content", "")
+                    messages_to_send.append(msg_dump)
+                    results = await asyncio.gather(*(execute_tool_call(call.function.name, call.function.arguments) for call in calls))
+                    for call, result in zip(calls, results):
+                        for url in re.findall(r"^URL: (https?://[^\s<>]+)$", result, re.MULTILINE):
+                            if url not in source_urls:
+                                source_urls.append(url)
+                        messages_to_send.append({"role": "tool", "tool_call_id": call.id, "name": call.function.name, "content": result})
+                answer = response_message.content or "⚠️ *System error: Empty response.*"
                 missing_sources = [url for url in source_urls[:WEB_SEARCH_MAX_RESULTS] if url not in answer]
                 if missing_sources:
                     answer += "\n\nSearch sources: " + " ".join(f"<{url}>" for url in missing_sources)
                 return answer
-            except Exception as e:
-                error_str = str(e).lower()
-                logging.error(f"Generation Error: {e}")
-                if has_media and ("400" in error_str or "vision" in error_str or "image" in error_str):
-                    await send_chunked_message(message, "⚠️ **Compatibility Error:** Your local AI model does not support image analysis.")
-                else: 
-                    await send_chunked_message(message, "Oops! I couldn't process that. Please check my terminal for details.")
+            except Exception as exc:
+                error = str(exc).lower()
+                logging.error("Generation error: %s", exc)
+                text = "Oops! I couldn't process that. Please check my terminal for details."
+                if has_media and any(word in error for word in ("400", "vision", "image")):
+                    text = "⚠️ **Compatibility Error:** Your local AI model does not support image analysis."
+                await send_chunked_message(message, text)
                 return None
 
-async def save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply, expected_version=None):
-    db_user_content = json.dumps(db_user_content_obj) if isinstance(db_user_content_obj, list) else str(db_user_content_obj)
+
+async def save_and_send_response(message, server_id, user_name, stored_text, final_reply, expected_version=None):
     if expected_version is None:
         expected_version = client.conversation_versions.get(server_id, 0)
     
-    # --- NEW: Apply the lock to the entire database transaction block ---
     async with history_transaction():
         if expected_version != client.conversation_versions.get(server_id, 0):
             return
-        await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "user", db_user_content, str(message.author.id), user_name))
-        await client.db_conn.execute("INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)", (server_id, "assistant", final_reply, str(message.author.id), user_name))
+        await client.db_conn.executemany(
+            "INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)",
+            [(server_id, role, text, str(message.author.id), user_name)
+             for role, text in (("user", stored_text), ("assistant", final_reply))],
+        )
         
         cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
         
         if (await cursor.fetchone())[0] >= MAX_HISTORY_LENGTH:
-            eviction_count = MAX_HISTORY_LENGTH // 2  
-            cursor = await client.db_conn.execute('''SELECT id, role, content, user_id, user_name FROM chat_history WHERE server_id = ? ORDER BY id ASC LIMIT ?''', (server_id, eviction_count))
-            forgotten_rows = await cursor.fetchall()
-            
-            if forgotten_rows:
-                await retain_history_for_memory(server_id, forgotten_rows)
-                client.memory_wakeup.set()
-    
+            await archive_history(server_id, MAX_HISTORY_LENGTH // 2)
+            client.memory_wakeup.set()
+
     await send_chunked_message(message, final_reply)
 
 # ==========================================
@@ -1548,19 +1391,28 @@ async def handle_server_message(message, server_id, conversation_version):
         await send_chunked_message(message, "Hello! Type `/help` to see what I can do!")
         return
 
-    api_user_content, db_user_content_obj = await build_user_payloads(clean_message, ephemeral_context, image_attachments, valid_stickers, user_name)
-    messages_to_send = await build_ai_context(server_id, str(message.author.id), api_user_content)
+    api_user_content, stored_text = await build_user_payloads(clean_message, ephemeral_context, image_attachments, valid_stickers, user_name)
+    messages_to_send = await build_ai_context(server_id, api_user_content)
 
-    disable_search = False  # Documents may be incomplete; let the model search when needed.
     has_media = bool(image_attachments or valid_stickers)
 
     start_time = datetime.now()
-    final_reply = await generate_ai_response(messages_to_send, message, disable_search, has_media)
+    final_reply = await generate_ai_response(messages_to_send, message, has_media)
 
     if final_reply:
         duration = (datetime.now() - start_time).total_seconds()
         logging.info(f"✨ AI Response generated in {duration:.2f}s | Server: {message.guild.name}")
-        await save_and_send_response(message, server_id, user_name, db_user_content_obj, final_reply, conversation_version)
+        await save_and_send_response(message, server_id, user_name, stored_text, final_reply, conversation_version)
 
-if TOKEN: 
-    client.run(TOKEN)
+def main():
+    load_dotenv()
+    client.config = Config(os.environ)
+    if not client.config.token:
+        raise SystemExit("Set DISCORD_BOT_TOKEN in the environment or .env before starting the bot.")
+    configure_logging()
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    client.run(client.config.token)
+
+
+if __name__ == "__main__":
+    main()

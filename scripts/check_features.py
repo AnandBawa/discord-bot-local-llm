@@ -117,18 +117,20 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.create.side_effect = [SimpleNamespace(choices=[SimpleNamespace(message=m)], usage=None)
                                    for m in (tool_message, answer_message)]
         with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=AsyncMock(return_value="URL: https://example.com/source\n")):
-            answer = await self.bot.generate_ai_response([], self.chat(), False, False)
+            answer = await self.bot.generate_ai_response([], self.chat(), False)
         self.assertIn("https://example.com/source", answer)
         self.assertTrue(answer.startswith("The answer."))
 
     async def test_supplied_document_still_allows_web_search(self):
         message = self.chat()
+        self.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="Answer", tool_calls=[]),
+        )], usage=None)
         with patch.object(self.bot, "extract_message_context", new=AsyncMock(return_value=(
-                "Question", [], [], "[Extracted PDF Content]: incomplete document"))), \
-                patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
-                patch.object(self.bot, "generate_ai_response", new=AsyncMock(return_value="Answer")) as generate:
+                "Question", [], [], "[Extracted PDF Content]: incomplete document"))):
             await self.bot.on_message(message)
-            self.assertFalse(generate.call_args.args[2])
+        self.assertEqual(self.create.call_args.kwargs["tools"][0]["function"]["name"], "web_search")
+        self.assertIn("incomplete document", str(self.create.call_args.kwargs["messages"]))
 
     async def test_remember_saves_and_recalls_during_embedding_outage(self):
         interaction = self.interaction()
@@ -137,7 +139,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Saved", interaction.followup.send.call_args.args[0])
         with patch.object(self.client.custom_ef, "embed", side_effect=RuntimeError("offline")):
             await self.bot.sync_manual_memories()
-            context = await self.bot.build_ai_context("1", "42", "What do I prefer?")
+            context = await self.bot.build_ai_context("1", "What do I prefer?")
         self.assertIn("I prefer Python", context[0]["content"])
         self.assertEqual(await self.count("explicit_memories"), 1)
         await self.client.db_conn.close()
@@ -184,7 +186,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             await self.bot.sync_manual_memories()
         self.assertEqual(self.store.facts, {})
         self.assertIn(key, await self.bot.list_memories("1", "42"))
-        context = await self.bot.build_ai_context("1", "42", "What do I like?")
+        context = await self.bot.build_ai_context("1", "What do I like?")
         self.assertIn("I like hiking", context[0]["content"])
         await self.bot.sync_manual_memories()
         self.assertIn("I like hiking", self.store.facts[key][0])
@@ -249,9 +251,9 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(server=2)
         entered, release, other_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
         contexts = {}
-        async def context(server, author, payload):
+        async def context(server, payload):
             cursor = await self.client.db_conn.execute("SELECT content FROM chat_history WHERE server_id = ? ORDER BY id", (server,))
-            contexts[(server, author)] = [row[0] for row in await cursor.fetchall()]
+            contexts.setdefault(server, []).append([row[0] for row in await cursor.fetchall()])
             return []
         async def generate(messages, message, *args):
             if message is first:
@@ -269,11 +271,11 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             c = asyncio.create_task(self.bot.on_message(other))
             try:
                 await asyncio.wait_for(other_done.wait(), 2)
-                self.assertNotIn(("1", "84"), contexts)
+                self.assertEqual(len(contexts["1"]), 1)
             finally:
                 release.set()
                 await asyncio.gather(a, b, c)
-        self.assertIn("Orion confirmed", contexts[("1", "84")])
+        self.assertIn("Orion confirmed", contexts["1"][1])
 
     async def test_clear_invalidates_running_and_queued_turns(self):
         first, second = self.chat(), self.chat(author=84)

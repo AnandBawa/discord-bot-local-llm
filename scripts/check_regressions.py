@@ -62,22 +62,19 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.old_directory = Path.cwd()
         os.chdir(self.directory.name)
         self.patches = contextlib.ExitStack()
-        self.patches.enter_context(patch.dict(os.environ, {
-            "DISCORD_BOT_TOKEN": "", "LLM_API_KEY": "offline-test", "BOT_OWNER_ID": "0",
-        }, clear=True))
-        self.patches.enter_context(patch("dotenv.load_dotenv", return_value=False))
+        self.patches.enter_context(patch("dotenv.load_dotenv", side_effect=AssertionError("Import must not read .env")))
         self.patches.enter_context(patch("discord.Client.run", side_effect=AssertionError("Discord login disabled")))
         self.patches.enter_context(patch("socket.socket.connect", side_effect=AssertionError("External sockets disabled")))
         self.patches.enter_context(patch("socket.socket.connect_ex", side_effect=AssertionError("External sockets disabled")))
         self.create = AsyncMock(return_value=self.completion('["Tester likes Python"]'))
-        model = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.create)))
-        self.patches.enter_context(patch("openai.AsyncOpenAI", return_value=model))
+        model = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.create)), close=AsyncMock())
         self.old_logging = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
         spec = importlib.util.spec_from_file_location("bot_regression_check", ROOT / "bot.py")
         self.bot = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.bot)
         self.client = self.bot.client
+        self.client.lm_client = model
         self.client.db_lock = asyncio.Lock()
         self.client.memory_lock = asyncio.Lock()
         self.client.llm_queue = asyncio.Semaphore(3)
@@ -89,7 +86,6 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.close()
-        self.bot.file_handler.close()
         logging.disable(self.old_logging)
         self.patches.close()
         os.chdir(self.old_directory)
