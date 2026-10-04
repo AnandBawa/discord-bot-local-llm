@@ -8,6 +8,7 @@ databases/logs or contacts Discord, LM Studio, or ComfyUI.
 import asyncio
 from datetime import datetime, timedelta, timezone
 import io
+import json
 import random
 from types import SimpleNamespace
 import unittest
@@ -555,7 +556,21 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                         interaction.response.send_modal.assert_not_awaited()
                     await self.bot.cmd_status.callback(interaction)
                     status = interaction.followup.send.call_args.args[0]
-                    self.assertIn("**Image generation:** " + ("Configured" if configured else "Off"), status)
+                    model = json.loads((fixtures.ROOT / "krea2.json").read_text())["316"]["inputs"]["unet_name"]
+                    self.assertIn("**Image model:** " + (f"`{model.removesuffix('.safetensors')}` (1K–2K)" if configured else "Off"), status)
+            # Read the current workflow each time, and keep status available when it cannot be read.
+            changed = json.dumps({"316": {"class_type": "UNETLoader", "inputs": {"unet_name": "different-model.safetensors"}}})
+            cases = ((changed, "`different-model` (1K–2K)"),
+                     ("{}", "Configured (model unavailable)"),
+                     ("invalid JSON", "Configured (model unavailable)"),
+                     (FileNotFoundError(), "Configured (model unavailable)"))
+            for source, expected in cases:
+                with self.subTest(workflow=repr(source)):
+                    interaction = self.interaction()
+                    options = {"side_effect": source} if isinstance(source, Exception) else {"return_value": source}
+                    with patch.object(self.bot.Path, "read_text", **options):
+                        await self.bot.cmd_status.callback(interaction)
+                    self.assertIn("**Image model:** " + expected, interaction.followup.send.call_args.args[0])
         self.backend.request.assert_not_awaited()
         self.backend.generate.assert_not_awaited()
         self.client.lm_client.models.list.assert_not_awaited()

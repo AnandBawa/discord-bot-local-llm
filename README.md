@@ -119,7 +119,7 @@ Unsupported file attachments and oversized images/PDFs are skipped, with a note 
 ### Slash Commands (`/`)
 
 - **`/help`**: Display the command guide (Ephemeral - only visible to you).
-- **`/status`**: Show ping, server history, the chat model, supported inputs, image-generation configuration, and key limits. The chat line reflects the most recent successful provider across the bot and shows fallback details only after use. Before first use it shows the configured primary model. Status makes no provider requests; image analysis and web search need a compatible chat model.
+- **`/status`**: Show ping, server history, chat and image models, supported inputs, and key limits. The chat line reflects the most recent successful provider across the bot and shows fallback details only after use. Before first use it shows the configured primary model. The image line reads the configured name from **#316 Load Diffusion Model** in `krea2.json`, omitting the `.safetensors` extension, or shows **Off** when image generation is disabled. If the workflow/model cannot be read, it shows **Configured (model unavailable)**. Status makes no provider requests or model loads; image analysis and web search need a compatible chat model.
 - **`/imagegen`**: Enter width, height, and a prompt of up to 4000 characters in one form, then submit. The confirmation shows the chosen size and any adjustment; a queue message in the channel is replaced with the generated image. Available to all members when ComfyUI and channel permissions are configured; see setup below.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Type `clear` to restore the neutral default.
 - **`/clear`**: Delete this server's saved conversation, retaining its persona.

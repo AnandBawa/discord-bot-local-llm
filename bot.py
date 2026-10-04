@@ -292,6 +292,19 @@ class ImageGeneration:
             yield
 
     @staticmethod
+    def model_name():
+        """Read the configured diffusion model without contacting ComfyUI."""
+        try:
+            workflow = json.loads(Path(__file__).with_name("krea2.json").read_text(encoding="utf-8"))
+            loader = workflow["316"]
+            name = loader["inputs"]["unet_name"]
+            if loader["class_type"] == "UNETLoader" and isinstance(name, str) and name.strip():
+                return name.removesuffix(".safetensors")
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    @staticmethod
     def workflow(prompt, width, height):
         width, height = image_resolution(width, height)
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
@@ -879,7 +892,7 @@ async def cmd_help(interaction: discord.Interaction):
 
 **Slash Commands:**
 • **`/help`** - Display this guide.
-• **`/status`** - See the chat model, supported inputs, and limits.
+• **`/status`** - See chat and image models, supported inputs, and limits.
 • **`/imagegen`** - Enter dimensions and a prompt in one form (size adjusted to 1K–2K).
 • **`/role`** - View, change, or clear the server persona.
 • **`/clear`** - Clear this server's saved conversation history.
@@ -901,14 +914,17 @@ async def cmd_status(interaction: discord.Interaction):
         )
         history_length = (await cursor.fetchone())[0]
     vision = "On" if client.config.vision_enabled else "Off"
-    imagegen = "Configured (1K–2K)" if client.config.comfy_url else "Off"
+    imagegen = "Off"
+    if client.config.comfy_url:
+        image_model = ImageGeneration.model_name()
+        imagegen = f"`{image_model}` (1K–2K)" if image_model else "Configured (model unavailable)"
     status = (
         "**Bot status**\n"
         f"• **Ping:** {ping} | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
         f"• **Chat model:** `{chat_model}`\n"
         "• **Inputs:** Text/code, text PDFs, public links\n"
         f"• **Images/stickers:** {vision} | **Web search:** Available\n"
-        f"• **Image generation:** {imagegen}\n"
+        f"• **Image model:** {imagegen}\n"
         f"• **Limits:** ~{MAX_FILE_SIZE / 1_000_000:.1f} MB per image/PDF; "
         f"{MAX_PDF_PAGES} PDF pages; {MAX_TEXT_EXTRACTION_LENGTH:,} characters per document\n"
         "Image analysis and web search require a compatible chat model."
