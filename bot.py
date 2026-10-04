@@ -157,6 +157,8 @@ class ImageGenerationError(Exception):
 
 IMAGEGEN_MAX_SIDE = 2048
 IMAGEGEN_MIN_SIDE = 64
+IMAGEGEN_MIN_PIXELS = 1_000_000
+IMAGEGEN_MAX_PIXELS = 2_000_000
 IMAGEGEN_MAX_PENDING = 3
 IMAGEGEN_POLL_INTERVAL = 1.0
 IMAGEGEN_SWITCH_TIMEOUT = 60.0
@@ -164,11 +166,26 @@ IMAGEGEN_DOWNLOAD_LIMIT = 32 * 1024 * 1024
 
 
 def image_resolution(width, height):
-    """Nearest supported dimensions; ties round up, with at most 2048 per side."""
-    if any(type(side) is not int or not IMAGEGEN_MIN_SIDE <= side <= IMAGEGEN_MAX_SIDE
-           for side in (width, height)):
-        raise ImageGenerationError("Enter a width and height between 64 and 2048 pixels.")
-    return tuple(min(IMAGEGEN_MAX_SIDE, ((side + 8) // 16) * 16) for side in (width, height))
+    """Closest dimensions within 1–2 MP, in steps of 16 and at most 2048 per side."""
+    if any(type(side) is not int or side <= 0 for side in (width, height)):
+        raise ImageGenerationError("Enter positive whole numbers for width and height.")
+    pixels = width * height
+    scale = min(1.0, math.sqrt(IMAGEGEN_MAX_PIXELS / pixels), IMAGEGEN_MAX_SIDE / max(width, height))
+    scale = max(scale, math.sqrt(IMAGEGEN_MIN_PIXELS / pixels))
+    target_width, target_height = width * scale, height * scale
+    heights = (math.floor(target_height / 16) * 16, math.ceil(target_height / 16) * 16)
+    candidates = []
+    for candidate_width in range(IMAGEGEN_MIN_SIDE, IMAGEGEN_MAX_SIDE + 1, 16):
+        low = max(IMAGEGEN_MIN_SIDE, math.ceil(IMAGEGEN_MIN_PIXELS / (candidate_width * 16)) * 16)
+        high = min(IMAGEGEN_MAX_SIDE, (IMAGEGEN_MAX_PIXELS // (candidate_width * 16)) * 16)
+        if low <= high:
+            for candidate_height in heights:
+                candidates.append((candidate_width, min(high, max(low, candidate_height))))
+    # Relative differences balance size and aspect ratio. Candidates are already
+    # inside the pixel bounds, so rounding cannot cross either limit.
+    return min(candidates, key=lambda size: (
+        math.log(size[0] / target_width) ** 2 + math.log(size[1] / target_height) ** 2
+    ))
 
 
 async def finish_model_call(awaitable):
@@ -1285,7 +1302,7 @@ async def cmd_help(interaction: discord.Interaction):
 **Slash Commands:**
 • **`/help`** - Display this guide.
 • **`/status`** - See models, supported inputs, and limits.
-• **`/imagegen`** - Choose an image size up to 2K, then enter your prompt.
+• **`/imagegen`** - Choose a size (adjusted to 1–2 MP), then enter your prompt.
 • **`/role`** - View, change, or clear the AI's personality.
 • **`/remember`** - Save a fact about yourself for this server.\n• **`/memory`** - List users, read saved facts, or clear your own memory.
 • **`/clear`** - Clear the temporary conversation history (core facts retained).
@@ -1311,7 +1328,7 @@ async def cmd_status(interaction: discord.Interaction):
         )
         history_length = (await cursor.fetchone())[0]
     vision = "On" if client.config.vision_enabled else "Off"
-    imagegen = "Configured (up to 2K)" if client.config.comfy_url else "Off"
+    imagegen = "Configured (1–2 MP)" if client.config.comfy_url else "Off"
     status = (
         "**Bot status**\n"
         f"• **Ping:** {ping} | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
@@ -1338,28 +1355,28 @@ def imagegen_permission_error(interaction):
     return None
 
 
-class ImageResolutionModal(discord.ui.Modal, title="Image resolution (up to 2K)"):
+class ImageResolutionModal(discord.ui.Modal, title="Image resolution (1–2 MP)"):
     def __init__(self):
         super().__init__(timeout=300)
-        self.width = discord.ui.TextInput(placeholder="e.g. 1080", min_length=1, max_length=4)
-        self.height = discord.ui.TextInput(placeholder="e.g. 1920", min_length=1, max_length=4)
-        self.add_item(discord.ui.Label(text="Width in pixels (64–2048)", component=self.width))
-        self.add_item(discord.ui.Label(text="Height in pixels (64–2048)", component=self.height))
+        self.width = discord.ui.TextInput(placeholder="e.g. 1080", min_length=1, max_length=8)
+        self.height = discord.ui.TextInput(placeholder="e.g. 1920", min_length=1, max_length=8)
+        self.add_item(discord.ui.Label(text="Requested width in pixels", component=self.width))
+        self.add_item(discord.ui.Label(text="Requested height in pixels", component=self.height))
 
     async def on_submit(self, interaction):
         try:
             requested = (int(self.width.value), int(self.height.value))
             width, height = image_resolution(*requested)
         except (ValueError, ImageGenerationError):
-            await interaction.response.send_message("Enter a width and height between 64 and 2048 pixels. Run /imagegen to try again.", ephemeral=True)
+            await interaction.response.send_message("Enter positive whole numbers for width and height. Run /imagegen to try again.", ephemeral=True)
             return
         error = imagegen_permission_error(interaction)
         if error:
             await interaction.response.send_message(error, ephemeral=True)
             return
-        adjusted = f" (closest to {requested[0]} × {requested[1]})" if requested != (width, height) else ""
+        adjusted = f" (adjusted from {requested[0]} × {requested[1]})" if requested != (width, height) else ""
         await interaction.response.send_message(
-            f"Image size: **{width} × {height}**{adjusted}. Now enter your prompt.",
+            f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Now enter your prompt.",
             view=ImagePromptView(interaction.user.id, width, height), ephemeral=True,
         )
 

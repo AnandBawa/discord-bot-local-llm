@@ -9,7 +9,7 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
 - **Cloud Fallback:** Chat and memory extraction share local/cloud routing. Embeddings have an independent failure cooldown. A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
-- **Image Generation:** `/imagegen` asks for dimensions, then a prompt, and posts one image from the bundled Krea 2 ComfyUI workflow. The bot calculates the closest supported size up to 2048 pixels per side and passes the prompt unchanged. Local chat/embedding work and image generation share the GPU, unloading models only when switching between LM Studio and ComfyUI.
+- **Image Generation:** `/imagegen` asks for dimensions, then a prompt, and posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to 1–2 megapixels, with at most 2048 pixels per side, and passes the prompt unchanged. Local chat/embedding work and image generation share the GPU, unloading models only when switching between LM Studio and ComfyUI.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
@@ -108,7 +108,7 @@ The feature checks cover missing Discord permissions, search queries and sources
 
 The refactor checks cover import/startup behavior, literal JSON history, image/sticker payloads, direct/replied attachment limits, failed downloads, persona recovery, transaction rollback/cancellation, shutdown cleanup, independent provider cooldowns, and tool-loop limits. The plain-text history format follows the owner's data reset; no decoder or migration for the former mixed text/JSON history is included.
 
-The image-generation checks cover both forms, resolution rounding, unchanged prompts, channel/thread permissions, queue limits, attachment delivery/compression, and GPU handoffs in both directions. They also cover concurrent local calls, cancellation during submission or embedding, uncertain submissions, fallback routing, and LM Studio model aliases. They use synthetic API responses and image files; they do not start the servers or test real GPU memory release.
+The image-generation checks cover both forms, minimum/maximum pixel counts after rounding, repeated sizing without drift, unchanged prompts, channel/thread permissions, queue limits, attachment delivery/compression, and GPU handoffs in both directions. They also cover concurrent local calls, cancellation during submission or embedding, uncertain submissions, fallback routing, and LM Studio model aliases. They use synthetic API responses and image files; they do not start the servers or test real GPU memory release.
 
 History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
 
@@ -160,7 +160,15 @@ The per-server conversation queue also covers context loading and saving replies
 
 For reliable reloads across bot restarts, use each model's native `key` from [LM Studio's `GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list) for `LLM_MODEL_NAME` and `EMB_MODEL_NAME`. A custom alias that is already loaded can be resolved while the bot runs, but that mapping is not saved across restarts. Keep your desired load settings saved in LM Studio for JIT loading.
 
-The resolution form accepts 64–2048 for each side. Each dimension rounds to the nearest multiple of 16; ties round up. For example, **1080 × 1920 becomes 1088 × 1920**. Krea 2 uses multiples of 16; model quality at unusual aspect ratios or very small sizes is not guaranteed by this input check. See [Krea 2's resolution guidance](https://github.com/krea-ai/krea-2#usage).
+Enter positive whole numbers for width and height; larger requests such as 3840 × 2160 are accepted. The bot adjusts the requested area to **1,000,000–2,000,000 pixels (1–2 MP)**, then chooses dimensions in multiples of 16 that stay inside that range and the existing **2048-pixel maximum per side**. It keeps size and aspect ratio as close as these bounds allow. Very wide or tall requests may need a different aspect ratio to satisfy both limits. The chosen dimensions and megapixel count appear before you enter the prompt.
+
+| Requested size | Generation size | Total pixels |
+| --- | --- | --- |
+| 512 × 512 | 1008 × 1008 | 1,016,064 |
+| 1536 × 1024 | 1536 × 1024 | 1,572,864 |
+| 3840 × 2160 | 1888 × 1056 | 1,993,728 |
+
+The 1–2 MP range is the owner's chosen bot limit. Krea's documentation describes Turbo as supporting **1K–2K** and includes a **2048 × 2048** example (about **4.19 MP**), so it does not establish a hard 2 MP ceiling. ComfyUI's Krea 2 guide separately uses a **2.0-megapixel** workflow setting. See [Krea's resolution guidance](https://github.com/krea-ai/krea-2#usage) and [ComfyUI's Krea 2 workflow guide](https://github.com/Comfy-Org/docs/blob/main/tutorials/image/krea/krea-2.mdx). No model or sampler settings are changed to enforce the bot's size limit.
 
 The bot writes the unmodified prompt to **#48 Positive** and the calculated dimensions to **#232**, then reads the image from **#213 SaveImage**. The supplied 2× VAE decode is followed by **#324 ImageScaleBy at 0.5**, returning the decoded image to the selected size; the bot leaves these nodes unchanged. The workflow's model, LoRAs, sampler, and other generation settings remain in `krea2.json`. No chat-model request is used to rewrite the prompt or calculate the size. `VISION_ENABLED` affects image analysis, not generation.
 

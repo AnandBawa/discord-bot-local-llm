@@ -28,7 +28,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.client.config.comfy_url = "http://comfy.invalid:8188"
         self.backend = self.client.imagegen = self.bot.ImageGeneration(self.client.config)
         self.backend.request = AsyncMock(side_effect=AssertionError("Backend requests disabled"))
-        self.backend.generate = AsyncMock(return_value=self.png())
+        self.backend.generate = AsyncMock(return_value=self.png((1008, 1008)))
         self.create.side_effect = AssertionError("Image prompts must not go through the LLM")
 
     @staticmethod
@@ -88,7 +88,8 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         await resolution.on_submit(interaction)
         response = interaction.response.send_message.call_args
         self.assertTrue(response.kwargs["ephemeral"])
-        self.assertIn("1088 × 1920", response.args[0])
+        self.assertIn("1056 × 1888", response.args[0])
+        self.assertIn("1.99 MP", response.args[0])
         self.assertIn("1080 × 1920", response.args[0])
         view = response.kwargs["view"]
         self.assertIsInstance(view, self.bot.ImagePromptView)
@@ -101,7 +102,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         await view.children[0].callback(interaction)
         prompt = interaction.response.send_modal.call_args.args[0]
         self.assertIsInstance(prompt, self.bot.ImagePromptModal)
-        self.assertEqual((prompt.width, prompt.height), (1088, 1920))
+        self.assertEqual((prompt.width, prompt.height), (1056, 1888))
         self.assertEqual(prompt.prompt.style, discord.TextStyle.paragraph)
         self.assertEqual((prompt.prompt.min_length, prompt.prompt.max_length), (1, 4000))
         self.backend.generate.assert_not_awaited()
@@ -109,11 +110,14 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assert_slots_free()
 
     async def test_resolution_rounding_boundaries_and_malformed_form_values(self):
-        for requested, expected in (((64, 2048), (64, 2048)), ((71, 72), (64, 80)),
-                                    ((1080, 1920), (1088, 1920)), ((2040, 2047), (2048, 2048))):
+        for requested, expected in (((512, 512), (1008, 1008)), ((64, 2048), (496, 2048)),
+                                    ((1080, 1920), (1056, 1888)), ((2048, 2048), (1408, 1408)),
+                                    ((3840, 2160), (1888, 1056)), ((1536, 1024), (1536, 1024)),
+                                    ((3840, 1080), (2048, 576)), ((4000, 1000), (2048, 512)),
+                                    ((1000, 1000), (1008, 1008)), ((2000, 1000), (2000, 992))):
             with self.subTest(requested=requested):
                 self.assertEqual(self.bot.image_resolution(*requested), expected)
-        for invalid in ("", "wide", "64.5", "1e3", "0", "63", "2049", "-64"):
+        for invalid in ("", "wide", "64.5", "1e3", "0", "-1", "-64"):
             for field in ("width", "height"):
                 with self.subTest(field=field, value=invalid):
                     interaction = self.interaction()
@@ -122,10 +126,34 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                     await modal.on_submit(interaction)
                     response = interaction.response.send_message.call_args
                     self.assertTrue(response.kwargs["ephemeral"])
-                    self.assertIn("64 and 2048", response.args[0])
+                    self.assertIn("positive whole numbers", response.args[0])
                     self.assertNotIn("view", response.kwargs)
         self.backend.generate.assert_not_awaited()
         self.assert_slots_free()
+
+    async def test_resolution_pixel_limits_idempotence_and_common_aspect_ratios(self):
+        rng = random.Random(17)
+        requests = [(1, 1), (99999999, 1), (1, 99999999), (1024, 976), (2048, 976)]
+        requests += [(rng.randint(1, 99999999), rng.randint(1, 99999999)) for _ in range(200)]
+        for requested in requests:
+            with self.subTest(requested=requested):
+                width, height = self.bot.image_resolution(*requested)
+                self.assertGreaterEqual(width * height, 1_000_000)
+                self.assertLessEqual(width * height, 2_000_000)
+                self.assertLessEqual(max(width, height), 2048)
+                self.assertEqual((width % 16, height % 16), (0, 0))
+                self.assertEqual(self.bot.image_resolution(width, height), (width, height))
+                self.assertEqual(self.bot.image_resolution(*requested[::-1]), (height, width))
+        for x, y in ((1, 1), (16, 9), (9, 16), (3, 2), (2, 3)):
+            for scale in (1, 31, 80, 160, 240):
+                width, height = self.bot.image_resolution(x * scale, y * scale)
+                self.assertLess(abs((width / height) / (x / y) - 1), 0.02)
+        interaction = self.interaction()
+        modal = self.fill(self.bot.ImageResolutionModal(), width="3840", height="2160")
+        await modal.on_submit(interaction)
+        response = interaction.response.send_message.call_args
+        self.assertIn("1888 × 1056", response.args[0])
+        self.assertIn("adjusted from 3840 × 2160", response.args[0])
 
     async def test_permissions_are_rechecked_at_each_submission_including_threads(self):
         for thread in (False, True):
@@ -164,9 +192,9 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_prompts_and_dimensions_do_not_claim_queue_slots(self):
         cases = [(prompt, 64, 64, "1 and 4000") for prompt in ("", " \n\t ", "x" * 4001, None, 123)]
-        for invalid in (True, 64.0, "64", 63, 2049, None):
-            cases.extend((("A tree", invalid, 64, "64 and 2048"),
-                          ("A tree", 64, invalid, "64 and 2048")))
+        for invalid in (True, 64.0, "64", 0, -1, None):
+            cases.extend((("A tree", invalid, 64, "positive whole numbers"),
+                          ("A tree", 64, invalid, "positive whole numbers")))
         for prompt, width, height, expected in cases:
             with self.subTest(prompt=repr(prompt)[:40], width=width, height=height):
                 interaction = self.interaction()
@@ -212,7 +240,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await asyncio.wait_for(task, 2)
-        self.backend.generate.assert_awaited_once_with(literal, 80, 112)
+        self.backend.generate.assert_awaited_once_with(literal, 848, 1184)
         self.create.assert_not_awaited()
         self.backend.request.assert_not_awaited()
         interaction.followup.send.assert_not_awaited()
@@ -220,12 +248,12 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         final = interaction.progress.edit.call_args
         self.assertEqual(final.kwargs["allowed_mentions"].to_dict()["parse"], [])
         self.assertNotIn(literal, final.kwargs["content"])
-        self.assertIn("80 × 112", final.kwargs["content"])
+        self.assertIn("848 × 1184", final.kwargs["content"])
         self.assertEqual(len(interaction.uploads), 1)
         name, data = interaction.uploads[0]
         self.assertEqual(name, "image.png")
         with Image.open(io.BytesIO(data)) as picture:
-            self.assertEqual(picture.size, (80, 112))
+            self.assertEqual(picture.size, (848, 1184))
             self.assertNotIn("workflow", picture.info)
             self.assertNotIn("prompt", picture.info)
         self.assert_slots_free()
@@ -274,7 +302,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 interaction = self.interaction()
                 forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing permissions")
                 self.backend.generate.side_effect = None
-                self.backend.generate.return_value = self.png()
+                self.backend.generate.return_value = self.png((1008, 1008))
                 if stage == "defer":
                     interaction.response.defer.side_effect = forbidden
                 elif stage == "progress":
@@ -293,7 +321,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(interaction.uploads, [])
                 self.assert_slots_free()
                 self.backend.generate.side_effect = None
-                self.backend.generate.return_value = self.png()
+                self.backend.generate.return_value = self.png((1008, 1008))
                 retry = self.interaction()
                 await self.bot.run_imagegen(retry, "Try again", 64, 64)
                 self.assertEqual(len(retry.uploads), 1)

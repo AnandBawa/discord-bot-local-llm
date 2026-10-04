@@ -101,7 +101,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         prompt = '  A sign saying "hello"\n{"48": "literal prompt text"} @everyone  '
         graph = self.service.workflow(prompt, 1080, 1920)
         self.assertEqual(graph["48"]["inputs"]["value"], prompt)
-        self.assertEqual(graph["232"]["inputs"], {"width": 1088, "height": 1920, "batch_size": 1})
+        self.assertEqual(graph["232"]["inputs"], {"width": 1056, "height": 1888, "batch_size": 1})
         self.assertEqual(graph["324"]["class_type"], "ImageScaleBy")
         self.assertEqual(graph["324"]["inputs"]["scale_by"], 0.5)
         self.assertEqual(graph["324"]["inputs"]["image"], ["323", 0])
@@ -116,10 +116,11 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next_graph["324"], graph["324"])
 
     async def test_repeated_images_reuse_comfy_without_any_lm_inference(self):
-        for prompt, size in (("first", (64, 80)), ("second\nexactly", (96, 64))):
-            raw = await self.service.generate(prompt, *size)
+        for prompt, requested, expected in (("first", (64, 80), (896, 1120)),
+                                            ("second\nexactly", (3840, 2160), (1888, 1056))):
+            raw = await self.service.generate(prompt, *requested)
             with Image.open(io.BytesIO(raw)) as picture:
-                self.assertEqual(picture.size, size)
+                self.assertEqual(picture.size, expected)
         submitted = [graph for graph in self.jobs.values() if "213" in graph]
         self.assertEqual([graph["48"]["inputs"]["value"] for graph in submitted], ["first", "second\nexactly"])
         self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 2)
