@@ -116,7 +116,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_images_reuse_comfy_without_any_lm_inference(self):
         for prompt, requested, expected in (("first", (64, 80), (912, 1152)),
                                             ("second\nexactly", (3840, 2160), (2048, 1152))):
-            raw = await self.service.generate(prompt, *requested)
+            raw, _ = await self.service.generate(prompt, *requested)
             with Image.open(io.BytesIO(raw)) as picture:
                 self.assertEqual(picture.size, expected)
         submitted = [graph for graph in self.jobs.values() if "213" in graph]
@@ -125,6 +125,31 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(path == "/free" for _, _, path, _ in self.calls))
         self.assertEqual(self.service.backend, "comfyui")
         self.create.assert_not_awaited()
+
+    async def test_generation_time_excludes_queue_handoff_and_download(self):
+        clock = SimpleNamespace(now=0.0)
+
+        async def timed_request(backend, method, path, **kwargs):
+            # Only submission and workflow completion belong in generation time.
+            if path == "/prompt":
+                clock.now += 3.0
+            elif path.startswith("/history/"):
+                clock.now += 4.0
+            else:
+                clock.now += 100.0
+            return await self.request(backend, method, path, **kwargs)
+
+        self.service.request.side_effect = timed_request
+        with patch.object(self.bot, "time", SimpleNamespace(monotonic=lambda: clock.now)):
+            async with self.service.entry:
+                task = asyncio.create_task(self.service.generate("queued image", 1024, 1024))
+                await asyncio.sleep(0)
+                clock.now += 1000.0
+            raw, duration = await asyncio.wait_for(task, 1)
+        self.assertEqual(duration, 7.0)
+        self.assertGreater(clock.now, 1000.0)
+        with Image.open(io.BytesIO(raw)) as picture:
+            self.assertEqual(picture.size, (1024, 1024))
 
     async def test_round_trip_preserves_custom_chat_alias(self):
         await self.service.generate("first", 64, 64)

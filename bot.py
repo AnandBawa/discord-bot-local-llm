@@ -391,6 +391,7 @@ class ImageGeneration:
             raise
 
     async def generate(self, prompt, width, height):
+        """Return image bytes and workflow seconds, excluding queue and image transfers."""
         workflow = self.workflow(prompt, width, height)
         with self.reserve("comfyui"):
             async with self.entry:
@@ -398,7 +399,9 @@ class ImageGeneration:
                     await self.require_comfy_idle()
                 await self.switch("comfyui")
                 await self.require_comfy_idle()
+                started = time.monotonic()
                 result = await self.execute(workflow)
+                duration = time.monotonic() - started
                 images = result.get("outputs", {}).get("213", {}).get("images", [])
                 if len(images) != 1:
                     raise ImageGenerationError("The workflow must produce one image at Save Image #213.")
@@ -410,8 +413,9 @@ class ImageGeneration:
                         or ".." in subfolder.replace("\\", "/").split("/")
                         or output.get("type") != "output"):
                     raise ImageGenerationError("ComfyUI returned an unexpected image file.")
-                return await self.request("comfyui", "GET", "/view", binary=True,
+                data = await self.request("comfyui", "GET", "/view", binary=True,
                                           params={"filename": filename, "subfolder": subfolder, "type": "output"})
+                return data, duration
 
 
 
@@ -999,10 +1003,10 @@ async def run_imagegen(interaction, prompt, width, height):
             await interaction.edit_original_response(
                 content=f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Your image will appear in this channel.",
             )
-            data = await client.imagegen.generate(prompt, width, height)
+            data, duration = await client.imagegen.generate(prompt, width, height)
             data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
             with contextlib.closing(discord.File(io.BytesIO(data), filename=filename, spoiler=True)) as attachment:
-                await progress.edit(content=label, attachments=[attachment], allowed_mentions=discord.AllowedMentions.none())
+                await progress.edit(content=f"{label} · Generated in {duration:.1f}s", attachments=[attachment], allowed_mentions=discord.AllowedMentions.none())
     except asyncio.CancelledError:
         if progress is not None:
             with contextlib.suppress(discord.HTTPException):

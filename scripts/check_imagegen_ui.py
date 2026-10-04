@@ -31,7 +31,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.client.config.comfy_url = "http://comfy.invalid:8188"
         self.backend = self.client.imagegen = self.bot.ImageGeneration(self.client.config)
         self.backend.request = AsyncMock(side_effect=AssertionError("Backend requests disabled"))
-        self.backend.generate = AsyncMock(return_value=self.png((1024, 1024)))
+        self.backend.generate = AsyncMock(return_value=(self.png((1024, 1024)), 83.2))
         self.create.side_effect = AssertionError("Image prompts must not go through the LLM")
 
     @staticmethod
@@ -236,7 +236,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         submission = self.interaction()
         literal = "  A café in the rain.\nKeep the lettering exactly as given.  "
         self.fill(modal, width="1080", height="1920", prompt=literal)
-        self.backend.generate.side_effect = lambda prompt, width, height: self.png((width, height))
+        self.backend.generate.side_effect = lambda prompt, width, height: (self.png((width, height)), 83.2)
         await modal.on_submit(submission)
         submission.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
         submission.response.send_message.assert_not_awaited()
@@ -296,7 +296,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(abs((width / height) / (x / y) - 1), 0.02)
         interaction = self.interaction()
         modal = self.fill(self.bot.ImageGenerationModal(), width="3840", height="2160", prompt="A tree")
-        self.backend.generate.return_value = self.png((2048, 1152))
+        self.backend.generate.return_value = self.png((2048, 1152)), 83.2
         await modal.on_submit(interaction)
         confirmation = interaction.edit_original_response.call_args.kwargs["content"]
         self.assertIn("2048 × 1152", confirmation)
@@ -363,7 +363,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         async def generate(prompt, width, height):
             ready.set()
             await release.wait()
-            return self.png((width, height), metadata=True)
+            return self.png((width, height), metadata=True), 83.2
 
         async def require_live_token(*args, **kwargs):
             self.assertLess(datetime.now(timezone.utc) - interaction.created_at, timedelta(minutes=15))
@@ -395,6 +395,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.kwargs["allowed_mentions"].to_dict()["parse"], [])
         self.assertNotIn(literal, final.kwargs["content"])
         self.assertIn("864 × 1216", final.kwargs["content"])
+        self.assertIn("Generated in 83.2s", final.kwargs["content"])
         self.assertEqual(len(interaction.uploads), 1)
         name, data = interaction.uploads[0]
         self.assertEqual(name, "SPOILER_image.png")
@@ -413,7 +414,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             if len(entered) == 3:
                 ready.set()
             await release.wait()
-            return self.png((width, height))
+            return self.png((width, height)), 83.2
 
         self.backend.generate.side_effect = generate
         interactions = [self.interaction(user_id=user) for user in (42, 84, 126)]
@@ -448,7 +449,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 interaction = self.interaction()
                 forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing permissions")
                 self.backend.generate.side_effect = None
-                self.backend.generate.return_value = self.png((1024, 1024))
+                self.backend.generate.return_value = self.png((1024, 1024)), 83.2
                 if stage == "defer":
                     interaction.response.defer.side_effect = forbidden
                 elif stage == "progress":
@@ -462,12 +463,12 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 elif stage == "timeout":
                     self.backend.generate.side_effect = TimeoutError()
                 else:
-                    self.backend.generate.return_value = b"not an image"
+                    self.backend.generate.return_value = b"not an image", 83.2
                 await self.bot.run_imagegen(interaction, "A tree", 64, 64)
                 self.assertEqual(interaction.uploads, [])
                 self.assert_slots_free()
                 self.backend.generate.side_effect = None
-                self.backend.generate.return_value = self.png((1024, 1024))
+                self.backend.generate.return_value = self.png((1024, 1024)), 83.2
                 retry = self.interaction()
                 await self.bot.run_imagegen(retry, "Try again", 64, 64)
                 self.assertEqual(len(retry.uploads), 1)
