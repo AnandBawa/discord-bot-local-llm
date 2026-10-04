@@ -1001,7 +1001,7 @@ async def run_imagegen(interaction, prompt, width, height):
             )
             data = await client.imagegen.generate(prompt, width, height)
             data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
-            with contextlib.closing(discord.File(io.BytesIO(data), filename=filename)) as attachment:
+            with contextlib.closing(discord.File(io.BytesIO(data), filename=filename, spoiler=True)) as attachment:
                 await progress.edit(content=label, attachments=[attachment], allowed_mentions=discord.AllowedMentions.none())
     except asyncio.CancelledError:
         if progress is not None:

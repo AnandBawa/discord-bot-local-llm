@@ -397,7 +397,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("864 × 1216", final.kwargs["content"])
         self.assertEqual(len(interaction.uploads), 1)
         name, data = interaction.uploads[0]
-        self.assertEqual(name, "image.png")
+        self.assertEqual(name, "SPOILER_image.png")
         with Image.open(io.BytesIO(data)) as picture:
             self.assertEqual(picture.size, (864, 1216))
             self.assertNotIn("workflow", picture.info)
