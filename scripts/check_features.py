@@ -24,11 +24,11 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
     count = fixtures.BotChecks.count
     clear_history = fixtures.BotChecks.clear_history
 
-    def chat(self, server=1, author=42, content="Hello", history=True):
+    def chat(self, server=1, author=42, content="Hello", history=True, *, channel_id=None):
         bot_user = SimpleNamespace(id=99)
         self.client._connection.user = bot_user
         channel = SimpleNamespace(
-            id=server * 10, name="general", send=AsyncMock(), fetch_message=AsyncMock(),
+            id=channel_id if channel_id is not None else server * 10, name="general", send=AsyncMock(), fetch_message=AsyncMock(),
             permissions_for=lambda member: SimpleNamespace(read_message_history=history),
         )
         @contextlib.asynccontextmanager
@@ -111,8 +111,8 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("/" + name, text)
 
     async def test_status_reports_scoped_history_and_configured_input_limits(self):
-        await self.seed(count=2, server_id="1")
-        await self.seed(count=4, server_id="2")
+        await self.seed(count=2, server_id="channel:10")
+        await self.seed(count=4, server_id="channel:20")
         with patch.object(self.bot, "MAX_FILE_SIZE", 4_000_000), \
                 patch.object(self.bot, "MAX_PDF_PAGES", 7), \
                 patch.object(self.bot, "MAX_TEXT_EXTRACTION_LENGTH", 12345):
@@ -227,8 +227,8 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.create.call_args.kwargs["tools"][0]["function"]["name"], "web_search")
         self.assertIn("incomplete document", str(self.create.call_args.kwargs["messages"]))
 
-    async def test_turns_order_within_server_while_other_servers_progress(self):
-        first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(server=2)
+    async def test_turns_order_within_channel_while_other_channels_progress(self):
+        first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(channel_id=11)
         entered, release, other_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
         contexts = {}
         async def context(server, payload):
@@ -251,11 +251,11 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             c = asyncio.create_task(self.bot.on_message(other))
             try:
                 await asyncio.wait_for(other_done.wait(), 2)
-                self.assertEqual(len(contexts["1"]), 1)
+                self.assertEqual(len(contexts["channel:10"]), 1)
             finally:
                 release.set()
                 await asyncio.gather(a, b, c)
-        self.assertIn("Orion confirmed", contexts["1"][1])
+        self.assertIn("Orion confirmed", contexts["channel:10"][1])
 
     async def test_clear_and_role_invalidate_running_and_queued_turns(self):
         for prompt in (None, "Friendly", "clear"):

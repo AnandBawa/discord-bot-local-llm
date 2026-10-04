@@ -83,19 +83,19 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         for answer in ('[{"name":"Alice"}]', '{"key":true}', '[1,2]', '"quoted"', 'null', '```json\n[]\n```'):
             with self.subTest(answer=answer):
                 await self.bot.cmd_clear.callback(self.interaction())
-                await self.bot.save_and_send_response(self.message, "1", answer, answer)
-                context = await self.bot.build_ai_context("1", "Follow up")
+                await self.bot.save_and_send_response(self.message, "channel:10", answer, answer)
+                context = await self.bot.build_ai_context("channel:10", "Follow up")
                 self.assertEqual(context[1], {"role": "user", "content": answer})
                 self.assertEqual(context[2], {"role": "assistant", "content": answer})
 
     async def test_history_merge_keeps_roles_and_current_image(self):
         async with self.bot.history_transaction():
             await self.client.db_conn.executemany(
-                "INSERT INTO chat_history (server_id, role, content) VALUES ('1', ?, ?)",
+                "INSERT INTO chat_history (server_id, role, content) VALUES ('channel:10', ?, ?)",
                 [("assistant", "Earlier answer"), ("user", "First"), ("user", "Second")],
             )
         payload = [{"type": "text", "text": "Now"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}}]
-        context = await self.bot.build_ai_context("1", payload)
+        context = await self.bot.build_ai_context("channel:10", payload)
         self.assertEqual([m["role"] for m in context], ["system", "user", "assistant", "user"])
         self.assertEqual(context[-1]["content"], [{"type": "text", "text": "First\n\nSecond"}, *payload])
         self.assertEqual(len(payload), 2)
@@ -198,7 +198,7 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         interaction = self.interaction()
         await self.bot.cmd_role.callback(interaction)
         self.assertIn("Persisted persona", interaction.followup.send.call_args.args[0])
-        context = await self.bot.build_ai_context("1", "Hello")
+        context = await self.bot.build_ai_context("channel:10", "Hello")
         self.assertIn("Persisted persona", context[0]["content"])
 
     async def test_failed_persona_commit_preserves_history_and_persona(self):
@@ -207,7 +207,7 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.client.db_conn, "commit", new=AsyncMock(side_effect=RuntimeError("commit failed"))):
             with self.assertRaises(RuntimeError):
                 await self.bot.cmd_role.callback(self.interaction(), "New")
-        self.assertEqual(await self.bot.get_persona("1"), "Original")
+        self.assertEqual(await self.bot.get_persona("channel:10"), "Original")
         self.assertEqual(await self.count("chat_history"), 2)
 
     async def test_cancelled_commit_persona_lookup_matches_persisted_value(self):
@@ -224,9 +224,9 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                 await task
         finally:
             await self.client.db_conn.set_trace_callback(None)
-        cursor = await self.client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = '1'")
+        cursor = await self.client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = 'channel:10'")
         self.assertEqual((await cursor.fetchone())[0], "New")
-        self.assertEqual(await self.bot.get_persona("1"), "New")
+        self.assertEqual(await self.bot.get_persona("channel:10"), "New")
         self.assertEqual(await self.count("chat_history"), 0)
 
     async def test_shutdown_closes_remaining_resources_after_failure(self):

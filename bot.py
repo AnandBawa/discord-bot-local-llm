@@ -441,7 +441,7 @@ def image_attachment(data, width, height, limit):
         raise
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise ImageGenerationError("ComfyUI returned an unreadable image.") from exc
-    raise ImageGenerationError("The generated image exceeds this server's attachment limit.")
+    raise ImageGenerationError("The generated image exceeds the attachment limit here.")
 
 
 class MyAIClient(discord.Client):
@@ -505,7 +505,9 @@ class MyAIClient(discord.Client):
 intents = discord.Intents.default()
 intents.message_content = True
 client = MyAIClient(intents=intents)
-tree = app_commands.CommandTree(client)
+tree = app_commands.CommandTree(
+    client, allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=False),
+)
 
 # ==========================================
 # GLOBAL STATE & CONFIGURATION
@@ -529,13 +531,19 @@ WEB_SEARCH_MAX_RESULTS = 3          # Number of DuckDuckGo search result snippet
 # --- DISCORD & SYSTEM LIMITS ---
 DISCORD_CHUNK_LIMIT = 1980          # Max character limit per Discord message (safely below Discord's 2000 limit)
 CHUNK_MESSAGE_DELAY = 1.5           # Seconds to wait between sending message chunks to avoid Discord rate limits
-DEFAULT_PERSONA = "You are a neutral, conversational AI." # Fallback system prompt if no custom role is set for a server                             
+DEFAULT_PERSONA = "You are a neutral, conversational AI." # Fallback system prompt if no custom role is set for this conversation
 
 # ==========================================
 # 1. CORE DATABASE & UTILITY FUNCTIONS
 # ==========================================
 
+def conversation_key(guild_id, channel_id, user_id):
+    """Scope shared server chat to its channel/thread and private chat to its user."""
+    return f"channel:{channel_id}" if guild_id is not None else f"dm:{user_id}"
+
+
 async def init_db(db_conn):
+    # Keep the existing schema; server_id now stores a namespaced conversation key.
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS server_config (server_id TEXT PRIMARY KEY, prompt TEXT)''')
     await db_conn.execute('''CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, role TEXT, content TEXT)''')
     await db_conn.commit()
@@ -610,7 +618,10 @@ def available_reference(message):
     return reference.cached_message
 
 async def reply_or_send(message, text):
-    """Use a normal mention when native replies are unavailable."""
+    """Send directly in DMs; use native replies or a mention in server channels."""
+    if isinstance(getattr(message, "channel", None), discord.DMChannel):
+        await message.channel.send(text)
+        return
     if can_read_history(message):
         try:
             await message.reply(text)
@@ -890,16 +901,20 @@ async def request_completion(*, prefer_fallback=False, **kwargs):
 
 @tree.command(name="help", description="Learn how to interact with the AI and view system limits.")
 async def cmd_help(interaction: discord.Interaction):
+    chat_help = ("• Send me a message here—no mention needed. Files and links work too."
+                 if interaction.guild_id is None else
+                 f"• **`@{client.user.name} [message]`** - Chat, ask questions, or analyze attached files and links.\n"
+                 "• **Reply to me** to continue; tag me if I cannot see the referenced message.")
     help_text = f"""**How to interact with me:**
-• **`@{client.user.name} [message]`** - Chat, ask questions, or analyze attached files and links.
-• **Reply to me** to continue; tag me if I cannot see the referenced message.
+{chat_help}
+Each channel, thread, and user DM has its own saved conversation and persona.
 
 **Slash Commands:**
 • **`/help`** - Display this guide.
 • **`/status`** - See chat and image models, supported inputs, and limits.
 • **`/imagegen`** - Enter dimensions and a prompt in one form (size adjusted to 1K–2K).
-• **`/role`** - View, change, or clear the server persona.
-• **`/clear`** - Clear this server's saved conversation history.
+• **`/role`** - View, change, or clear the persona here (resets this conversation).
+• **`/clear`** - Clear the saved conversation here, keeping its persona.
 """
     await interaction.response.send_message(help_text, ephemeral=True)
 
@@ -914,7 +929,8 @@ async def cmd_status(interaction: discord.Interaction):
         chat_model = f"{client.config.fallback_model} (fallback)"
     async with client.db_lock:
         cursor = await client.db_conn.execute(
-            "SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (str(interaction.guild_id),),
+            "SELECT COUNT(*) FROM chat_history WHERE server_id = ?",
+            (conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id),),
         )
         history_length = (await cursor.fetchone())[0]
     vision = "On" if client.config.vision_enabled else "Off"
@@ -938,12 +954,13 @@ async def cmd_status(interaction: discord.Interaction):
 def imagegen_permission_error(interaction):
     if client.imagegen is None:
         return "Image generation is not configured. Set COMFYUI_BASE_URL on the bot."
-    if interaction.guild is None or interaction.channel is None:
-        return "Use /imagegen in a server channel."
-    permissions = interaction.app_permissions
-    can_send = permissions.send_messages_in_threads if isinstance(interaction.channel, discord.Thread) else permissions.send_messages
-    if not permissions.view_channel or not can_send or not permissions.attach_files:
-        return "I need View Channel, Send Messages (in threads when applicable), and Attach Files here."
+    if interaction.channel is None or (interaction.guild is None and not isinstance(interaction.channel, discord.DMChannel)):
+        return "Use /imagegen in a server channel or a direct message with me."
+    if interaction.guild is not None:
+        permissions = interaction.app_permissions
+        can_send = permissions.send_messages_in_threads if isinstance(interaction.channel, discord.Thread) else permissions.send_messages
+        if not permissions.view_channel or not can_send or not permissions.attach_files:
+            return "I need View Channel, Send Messages (in threads when applicable), and Attach Files here."
     return client.imagegen.busy_message("comfyui")
 
 
@@ -1018,10 +1035,10 @@ async def run_imagegen(interaction, prompt, width, height):
             progress = await interaction.channel.send(f"{label} — queued for image generation.", allowed_mentions=mentions)
             adjusted = f" (adjusted from {requested[0]} × {requested[1]})" if requested != (width, height) else ""
             await interaction.edit_original_response(
-                content=f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Your image will appear in this channel.",
+                content=f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Your image will appear here.",
             )
             data, duration = await client.imagegen.generate(prompt, width, height)
-            data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
+            data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.filesize_limit)
             header = f"{label} · Generated in {duration:.1f}s\n"
             continuation = f"<@{user_id}> · Prompt (continued)\n"
             warning = "\nThe image is ready, but the rest of the prompt could not be sent."
@@ -1053,7 +1070,7 @@ async def run_imagegen(interaction, prompt, width, height):
         elif isinstance(exc, TimeoutError):
             detail = "Image generation or model switching timed out. Check the local servers before retrying."
         elif isinstance(exc, discord.HTTPException):
-            detail = "I couldn't upload the image. Check channel permissions and the server's attachment limit."
+            detail = "I couldn't upload the image. Check send/attachment access and the attachment limit here."
         else:
             detail = "Couldn't complete image generation. Check that ComfyUI and LM Studio's API servers are reachable."
         with contextlib.suppress(discord.HTTPException):
@@ -1067,7 +1084,6 @@ async def run_imagegen(interaction, prompt, width, height):
 
 
 @tree.command(name="imagegen", description="Enter dimensions and a prompt to generate an image.")
-@app_commands.guild_only()
 async def cmd_imagegen(interaction: discord.Interaction):
     error = imagegen_permission_error(interaction)
     if error:
@@ -1076,15 +1092,15 @@ async def cmd_imagegen(interaction: discord.Interaction):
     await interaction.response.send_modal(ImageGenerationModal())
 
 
-@tree.command(name="role", description="View or change the AI's personality for this server.")
+@tree.command(name="role", description="View or change the AI's personality for this channel or DM.")
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
 async def cmd_role(interaction: discord.Interaction, prompt: str = None):
-    server_id = str(interaction.guild_id)
+    server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
     await interaction.response.defer()
     
     if not prompt:
         current_role = await get_persona(server_id)
-        await interaction.followup.send(f"**Current Server Persona:**\n> *{current_role}*")
+        await interaction.followup.send(f"**Current Persona:**\n> *{current_role}*")
         return
 
     new_prompt = "" if prompt.lower() == "clear" else prompt
@@ -1095,21 +1111,21 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
             "ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt),
         )
         client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
-    action = "Saved server persona" if new_prompt else "Server persona removed"
+    action = "Saved persona" if new_prompt else "Persona removed"
     await interaction.followup.send(
         f"✅ {action} and history cleared!\n\n**Current Persona:**\n> {new_prompt or DEFAULT_PERSONA}"
     )
 
-@tree.command(name="clear", description="Clear this server's saved conversation history.")
+@tree.command(name="clear", description="Clear the saved conversation in this channel or DM.")
 @app_commands.default_permissions(manage_messages=True)
 async def cmd_clear(interaction: discord.Interaction):
-    server_id = str(interaction.guild_id)
+    server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
     await interaction.response.defer()
 
     async with history_transaction():
         await delete_history(server_id)
         client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
-    await interaction.followup.send("🗑️ Server conversation history cleared!")
+    await interaction.followup.send("🗑️ Conversation history cleared here!")
 
 # ==========================================
 # 6. PIPELINE MODULES
@@ -1335,11 +1351,12 @@ async def on_message(message):
     if referenced is not None and referenced.author.id == client.user.id:
         is_reply_to_bot = True
 
-    # A mention or an available reference to the bot starts a turn.
-    if message.author.bot or not message.guild or not (is_mention or is_reply_to_bot):
+    # Every direct message starts a turn; server chat requires a mention or reply.
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    if message.author.bot or not (is_dm or (message.guild and (is_mention or is_reply_to_bot))):
         return
 
-    server_id = str(message.guild.id)
+    server_id = conversation_key(message.guild.id if message.guild else None, message.channel.id, message.author.id)
     conversation_version = client.conversation_versions.get(server_id, 0)
     lock = client.conversation_locks.setdefault(server_id, asyncio.Lock())
     access = client.imagegen.reserve("lmstudio") if client.imagegen else contextlib.nullcontext()
@@ -1372,7 +1389,10 @@ async def handle_server_message(message, server_id, conversation_version):
     else:
         log_content = media_tag.strip() if media_tag else "[Empty Ping]"
         
-    logging.info(f"{message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
+    if message.guild is None:
+        logging.info("DM from user %s | Message received", message.author.id)
+    else:
+        logging.info(f"{message.guild.name} | #{message.channel.name} | {message.author}: {log_content}")
 
     for mentioned_user in message.mentions:
         if mentioned_user.id != client.user.id:
@@ -1395,7 +1415,7 @@ async def handle_server_message(message, server_id, conversation_version):
 
     if final_reply:
         duration = (datetime.now() - start_time).total_seconds()
-        logging.info(f"✨ AI Response generated in {duration:.2f}s | Server: {message.guild.name}")
+        logging.info("✨ AI Response generated in %.2fs | Conversation: %s", duration, server_id)
         await save_and_send_response(message, server_id, stored_text, final_reply, conversation_version)
 
 def main():

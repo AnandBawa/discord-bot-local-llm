@@ -131,11 +131,11 @@ async def check_bot():
                     search = AsyncMock(return_value='Synthetic search result. Source: https://example.com/')
                     with patch.dict(bot.AVAILABLE_TOOLS, web_search=search):
                         content, stored = await bot.build_user_payloads('Hello', '', [], [], 'Tester')
-                        context = await bot.build_ai_context('1', content)
+                        context = await bot.build_ai_context('channel:10', content)
                         answer = await bot.generate_ai_response(context, message, False)
                         assert answer == 'Synthetic answer.'
                         search.assert_awaited_once_with(query='synthetic test')
-                        await bot.save_and_send_response(message, '1', stored, answer)
+                        await bot.save_and_send_response(message, 'channel:10', stored, answer)
                         assert channel.messages == ['Synthetic answer.']
                         cursor = await bot.client.db_conn.execute('SELECT COUNT(*) FROM chat_history')
                         assert (await cursor.fetchone())[0] == 2
@@ -144,7 +144,7 @@ async def check_bot():
 
                     async with bot.history_transaction():
                         await bot.client.db_conn.execute(
-                            "INSERT INTO server_config VALUES ('1', 'Persisted persona')",
+                            "INSERT INTO server_config VALUES ('channel:10', 'Persisted persona')",
                         )
                     await bot.client.close()
                     bot.client = bot.MyAIClient(intents=bot.intents)
@@ -154,7 +154,7 @@ async def check_bot():
                         'FALLBACK_API_KEY': 'offline-cloud-key', 'FALLBACK_MODEL_NAME': 'cloud-chat',
                     })
                     await bot.client.setup_hook()
-                    context = await bot.build_ai_context('1', 'Follow up')
+                    context = await bot.build_ai_context('channel:10', 'Follow up')
                     assert 'Persisted persona' in context[0]['content']
                     assert context[1:] == [
                         {'role': 'user', 'content': stored},

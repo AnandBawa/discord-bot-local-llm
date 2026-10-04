@@ -66,15 +66,16 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         )])
 
     @staticmethod
-    def interaction(user_id=42, server_id=1):
+    def interaction(user_id=42, server_id=1, *, channel_id=None):
         return SimpleNamespace(
-            guild_id=server_id, user=SimpleNamespace(id=user_id),
+            guild_id=server_id, channel_id=channel_id if channel_id is not None else server_id * 10,
+            user=SimpleNamespace(id=user_id),
             permissions=SimpleNamespace(administrator=True),
             response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
-    async def seed(self, count=2, server_id="1"):
+    async def seed(self, count=2, server_id="channel:10"):
         async with self.bot.history_transaction():
             await self.client.db_conn.executemany(
                 "INSERT INTO chat_history (server_id, role, content) VALUES (?, ?, ?)",
@@ -207,12 +208,12 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         cursor = await self.client.db_conn.execute("PRAGMA table_info(chat_history)")
         self.assertEqual([row[1] for row in await cursor.fetchall()], ["id", "server_id", "role", "content"])
 
-    async def test_eviction_drops_oldest_half_only_in_current_server(self):
-        await self.seed(count=4, server_id="2")
+    async def test_eviction_drops_oldest_half_only_in_current_conversation(self):
+        await self.seed(count=4, server_id="channel:20")
         await self.seed(count=98)
-        await self.bot.save_and_send_response(self.message, "1", "Hello", "Answer")
+        await self.bot.save_and_send_response(self.message, "channel:10", "Hello", "Answer")
         cursor = await self.client.db_conn.execute(
-            "SELECT role, content FROM chat_history WHERE server_id = '1' ORDER BY id",
+            "SELECT role, content FROM chat_history WHERE server_id = 'channel:10' ORDER BY id",
         )
         self.assertEqual(await cursor.fetchall(),
                          [("user", f"Synthetic message {i}") for i in range(50, 98)]
@@ -221,9 +222,9 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.create.assert_not_awaited()
         self.message.reply.assert_awaited_once_with("Answer")
 
-    async def test_clear_and_persona_changes_affect_only_current_server(self):
+    async def test_clear_and_persona_changes_affect_only_current_conversation(self):
         await self.bot.cmd_role.callback(self.interaction(server_id=2), "Other persona")
-        await self.seed(server_id="2")
+        await self.seed(server_id="channel:20")
         for prompt in (None, "Friendly", "clear"):
             with self.subTest(prompt=prompt):
                 await self.bot.cmd_role.callback(self.interaction(), "Original")
@@ -234,10 +235,10 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
                 else:
                     await self.bot.cmd_role.callback(interaction, prompt)
                 expected = "Original" if prompt is None else (self.bot.DEFAULT_PERSONA if prompt == "clear" else prompt)
-                self.assertEqual(await self.bot.get_persona("1"), expected)
-                self.assertEqual(await self.bot.get_persona("2"), "Other persona")
+                self.assertEqual(await self.bot.get_persona("channel:10"), expected)
+                self.assertEqual(await self.bot.get_persona("channel:20"), "Other persona")
                 cursor = await self.client.db_conn.execute("SELECT server_id FROM chat_history")
-                self.assertEqual(await cursor.fetchall(), [("2",), ("2",)])
+                self.assertEqual(await cursor.fetchall(), [("channel:20",), ("channel:20",)])
                 self.assertIn("cleared", interaction.followup.send.call_args.args[0])
                 self.assertNotIn("extraction", interaction.followup.send.call_args.args[0].lower())
         self.create.assert_not_awaited()
@@ -260,7 +261,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
             "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON chat_history BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
         )
         with self.assertRaises(aiosqlite.IntegrityError):
-            await self.bot.save_and_send_response(self.message, "1", "New input", "New answer")
+            await self.bot.save_and_send_response(self.message, "channel:10", "New input", "New answer")
         self.assertEqual(await self.count("chat_history"), 98)
         self.message.reply.assert_not_awaited()
 
@@ -269,7 +270,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         async def interrupted_write():
             async with self.bot.history_transaction():
                 await self.client.db_conn.execute(
-                    "INSERT INTO chat_history (server_id, role, content) VALUES ('1', 'user', 'Partial')",
+                    "INSERT INTO chat_history (server_id, role, content) VALUES ('channel:10', 'user', 'Partial')",
                 )
                 entered.set()
                 await asyncio.Event().wait()
@@ -279,16 +280,16 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertEqual(await self.count("chat_history"), 0)
-        await self.bot.save_and_send_response(self.message, "1", "Next input", "Next answer")
+        await self.bot.save_and_send_response(self.message, "channel:10", "Next input", "Next answer")
         self.assertEqual(await self.count("chat_history"), 2)
 
     async def test_restart_retains_recent_conversation_and_persona_without_model_calls(self):
         await self.bot.cmd_role.callback(self.interaction(), "Persisted persona")
-        await self.bot.save_and_send_response(self.message, "1", "Project Orion", "Orion confirmed")
+        await self.bot.save_and_send_response(self.message, "channel:10", "Project Orion", "Orion confirmed")
         await self.client.db_conn.close()
         self.client.db_conn = await aiosqlite.connect("check.sqlite3")
         await self.bot.init_db(self.client.db_conn)
-        context = await self.bot.build_ai_context("1", "What name?")
+        context = await self.bot.build_ai_context("channel:10", "What name?")
         self.assertIn("Persisted persona", context[0]["content"])
         self.assertEqual(context[1:], [
             {"role": "user", "content": "Project Orion"},
@@ -312,11 +313,11 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
                 id TEXT PRIMARY KEY, server_id TEXT NOT NULL, user_id TEXT NOT NULL,
                 user_name TEXT NOT NULL, document TEXT NOT NULL, indexed INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL);
-            INSERT INTO server_config VALUES ('1', 'Legacy persona');
-            INSERT INTO chat_history VALUES (1, '1', 'user', 'Recent project Orion', '42', 'Tester');
-            INSERT INTO chat_history VALUES (2, '1', 'assistant', 'Orion confirmed', '42', 'Tester');
-            INSERT INTO pending_memories VALUES (100, '1', 'user', 'Unused pending fact', '42', 'Tester');
-            INSERT INTO explicit_memories VALUES ('saved', '1', '42', 'Tester', 'Unused explicit fact', 0, '2026-01-01');
+            INSERT INTO server_config VALUES ('channel:10', 'Legacy persona');
+            INSERT INTO chat_history VALUES (1, 'channel:10', 'user', 'Recent project Orion', '42', 'Tester');
+            INSERT INTO chat_history VALUES (2, 'channel:10', 'assistant', 'Orion confirmed', '42', 'Tester');
+            INSERT INTO pending_memories VALUES (100, 'channel:10', 'user', 'Unused pending fact', '42', 'Tester');
+            INSERT INTO explicit_memories VALUES ('saved', 'channel:10', '42', 'Tester', 'Unused explicit fact', 0, '2026-01-01');
         """)
         snapshots = {}
         for table in ("pending_memories", "explicit_memories"):
@@ -329,12 +330,12 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         await self.client.db_conn.set_trace_callback(statements.append)
         try:
             await self.bot.init_db(self.client.db_conn)
-            context = await self.bot.build_ai_context("1", "What name?")
+            context = await self.bot.build_ai_context("channel:10", "What name?")
             self.assertIn("Legacy persona", context[0]["content"])
             self.assertEqual(context[1]["content"], "Recent project Orion")
             self.assertEqual(context[2]["content"], "Orion confirmed")
             self.assertNotIn("Unused", str(context))
-            await self.bot.save_and_send_response(self.message, "1", "Next question", "Next answer")
+            await self.bot.save_and_send_response(self.message, "channel:10", "Next question", "Next answer")
             cursor = await self.client.db_conn.execute(
                 "SELECT user_id, user_name FROM chat_history ORDER BY id",
             )
@@ -351,14 +352,14 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.create.assert_not_awaited()
 
     async def test_clear_invalidates_every_members_old_reply_but_allows_new_turns(self):
-        version = self.client.conversation_versions.get("1", 0)
+        version = self.client.conversation_versions.get("channel:10", 0)
         await self.clear_history()
         for author_id in (42, 84):
             self.message.author.id = author_id
-            await self.bot.save_and_send_response(self.message, "1", "Old input", "Old answer", version)
+            await self.bot.save_and_send_response(self.message, "channel:10", "Old input", "Old answer", version)
         self.assertEqual(await self.count("chat_history"), 0)
         self.message.reply.assert_not_awaited()
-        await self.bot.save_and_send_response(self.message, "1", "New input", "New answer")
+        await self.bot.save_and_send_response(self.message, "channel:10", "New input", "New answer")
         self.assertEqual(await self.count("chat_history"), 2)
         self.message.reply.assert_awaited_once()
 
@@ -367,7 +368,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.client._connection.user = bot_user
         message = SimpleNamespace(
             author=SimpleNamespace(id=84, bot=False, display_name="Other member"),
-            guild=SimpleNamespace(id=1, name="Test guild"), channel=SimpleNamespace(name="general"),
+            guild=SimpleNamespace(id=1, name="Test guild"), channel=SimpleNamespace(id=10, name="general"),
             mentions=[bot_user], reference=None, content="<@99> Hello", attachments=[], stickers=[],
             reply=AsyncMock(),
         )
@@ -392,12 +393,12 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
     async def test_clear_and_role_invalidate_old_replies(self):
         for prompt in (None, "Friendly", "clear"):
             with self.subTest(prompt=prompt):
-                version = self.client.conversation_versions.get("1", 0)
+                version = self.client.conversation_versions.get("channel:10", 0)
                 if prompt is None:
                     await self.clear_history()
                 else:
                     await self.bot.cmd_role.callback(self.interaction(), prompt)
-                await self.bot.save_and_send_response(self.message, "1", "Old", "Old answer", version)
+                await self.bot.save_and_send_response(self.message, "channel:10", "Old", "Old answer", version)
                 self.assertEqual(await self.count("chat_history"), 0)
                 self.message.reply.assert_not_awaited()
 

@@ -1,19 +1,19 @@
 # Discord AI Bot
 
-A Discord server bot for chat and ComfyUI image generation. Recent conversations and server personas persist across restarts in SQLite. Chat uses a local OpenAI-compatible endpoint, with optional cloud fallback, web search, PDF extraction, and image analysis.
+A Discord bot for chat and ComfyUI image generation in server channels, threads, and private DMs. Each channel, thread, and user DM has its own conversation history and persona, saved across restarts in SQLite. Chat uses a local OpenAI-compatible endpoint, with optional cloud fallback, web search, PDF extraction, and image analysis.
 
 ## Key Features
 
-- **Saved Conversations:** SQLite keeps recent conversation text and the persona for each server across restarts. Channels within a server share that context; different servers stay separate. Attachment notes and assistant image descriptions persist; image bytes are sent only with the current request. No user profiles, fact extraction, semantic recall, or embedding model is used.
-- **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat LLM tasks.
+- **Saved Conversations:** SQLite keeps recent conversation text and the persona for each channel/thread and each user DM across restarts. Members in the same channel share its context; other channels, threads, and DMs stay separate. Attachment notes and assistant image descriptions persist; image bytes are sent only with the current request. No user profiles, fact extraction, semantic recall, or embedding model is used.
+- **Ordered Conversations:** Chat turns run in arrival order within each channel, thread, or DM. Different conversations can progress concurrently, sharing three chat processing slots across the whole bot.
 - **Cloud Fallback:** A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Image Generation:** `/imagegen` collects dimensions and a prompt in one private form, then posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
-- **Slash Commands:** `/help`, `/status`, `/role`, `/clear`, and `/imagegen`. Members can change the shared server persona; `/clear` defaults to members with Manage Messages, subject to the server's command settings.
-- **Permission-Aware Replies:** Uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
+- **Slash Commands:** `/help`, `/status`, `/role`, `/clear`, and `/imagegen`. Members can change their channel's shared persona; DM users control their own persona. In servers, `/clear` defaults to members with Manage Messages, subject to command settings. In a DM it clears only that user's conversation.
+- **Permission-Aware Replies:** Sends directly in DMs. In servers, uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
 
 ## Prerequisites
 
@@ -89,49 +89,56 @@ python scripts/check_features.py
 python scripts/check_refactor.py
 python scripts/check_imagegen.py
 python scripts/check_imagegen_ui.py
+python scripts/check_dms.py
 ```
 
 The checks use synthetic messages, mocked API responses, temporary storage, and blocked external sockets (with a controlled loopback HTTP fixture for URL tests). They do not load `.env`, log in to Discord, or use real conversations or model endpoints.
 
-Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-server history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. They do not establish real GPU release, live permissions, or model quality.
+Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
 
 ## Conversation Storage and Updating
 
-The bot stores recent messages and personas in `bot_database.db`. A message can still refer to something a member said in the saved conversation; the bot no longer extracts separate facts about that member. On reaching 100 saved user/assistant messages in a server, it deletes the oldest 50. `/clear` deletes that server's conversation; changing `/role` does the same while saving the new persona. Deleted context is not archived or summarized.
+The bot stores recent messages and personas in `bot_database.db`. A message can still refer to something a member said in the saved conversation; the bot no longer extracts separate facts about that member. On reaching 100 saved user/assistant messages in a channel, thread, or DM, it deletes the oldest 50 there. `/clear` deletes only the current conversation; changing `/role` does the same while saving its new persona. Deleted context is not archived or summarized.
 
-Existing conversations and personas survive the update. Old fact tables and `chroma_storage` are left on disk but are no longer read, written, or used for replies. This update removes the feature, not that historical data. Existing logs are also retained. Old memory-related `.env` entries are ignored and can be removed: `EMB_MODEL_NAME`, `FALLBACK_EMB_API_KEY`, `MEMORY_DISTANCE_THRESHOLD`, and `BOT_OWNER_ID`.
+The October 5 scope change starts each server channel/thread with a fresh history and neutral persona. Earlier server-wide rows remain in SQLite but are not used or copied into channels: their source channel was never stored. New channel/thread and DM histories and personas persist across subsequent restarts. Old fact tables and `chroma_storage` are left on disk but are no longer read, written, or used for replies. This update removes the feature, not that historical data. Existing logs are also retained. Old memory-related `.env` entries are ignored and can be removed: `EMB_MODEL_NAME`, `FALLBACK_EMB_API_KEY`, `MEMORY_DISTANCE_THRESHOLD`, and `BOT_OWNER_ID`.
 
-Restart the bot to load the new code and sync the reduced command list; no re-invite is needed where slash commands already work. If an unused embedding model is still loaded in LM Studio, unload it manually once: the bot now manages only its configured chat model and refuses to unload unrelated models before image generation.
+Restart the bot to load the new code and sync all five commands for server channels and bot DMs; no re-invite is needed where slash commands already work. If an unused embedding model is still loaded in LM Studio, unload it manually once: the bot now manages only its configured chat model and refuses to unload unrelated models before image generation.
 
-The [audit and improvement plan](docs/AUDIT.md) records findings, accepted server-wide behavior, implemented fixes, and deferred improvements.
+The [audit and improvement plan](docs/AUDIT.md) records findings, current conversation scopes, implemented fixes, and deferred improvements.
 
 ## Bot Commands
 
-The bot features two distinct ways to interact: standard conversational tagging, and native Slash Commands (`/`).
+Use mentions/replies in a server, ordinary messages in a DM, or native Slash Commands (`/`).
 
 ### General Chat
 
-- **`@BotName [message]`**: Chat or ask questions in the channel. The bot can analyze supported attachments and public links.
+- **`@BotName [message]`**: Chat or ask questions in a server channel/thread. The bot can analyze supported attachments and public links.
 - **Reply to the Bot**: A reply whose referenced message is delivered or cached is recognised without an extra tag. Tag the bot if the reference is unavailable. Without Read Message History, it can use its saved conversation but cannot fetch missing Discord messages or their attachments.
 
 Unsupported file attachments and oversized images/PDFs are skipped, with a note passed to the chat model; remaining text and supported attachments are processed normally. The explanation to the user depends on the model, so there is no guaranteed rejection message. Unsupported animated stickers are silently skipped; a mention with only such a sticker receives the generic `/help` greeting.
 
+### Private DMs
+
+Open the bot's Discord profile and choose **Message**, then send a normal message without mentioning it. Chat attachments, links, web search, and `/imagegen` use the same features as server chat. `/help`, `/status`, `/role`, and `/clear` also work in the DM. A DM's history and persona belong to that user and do not affect any server, channel, or other user.
+
+These are direct messages with the bot, not group DMs or commands from a user-installed app in someone else's DM. The bot registers commands for Discord's [server and bot-DM contexts](https://docs.discord.com/developers/interactions/application-commands#interaction-contexts). Users need a mutual server with the bot for its global DM commands. Server channel permission overrides do not apply inside a DM; Discord's DM availability/block settings still apply. Restarting the bot syncs the updated command contexts.
+
 ### Slash Commands (`/`)
 
 - **`/help`**: Display the command guide (Ephemeral - only visible to you).
-- **`/status`**: Show ping, server history, chat and image models, supported inputs, and key limits. The chat line reflects the most recent successful provider across the bot and shows fallback details only after use. Before first use it shows the configured primary model. The image line reads the configured name from **#316 Load Diffusion Model** in `krea2.json`, omitting the `.safetensors` extension, or shows **Off** when image generation is disabled. If the workflow/model cannot be read, it shows **Configured (model unavailable)**. Status makes no provider requests or model loads; image analysis and web search need a compatible chat model.
-- **`/imagegen`**: Enter width, height, and a prompt of up to 4000 characters in one form, then submit. The confirmation shows the chosen size and any adjustment; a queue message in the channel is replaced with the generated image and original prompt marked as Discord spoilers, with dimensions and generation time left visible. Available to all members when ComfyUI and channel permissions are configured; see setup below.
-- **`/role`**: View the shared persona, or change it and start a fresh server conversation. Type `clear` to restore the neutral default.
-- **`/clear`**: Delete this server's saved conversation, retaining its persona.
+- **`/status`**: Show ping, history for this channel/DM, chat and image models, supported inputs, and key limits. The chat line reflects the most recent successful provider across the bot and shows fallback details only after use. Before first use it shows the configured primary model. The image line reads the configured name from **#316 Load Diffusion Model** in `krea2.json`, omitting the `.safetensors` extension, or shows **Off** when image generation is disabled. If the workflow/model cannot be read, it shows **Configured (model unavailable)**. Status makes no provider requests or model loads; image analysis and web search need a compatible chat model.
+- **`/imagegen`**: Enter width, height, and a prompt of up to 4000 characters in one form, then submit. The confirmation shows the chosen size and any adjustment; a queue message in the channel is replaced with the generated image and original prompt marked as Discord spoilers, with dimensions and generation time left visible. Available in DMs when ComfyUI is configured, and in servers where the bot has the needed channel permissions; see setup below.
+- **`/role`**: View or change the persona for this channel/thread or your DM. Changing it clears only that conversation. Type `clear` to restore the neutral default. Each thread is independent of its parent channel; personas do not carry over.
+- **`/clear`**: Delete the current channel/thread or DM conversation, retaining its persona. It clears saved context, not Discord messages.
 
-The per-server conversation queue covers context loading, generation, saving, and reply delivery. Slow requests delay later turns in that server. Clear and persona changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
+The queue for each channel, thread, or DM covers context loading, generation, saving, and reply delivery. Slow requests delay later turns in the same conversation. Clear and persona changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
 
 ## Image Generation Setup
 
 1. Keep your working ComfyUI installation on Windows, with the models and custom nodes used by [krea2.json](krea2.json). Use a current ComfyUI server that supports client-supplied prompt IDs, `/api/jobs/{job_id}/cancel`, and the built-in `PreviewAny` node. The bot submits the API workflow directly; you do not need to queue it manually in the ComfyUI UI. See [ComfyUI's server API](https://docs.comfy.org/development/comfyui-server/comms_routes) and [job cancellation implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/server.py).
 2. Set `COMFYUI_BASE_URL` in the bot's `.env` to the Windows server's root URL, for example `http://localhost:8188` **if that is its actual port and localhost is reachable from WSL**. Mirrored WSL networking supports Windows localhost; default NAT networking normally needs the Windows host IP and ComfyUI listening on a reachable interface. Use the same host arrangement that works for LM Studio, with ComfyUI's port. See [Microsoft's WSL networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking).
 3. Run LM Studio's API server as well. Image generation requires its native model-management API (LM Studio 0.4 or newer), in addition to the existing `/v1` endpoint. Enable **Just-in-Time model loading** so chat requests can reload the configured model after images. Disable **Idle TTL / automatic unloading** if you want it to stay loaded until a switch. The bot unloads its configured chat model before images and frees ComfyUI models before returning to LM Studio. See [LM Studio model unloading](https://lmstudio.ai/docs/developer/rest/unload) and [JIT loading and TTL](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict).
-4. Grant the bot **Attach Files**, **View Channel**, and **Send Messages** in the destination channel, or **Send Messages in Threads** inside a thread/post. **Read Message History is not required.** Effective channel overrides apply. A server administrator must grant missing permissions. Restart the bot with `python bot.py` to register `/imagegen`.
+4. For server use, grant the bot **Attach Files**, **View Channel**, and **Send Messages** in the destination channel, or **Send Messages in Threads** inside a thread/post. **Read Message History is not required.** Effective channel overrides apply. A server administrator must grant missing permissions; DMs need no server permission changes. Restart the bot with `python bot.py` to register `/imagegen` in servers and bot DMs.
 
 For reliable reloads across bot restarts, use the chat model's native `key` from [LM Studio's `GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list) for `LLM_MODEL_NAME`. A custom alias that is already loaded can be resolved while the bot runs, but that mapping is not saved across restarts. Keep your desired load settings saved in LM Studio for JIT loading.
 
@@ -153,13 +160,13 @@ The bot writes the unmodified prompt to **#48 Positive** and the calculated dime
 
 For example, a 1920 × 1088 latent target is decoded to 3840 × 2176, then halved to a saved 1920 × 1088 image. The size limits apply to the selected generation/final size; the intermediate VAE image is larger. This is the intended behavior of the workflow's [Wan2.1 upscaling VAE](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x).
 
-Chat and images share one activity rule across **all channels and servers**. Running or queued chat turns decline `/imagegen` with **“Chat is active right now. Image generation is unavailable. Please try again later.”** Running or queued images decline new chat with **“Image generation is active right now. Chat is unavailable. Please try again later.”** Declined requests are not queued or saved to chat history, and busy status does not trigger chat's cloud fallback. **Image generation uses ComfyUI only, with no cloud fallback.** Activity covers the complete accepted turn, including preparation, queue waits, model switching, and delivery. Opening an image form alone does not reserve the GPU; availability is checked again at submission. A loaded but idle model does not block the other request type.
+Chat and images share one activity rule across **all channels, threads, servers, and DMs**. Running or queued chat turns decline `/imagegen` with **“Chat is active right now. Image generation is unavailable. Please try again later.”** Running or queued images decline new chat with **“Image generation is active right now. Chat is unavailable. Please try again later.”** Declined requests are not queued or saved to chat history, and busy status does not trigger chat's cloud fallback. **Image generation uses ComfyUI only, with no cloud fallback.** Activity covers the complete accepted turn, including preparation, queue waits, model switching, and delivery. Opening an image form alone does not reserve the GPU; availability is checked again at submission. A loaded but idle model does not block the other request type.
 
-Requests for the active type continue to queue. Images run one at a time, with at most **three accepted image requests total**, including the running image, across all servers and one per member. A fourth image request receives a queue-full message. The bot holds the waiting images and submits each to ComfyUI in turn. Chat retains **three chat processing slots**; additional chat requests wait, with no separate waiting-queue cap. Turns within a server run one at a time, including across channels; different servers can use the shared processing slots concurrently.
+Requests for the active type continue to queue. Images run one at a time, with at most **three accepted image requests total**, including the running image, across all servers and DMs, with one per user across both. A fourth image request receives a queue-full message. The bot holds the waiting images and submits each to ComfyUI in turn. Chat retains **three chat processing slots**; additional chat requests wait, with no separate waiting-queue cap. Turns within one channel, thread, or DM run one at a time; separate conversations can use the shared processing slots concurrently. DM support adds no separate queue or processing capacity.
 
 A local chat call already in progress blocks image admission, and cancellation retains that protection until the call finishes. When no work remains, the next accepted request can switch backends; repeated image or chat requests keep using their existing models. Keep these servers dedicated to the bot while it manages the shared GPU; independent manual requests cannot participate in its lock. The bot refuses to unload unrelated LM Studio models or interrupt unrelated ComfyUI jobs.
 
-The form is private; the finished message posts the original prompt as spoiler text and the image as a spoiler attachment. Dimensions and generation time remain visible. All image uploads are marked as spoilers, including JPEG fallback, so viewers can reveal them in Discord. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the server's attachment limit, and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's conversation history.
+The form is private; the finished message posts the original prompt as spoiler text and the image as a spoiler attachment. Dimensions and generation time remain visible. All image uploads are marked as spoilers, including JPEG fallback, so viewers can reveal them in Discord. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the interaction's attachment limit (in a server or DM), and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's conversation history.
 
 Long prompts continue in additional spoilered messages to fit [Discord's 2,000-character message limit](https://docs.discord.com/developers/resources/message#create-message), without truncation. Markdown in the prompt is displayed literally so it cannot break the surrounding spoiler; prompt mentions do not ping anyone, and link previews are suppressed. If a continuation cannot be sent, the image and first prompt part remain posted, and the bot attempts to add a notice.
 
@@ -173,7 +180,7 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 
 **Model & Context Limits:**
 
-- `MAX_HISTORY_LENGTH` (Default: 100) - At this many saved messages in a server, the oldest half are deleted.
+- `MAX_HISTORY_LENGTH` (Default: 100) - At this many saved messages in one channel/thread or DM, its oldest half are deleted.
 - `MAX_TOOL_ITERATIONS` (Default: 3) - Maximum tool-call rounds in one turn; each round may contain multiple searches.
 - `LLM_TEMPERATURE` (Default: 1.0) - Controls the creativity and randomness of standard chat responses.
 - `LLM_MAX_TOKENS` (Default: 4096) - Maximum token length for standard chat responses.
@@ -192,5 +199,5 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 
 - `DISCORD_CHUNK_LIMIT` (Default: 1980) - Max character limit per Discord message chunk.
 - `CHUNK_MESSAGE_DELAY` (Default: 1.5) - Seconds to wait between sending chunks to avoid rate limits.
-- `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for a server.
+- `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for this channel/thread or DM.
 - `CIRCUIT_BREAKER_COOLDOWN` (Default: 60) - Seconds to bypass a failed local chat service when its fallback is configured.

@@ -61,6 +61,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             view_channel=True, send_messages=True, send_messages_in_threads=True, attach_files=True,
         )
         interaction.guild = SimpleNamespace(id=server_id, filesize_limit=8_000_000)
+        interaction.filesize_limit = 8_000_000
         interaction.response.send_modal = AsyncMock()
         interaction.edit_original_response = AsyncMock()
         interaction.created_at = datetime.now(timezone.utc)
@@ -155,7 +156,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
     async def test_queued_chat_blocks_images_until_cancelled_or_invalidated(self):
         for action in ("cancel", "clear"):
             with self.subTest(action=action):
-                lock = self.client.conversation_locks["1"] = asyncio.Lock()
+                lock = self.client.conversation_locks["channel:10"] = asyncio.Lock()
                 await lock.acquire()
                 with patch.object(self.bot, "handle_server_message", new=AsyncMock()) as handle:
                     task = asyncio.create_task(self.bot.on_message(self.chat()))
@@ -169,7 +170,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                             with self.assertRaises(asyncio.CancelledError):
                                 await task
                         else:
-                            self.client.conversation_versions["1"] = self.client.conversation_versions.get("1", 0) + 1
+                            self.client.conversation_versions["channel:10"] = self.client.conversation_versions.get("channel:10", 0) + 1
                     finally:
                         lock.release()
                         await asyncio.gather(task, return_exceptions=True)
