@@ -213,6 +213,8 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                 result = await self.bot.perform_web_search(query)
                 search.assert_called_with(query, max_results=self.bot.WEB_SEARCH_MAX_RESULTS)
                 self.assertIn("URL: https://example.com/cpp", result)
+                self.assertTrue(result.startswith("Web search results:\n"))
+                self.assertNotIn("cite source URLs", result)
 
     async def test_invalid_tool_arguments_return_recoverable_errors(self):
         search = AsyncMock(return_value="result")
@@ -224,18 +226,37 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Tool error", await self.bot.execute_tool_call("unknown", '{"query":"ok"}'))
             search.assert_not_awaited()
 
-    async def test_generation_keeps_sources_even_if_model_omits_citations(self):
+    async def test_search_results_do_not_add_unsolicited_sources_or_extra_links(self):
         call = SimpleNamespace(id="search-1", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
         tool_message = SimpleNamespace(content=None, tool_calls=[call], model_dump=lambda **kwargs: {
             "role": "assistant", "tool_calls": [],
         })
-        answer_message = SimpleNamespace(content="The answer.", tool_calls=[])
-        self.create.side_effect = [SimpleNamespace(choices=[SimpleNamespace(message=m)], usage=None)
-                                   for m in (tool_message, answer_message)]
-        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=AsyncMock(return_value="URL: https://example.com/source\n")):
-            answer = await self.bot.generate_ai_response([], self.chat(), False)
-        self.assertIn("https://example.com/source", answer)
-        self.assertTrue(answer.startswith("The answer."))
+        results = [{"title": "First", "href": "https://example.com/source", "body": "Useful excerpt"},
+                   {"title": "Other", "href": "https://example.com/extra", "body": "Another excerpt"}]
+        cases = (
+            ("Tell me about this dish.", "The answer."),
+            ("Please include sources.", "The answer. [Source](https://example.com/source)"),
+            ("Where did you get that?", "Here is the source: https://example.com/source"),
+            ("Give me the website link.", "https://example.com/source"),
+        )
+        for request, response in cases:
+            with self.subTest(request=request):
+                messages = await self.bot.build_ai_context("channel:10", request)
+                answer_message = SimpleNamespace(content=response, tool_calls=[])
+                self.create.side_effect = [SimpleNamespace(choices=[SimpleNamespace(message=m)], usage=None)
+                                           for m in (tool_message, answer_message)]
+                search = Mock(return_value=results)
+                with patch.object(self.bot, "DDGS", return_value=SimpleNamespace(text=search)):
+                    answer = await self.bot.generate_ai_response(messages, self.chat(content=request), False)
+                self.assertEqual(answer, response)
+                self.assertNotIn("Search sources:", answer)
+                self.assertNotIn("https://example.com/extra", answer)
+                tool_results = [item["content"] for item in messages if item["role"] == "tool"]
+                self.assertEqual(len(tool_results), 1)
+                self.assertTrue(tool_results[0].startswith("Web search results:\n"))
+                self.assertIn("URL: https://example.com/source", tool_results[0])
+                self.assertIn("URL: https://example.com/extra", tool_results[0])
+                search.assert_called_once_with("test", max_results=self.bot.WEB_SEARCH_MAX_RESULTS)
 
     async def test_supplied_document_still_allows_web_search(self):
         message = self.chat()

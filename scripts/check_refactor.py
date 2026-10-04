@@ -342,7 +342,7 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
             answer = await self.bot.generate_ai_response([], self.chat(), False)
         self.assertEqual(self.create.await_count, 1)
         self.assertEqual(cloud.await_count, 2)
-        self.assertIn("https://example.com/source", answer)
+        self.assertEqual(answer, "Found it")
         self.assertEqual(self.client.highest_token_count, 77)
 
     async def test_tool_round_limit_is_preserved(self):
