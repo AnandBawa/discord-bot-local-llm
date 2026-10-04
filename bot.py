@@ -880,7 +880,7 @@ async def cmd_help(interaction: discord.Interaction):
 **Slash Commands:**
 • **`/help`** - Display this guide.
 • **`/status`** - See the chat model, supported inputs, and limits.
-• **`/imagegen`** - Choose a size (adjusted to 1K–2K), then enter your prompt.
+• **`/imagegen`** - Enter dimensions and a prompt in one form (size adjusted to 1K–2K).
 • **`/role`** - View, change, or clear the server persona.
 • **`/clear`** - Clear this server's saved conversation history.
 """
@@ -927,65 +927,28 @@ def imagegen_permission_error(interaction):
     return client.imagegen.busy_message("comfyui")
 
 
-class ImageResolutionModal(discord.ui.Modal, title="Image resolution (1K–2K)"):
+class ImageGenerationModal(discord.ui.Modal, title="Generate an image (1K–2K)"):
     def __init__(self):
         super().__init__(timeout=300)
         self.width = discord.ui.TextInput(placeholder="e.g. 1080", min_length=1, max_length=8)
         self.height = discord.ui.TextInput(placeholder="e.g. 1920", min_length=1, max_length=8)
-        self.add_item(discord.ui.Label(text="Requested width in pixels", component=self.width))
-        self.add_item(discord.ui.Label(text="Requested height in pixels", component=self.height))
-
-    async def on_submit(self, interaction):
-        try:
-            requested = (int(self.width.value), int(self.height.value))
-            width, height = image_resolution(*requested)
-        except (ValueError, ImageGenerationError):
-            await interaction.response.send_message("Enter positive whole numbers for width and height. Run /imagegen to try again.", ephemeral=True)
-            return
-        error = imagegen_permission_error(interaction)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
-        adjusted = f" (adjusted from {requested[0]} × {requested[1]})" if requested != (width, height) else ""
-        await interaction.response.send_message(
-            f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Now enter your prompt.",
-            view=ImagePromptView(interaction.user.id, width, height), ephemeral=True,
-        )
-
-
-class ImagePromptView(discord.ui.View):
-    def __init__(self, user_id, width, height):
-        super().__init__(timeout=300)
-        self.user_id, self.width, self.height = user_id, width, height
-
-    async def interaction_check(self, interaction):
-        if interaction.user.id == self.user_id:
-            return True
-        await interaction.response.send_message("Run /imagegen to start your own image.", ephemeral=True)
-        return False
-
-    @discord.ui.button(label="Enter prompt", style=discord.ButtonStyle.primary)
-    async def enter_prompt(self, interaction, button):
-        error = imagegen_permission_error(interaction)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
-            return
-        await interaction.response.send_modal(ImagePromptModal(self.width, self.height))
-
-
-class ImagePromptModal(discord.ui.Modal, title="Image prompt"):
-    def __init__(self, width, height):
-        super().__init__(timeout=300)
-        self.width, self.height = width, height
         self.prompt = discord.ui.TextInput(style=discord.TextStyle.paragraph, min_length=1, max_length=4000,
                                            placeholder="Describe the image you want to create.")
+        self.add_item(discord.ui.Label(text="Requested width in pixels", component=self.width))
+        self.add_item(discord.ui.Label(text="Requested height in pixels", component=self.height))
         self.add_item(discord.ui.Label(text="Your prompt", component=self.prompt))
 
     async def on_submit(self, interaction):
-        await run_imagegen(interaction, self.prompt.value, self.width, self.height)
+        try:
+            width, height = int(self.width.value), int(self.height.value)
+        except ValueError:
+            await interaction.response.send_message("Enter positive whole numbers for width and height. Run /imagegen to try again.", ephemeral=True)
+            return
+        await run_imagegen(interaction, self.prompt.value, width, height)
 
 
 async def run_imagegen(interaction, prompt, width, height):
+    requested = (width, height)
     error = imagegen_permission_error(interaction)
     if error:
         await interaction.response.send_message(error, ephemeral=True)
@@ -1016,7 +979,10 @@ async def run_imagegen(interaction, prompt, width, height):
             # Use a normal bot message: delivery/editing keeps working beyond the
             # interaction token's 15-minute lifetime, including time spent in the queue.
             progress = await interaction.channel.send(f"{label} — queued for image generation.", allowed_mentions=mentions)
-            await interaction.edit_original_response(content="Your image will appear in this channel.")
+            adjusted = f" (adjusted from {requested[0]} × {requested[1]})" if requested != (width, height) else ""
+            await interaction.edit_original_response(
+                content=f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Your image will appear in this channel.",
+            )
             data = await client.imagegen.generate(prompt, width, height)
             data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
             with contextlib.closing(discord.File(io.BytesIO(data), filename=filename)) as attachment:
@@ -1046,14 +1012,14 @@ async def run_imagegen(interaction, prompt, width, height):
         client.image_tasks.discard(task)
 
 
-@tree.command(name="imagegen", description="Choose a resolution, then enter a prompt to generate an image.")
+@tree.command(name="imagegen", description="Enter dimensions and a prompt to generate an image.")
 @app_commands.guild_only()
 async def cmd_imagegen(interaction: discord.Interaction):
     error = imagegen_permission_error(interaction)
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
-    await interaction.response.send_modal(ImageResolutionModal())
+    await interaction.response.send_modal(ImageGenerationModal())
 
 
 @tree.command(name="role", description="View or change the AI's personality for this server.")

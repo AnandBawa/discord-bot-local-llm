@@ -8,7 +8,7 @@ A Discord server bot for chat and ComfyUI image generation. Recent conversations
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat LLM tasks.
 - **Cloud Fallback:** A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
-- **Image Generation:** `/imagegen` asks for dimensions, then a prompt, and posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
+- **Image Generation:** `/imagegen` collects dimensions and a prompt in one private form, then posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
@@ -93,7 +93,7 @@ python scripts/check_imagegen_ui.py
 
 The checks use synthetic messages, mocked API responses, temporary storage, and blocked external sockets (with a controlled loopback HTTP fixture for URL tests). They do not load `.env`, log in to Discord, or use real conversations or model endpoints.
 
-Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-server history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF processing, and provider fallback. Image checks cover the forms, size bounds, unchanged prompts, channel/thread permissions, queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. They do not establish real GPU release, live permissions, or model quality.
+Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-server history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. They do not establish real GPU release, live permissions, or model quality.
 
 ## Conversation Storage and Updating
 
@@ -120,7 +120,7 @@ Unsupported file attachments and oversized images/PDFs are skipped, with a note 
 
 - **`/help`**: Display the command guide (Ephemeral - only visible to you).
 - **`/status`**: Show ping, server history, the chat model, supported inputs, image-generation configuration, and key limits. The chat line reflects the most recent successful provider across the bot and shows fallback details only after use. Before first use it shows the configured primary model. Status makes no provider requests; image analysis and web search need a compatible chat model.
-- **`/imagegen`**: Enter width and height, review the chosen size, then press **Enter prompt**. Submit a prompt of up to 4000 characters to generate an image in the channel. Available to all members when ComfyUI and channel permissions are configured; see setup below.
+- **`/imagegen`**: Enter width, height, and a prompt of up to 4000 characters in one form, then submit. The confirmation shows the chosen size and any adjustment; a queue message in the channel is replaced with the generated image. Available to all members when ComfyUI and channel permissions are configured; see setup below.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Type `clear` to restore the neutral default.
 - **`/clear`**: Delete this server's saved conversation, retaining its persona.
 
@@ -135,7 +135,7 @@ The per-server conversation queue covers context loading, generation, saving, an
 
 For reliable reloads across bot restarts, use the chat model's native `key` from [LM Studio's `GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list) for `LLM_MODEL_NAME`. A custom alias that is already loaded can be resolved while the bot runs, but that mapping is not saved across restarts. Keep your desired load settings saved in LM Studio for JIT loading.
 
-Enter positive whole numbers for width and height; larger requests such as 3840 × 2160 are accepted. The bot uses the agreed **1K–2K** sizing rules: a minimum area of **1024 × 1024 = 1,048,576 pixels**, a maximum of **2048 pixels per side**, and dimensions in **multiples of 16**. Small requests scale up and large requests scale down, keeping size and aspect ratio as close as these bounds allow. The minimum is total area: a portrait or landscape image may have one side below 1024. Very wide or tall requests may need a different aspect ratio to satisfy both limits. The chosen dimensions and megapixel count appear before you enter the prompt.
+Enter positive whole numbers for width and height; larger requests such as 3840 × 2160 are accepted. The bot uses the agreed **1K–2K** sizing rules: a minimum area of **1024 × 1024 = 1,048,576 pixels**, a maximum of **2048 pixels per side**, and dimensions in **multiples of 16**. Small requests scale up and large requests scale down, keeping size and aspect ratio as close as these bounds allow. The minimum is total area: a portrait or landscape image may have one side below 1024. Very wide or tall requests may need a different aspect ratio to satisfy both limits. The chosen dimensions, megapixel count, and any adjustment appear in the private confirmation after you submit the form.
 
 | Requested size | Generation size | Total pixels |
 | --- | --- | --- |
@@ -159,7 +159,7 @@ Requests for the active type continue to queue. Images run one at a time, with a
 
 A local chat call already in progress blocks image admission, and cancellation retains that protection until the call finishes. When no work remains, the next accepted request can switch backends; repeated image or chat requests keep using their existing models. Keep these servers dedicated to the bot while it manages the shared GPU; independent manual requests cannot participate in its lock. The bot refuses to unload unrelated LM Studio models or interrupt unrelated ComfyUI jobs.
 
-Forms are private; the result is posted in the channel. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the server's attachment limit, and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's conversation history.
+The form is private; the result is posted in the channel. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the server's attachment limit, and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's conversation history.
 
 `IMAGEGEN_TIMEOUT` defaults to 600 seconds per submitted workflow; waiting behind other image requests is separate. Timed-out or interrupted jobs are cancelled by their own ID. If ComfyUI cannot confirm a submission/cancellation, the bot blocks another GPU handoff rather than risking overlapping models. Check the ComfyUI queue and connectivity before retrying. Waiting image requests are not persisted across bot restarts. Leave `COMFYUI_BASE_URL` blank to disable this feature.
 

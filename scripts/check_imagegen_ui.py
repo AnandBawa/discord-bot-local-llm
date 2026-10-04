@@ -1,4 +1,4 @@
-"""Offline checks for image-generation forms, permissions, queues, and uploads.
+"""Offline checks for the image-generation form, permissions, queues, and uploads.
 
 Run: venv_bot/bin/python scripts/check_imagegen_ui.py
 Reuses temporary SQLite fixtures and blocked sockets; never reads .env/runtime
@@ -78,7 +78,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.client.image_tasks, set())
         self.assertEqual(self.backend.work, {"lmstudio": 0, "comfyui": 0})
 
-    async def test_chat_declines_images_at_every_form_step_in_any_server(self):
+    async def test_chat_declines_images_at_command_and_form_submission_in_any_server(self):
         first = self.chat()
         second = self.chat(author=84)
         other = self.chat(server=2)
@@ -98,19 +98,14 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(other_entered.wait(), 1)
                 self.assertNotIn(second, seen)
                 for server in (1, 2, 3):
-                    for step in ("command", "resolution", "button", "prompt"):
+                    for step in ("command", "form"):
                         with self.subTest(server=server, step=step):
                             interaction = self.interaction(server_id=server)
                             if step == "command":
                                 await self.bot.cmd_imagegen.callback(interaction)
-                            elif step == "resolution":
-                                modal = self.fill(self.bot.ImageResolutionModal(), width="1024", height="1024")
-                                await modal.on_submit(interaction)
-                            elif step == "button":
-                                view = self.bot.ImagePromptView(interaction.user.id, 1024, 1024)
-                                await view.children[0].callback(interaction)
                             else:
-                                await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
+                                modal = self.fill(self.bot.ImageGenerationModal(), width="1024", height="1024", prompt="A tree")
+                                await modal.on_submit(interaction)
                             reply = interaction.response.send_message.call_args
                             self.assertIn("Chat is active right now", reply.args[0])
                             self.assertTrue(reply.kwargs["ephemeral"])
@@ -221,38 +216,41 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(message.reply.await_count == 1 for message in messages))
         self.assert_slots_free()
 
-    async def test_resolution_then_private_button_then_prompt_keeps_selected_size(self):
-        interaction = self.interaction()
-        self.assertFalse(interaction.permissions.administrator)
-        self.assertFalse(interaction.app_permissions.read_message_history)
+    async def test_single_form_submits_dimensions_and_literal_prompt_without_an_extra_button(self):
+        opening = self.interaction()
+        self.assertFalse(opening.permissions.administrator)
+        self.assertFalse(opening.app_permissions.read_message_history)
         self.assertIsNone(self.bot.cmd_imagegen.default_permissions)
-        await self.bot.cmd_imagegen.callback(interaction)
-        resolution = interaction.response.send_modal.call_args.args[0]
-        self.assertIsInstance(resolution, self.bot.ImageResolutionModal)
-        self.assertEqual(len(resolution.children), 2)
-        self.fill(resolution, width="1080", height="1920")
-        await resolution.on_submit(interaction)
-        response = interaction.response.send_message.call_args
-        self.assertTrue(response.kwargs["ephemeral"])
-        self.assertIn("1088 × 1920", response.args[0])
-        self.assertIn("2.09 MP", response.args[0])
-        self.assertIn("1080 × 1920", response.args[0])
-        view = response.kwargs["view"]
-        self.assertIsInstance(view, self.bot.ImagePromptView)
-        self.assertTrue(await view.interaction_check(interaction))
-        stranger = self.interaction(user_id=84)
-        self.assertFalse(await view.interaction_check(stranger))
-        self.assertTrue(stranger.response.send_message.call_args.kwargs["ephemeral"])
-        self.assertIn("own image", stranger.response.send_message.call_args.args[0])
-        interaction.response.send_modal.reset_mock()
-        await view.children[0].callback(interaction)
-        prompt = interaction.response.send_modal.call_args.args[0]
-        self.assertIsInstance(prompt, self.bot.ImagePromptModal)
-        self.assertEqual((prompt.width, prompt.height), (1088, 1920))
-        self.assertEqual(prompt.prompt.style, discord.TextStyle.paragraph)
-        self.assertEqual((prompt.prompt.min_length, prompt.prompt.max_length), (1, 4000))
+        await self.bot.cmd_imagegen.callback(opening)
+        opening.response.send_modal.assert_awaited_once()
+        modal = opening.response.send_modal.call_args.args[0]
+        self.assertIsInstance(modal, self.bot.ImageGenerationModal)
+        self.assertEqual(len(modal.to_dict()["components"]), 3)
+        self.assertEqual(modal.prompt.style, discord.TextStyle.paragraph)
+        self.assertEqual((modal.prompt.min_length, modal.prompt.max_length), (1, 4000))
         self.backend.generate.assert_not_awaited()
-        interaction.channel.send.assert_not_awaited()
+        opening.channel.send.assert_not_awaited()
+        self.assert_slots_free()
+
+        submission = self.interaction()
+        literal = "  A café in the rain.\nKeep the lettering exactly as given.  "
+        self.fill(modal, width="1080", height="1920", prompt=literal)
+        self.backend.generate.side_effect = lambda prompt, width, height: self.png((width, height))
+        await modal.on_submit(submission)
+        submission.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        submission.response.send_message.assert_not_awaited()
+        submission.response.send_modal.assert_not_awaited()
+        confirmation = submission.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("1088 × 1920", confirmation)
+        self.assertIn("2.09 MP", confirmation)
+        self.assertIn("adjusted from 1080 × 1920", confirmation)
+        progress = submission.channel.send.call_args
+        self.assertIn("1088 × 1920", progress.args[0])
+        self.assertIn("queued", progress.args[0])
+        self.assertNotIn("view", progress.kwargs)
+        self.backend.generate.assert_awaited_once_with(literal, 1088, 1920)
+        self.assertEqual(len(submission.uploads), 1)
+        self.create.assert_not_awaited()
         self.assert_slots_free()
 
     async def test_resolution_rounding_boundaries_and_malformed_form_values(self):
@@ -268,8 +266,8 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             for field in ("width", "height"):
                 with self.subTest(field=field, value=invalid):
                     interaction = self.interaction()
-                    values = {"width": "64", "height": "64", field: invalid}
-                    modal = self.fill(self.bot.ImageResolutionModal(), **values)
+                    values = {"width": "64", "height": "64", "prompt": "A tree", field: invalid}
+                    modal = self.fill(self.bot.ImageGenerationModal(), **values)
                     await modal.on_submit(interaction)
                     response = interaction.response.send_message.call_args
                     self.assertTrue(response.kwargs["ephemeral"])
@@ -296,27 +294,27 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                 width, height = self.bot.image_resolution(x * scale, y * scale)
                 self.assertLess(abs((width / height) / (x / y) - 1), 0.02)
         interaction = self.interaction()
-        modal = self.fill(self.bot.ImageResolutionModal(), width="3840", height="2160")
+        modal = self.fill(self.bot.ImageGenerationModal(), width="3840", height="2160", prompt="A tree")
+        self.backend.generate.return_value = self.png((2048, 1152))
         await modal.on_submit(interaction)
-        response = interaction.response.send_message.call_args
-        self.assertIn("2048 × 1152", response.args[0])
-        self.assertIn("adjusted from 3840 × 2160", response.args[0])
+        confirmation = interaction.edit_original_response.call_args.kwargs["content"]
+        self.assertIn("2048 × 1152", confirmation)
+        self.assertIn("adjusted from 3840 × 2160", confirmation)
+        self.backend.generate.assert_awaited_once_with("A tree", 2048, 1152)
+        self.assert_slots_free()
 
     async def test_permissions_are_rechecked_at_each_submission_including_threads(self):
         for thread in (False, True):
             send_permission = "send_messages_in_threads" if thread else "send_messages"
             for missing in ("view_channel", send_permission, "attach_files"):
-                for step in ("command", "resolution", "prompt"):
+                for step in ("command", "form"):
                     with self.subTest(thread=thread, missing=missing, step=step):
                         interaction = self.interaction(thread=thread)
                         setattr(interaction.app_permissions, missing, False)
                         if step == "command":
                             await self.bot.cmd_imagegen.callback(interaction)
-                        elif step == "resolution":
-                            modal = self.fill(self.bot.ImageResolutionModal(), width="64", height="64")
-                            await modal.on_submit(interaction)
                         else:
-                            modal = self.fill(self.bot.ImagePromptModal(64, 64), prompt="A tree")
+                            modal = self.fill(self.bot.ImageGenerationModal(), width="64", height="64", prompt="A tree")
                             await modal.on_submit(interaction)
                         response = interaction.response.send_message.call_args
                         self.assertTrue(response.kwargs["ephemeral"])
@@ -372,7 +370,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.backend.generate.side_effect = generate
         interaction.edit_original_response.side_effect = require_live_token
         interaction.followup.send.side_effect = require_live_token
-        modal = self.fill(self.bot.ImagePromptModal(80, 112), prompt=literal)
+        modal = self.fill(self.bot.ImageGenerationModal(), width="80", height="112", prompt=literal)
         task = asyncio.create_task(modal.on_submit(interaction))
         try:
             await asyncio.wait_for(ready.wait(), 2)
