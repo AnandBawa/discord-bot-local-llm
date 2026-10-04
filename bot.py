@@ -349,12 +349,11 @@ class ImageGeneration:
         try:
             workflow = json.loads(Path(__file__).with_name("krea2.json").read_text(encoding="utf-8"))
             required = {"48": "PrimitiveStringMultiline", "232": "EmptyLatentImage",
-                        "213": "SaveImage", "324": "ImageScale"}
+                        "213": "SaveImage"}
             if any(workflow[key]["class_type"] != kind for key, kind in required.items()):
                 raise ValueError("unexpected workflow nodes")
             workflow["48"]["inputs"]["value"] = prompt
             workflow["232"]["inputs"].update(width=width, height=height, batch_size=1)
-            workflow["324"]["inputs"].update(width=width, height=height)
             return workflow
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ImageGenerationError("The bot's krea2.json workflow is missing or incompatible.") from exc

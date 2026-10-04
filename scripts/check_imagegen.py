@@ -102,11 +102,18 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         graph = self.service.workflow(prompt, 1080, 1920)
         self.assertEqual(graph["48"]["inputs"]["value"], prompt)
         self.assertEqual(graph["232"]["inputs"], {"width": 1088, "height": 1920, "batch_size": 1})
-        self.assertEqual((graph["324"]["inputs"]["width"], graph["324"]["inputs"]["height"]), (1088, 1920))
+        self.assertEqual(graph["324"]["class_type"], "ImageScaleBy")
+        self.assertEqual(graph["324"]["inputs"]["scale_by"], 0.5)
+        self.assertEqual(graph["324"]["inputs"]["image"], ["323", 0])
+        self.assertNotIn("width", graph["324"]["inputs"])
+        self.assertNotIn("height", graph["324"]["inputs"])
         self.assertEqual([nid for nid, node in graph.items() if node["class_type"] == "EmptyLatentImage"], ["232"])
         self.assertEqual(graph["213"]["inputs"]["images"], ["324", 0])
         graph["48"]["inputs"]["value"] = "changed"
-        self.assertEqual(self.service.workflow("next", 64, 64)["48"]["inputs"]["value"], "next")
+        next_graph = self.service.workflow("next", 64, 64)
+        self.assertEqual(next_graph["48"]["inputs"]["value"], "next")
+        self.assertEqual(next_graph["323"], graph["323"])
+        self.assertEqual(next_graph["324"], graph["324"])
 
     async def test_repeated_images_reuse_comfy_without_any_lm_inference(self):
         for prompt, size in (("first", (64, 80)), ("second\nexactly", (96, 64))):
