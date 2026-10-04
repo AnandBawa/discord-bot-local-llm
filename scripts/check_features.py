@@ -1,4 +1,4 @@
-"""Offline checks for permission fallback, search, explicit memory, and turn ordering.
+"""Offline checks for permission fallback, search, command schemas, and turn ordering.
 
 Run: venv_bot/bin/python scripts/check_features.py
 Reuses the temporary SQLite/model fixtures; never loads .env or logs into Discord.
@@ -6,13 +6,10 @@ Reuses the temporary SQLite/model fixtures; never loads .env or logs into Discor
 
 import asyncio
 import contextlib
-import json
-import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
-import aiosqlite
 import discord
 
 import check_regressions as fixtures
@@ -25,7 +22,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
     interaction = staticmethod(fixtures.BotChecks.interaction)
     seed = fixtures.BotChecks.seed
     count = fixtures.BotChecks.count
-    archive = fixtures.BotChecks.archive
+    clear_history = fixtures.BotChecks.clear_history
 
     def chat(self, server=1, author=42, content="Hello", history=True):
         bot_user = SimpleNamespace(id=99)
@@ -45,48 +42,33 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             content=f"<@99> {content}", attachments=[], stickers=[], reply=AsyncMock(),
         )
 
-    def put_fact(self, key="existing", text="Tester lives in Delhi", user="42", server="1", name="Tester"):
-        self.store.facts[key] = (f"[Recorded on 2026-01-01]: {text}",
-                                 {"user_id": user, "server_id": server, "user_name": name})
-        return key
-
-    async def test_status_reports_independent_models_from_successful_requests(self):
+    async def test_status_reports_chat_model_from_last_successful_request(self):
         self.client.config.model = "primary-chat"
-        self.client.config.embedding_model = "primary-memory"
         self.client.config.fallback_model = "fallback-chat"
         cloud = AsyncMock(return_value=self.completion("Answer"))
         self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
         models = self.client.lm_client.models = SimpleNamespace(list=AsyncMock())
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.123):
-            for chat_fallback, memory_fallback in ((True, False), (False, True), (True, True), (False, False)):
-                with self.subTest(chat_fallback=chat_fallback, memory_fallback=memory_fallback):
+            for chat_fallback in (True, False):
+                with self.subTest(chat_fallback=chat_fallback):
                     self.client.chat_dead_until = 0
                     self.create.side_effect = RuntimeError("chat unavailable") if chat_fallback else None
-                    primary = SimpleNamespace(model_name="primary-memory", embed=Mock(return_value=[[1.0, 0.0]]))
-                    primary.embed.side_effect = RuntimeError("embedding unavailable") if memory_fallback else None
-                    fallback = SimpleNamespace(model_name="fallback-memory", embed=Mock(return_value=[[1.0, 0.0]]))
-                    self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
                     await self.bot.request_completion(messages=[])
-                    self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
-                    # Expiry does not change which provider actually handled the last request.
-                    self.client.chat_dead_until = self.client.custom_ef.dead_until = 0
+                    # Cooldown expiry does not change the provider that handled the last request.
+                    self.client.chat_dead_until = 0
                     interaction = self.interaction()
                     await self.bot.cmd_status.callback(interaction)
                     text = interaction.followup.send.call_args.args[0]
                     self.assertIn("**Chat model:** `" + ("fallback-chat (fallback)" if chat_fallback else "primary-chat") + "`", text)
-                    self.assertIn("**Memory model:** `" + ("fallback-memory (fallback)" if memory_fallback else "primary-memory") + "`", text)
+                    self.assertNotIn("Memory model", text)
                     self.assertNotIn("backup:", text.lower())
         models.list.assert_not_awaited()
 
-    async def test_status_keeps_primary_models_until_fallback_succeeds(self):
+    async def test_status_keeps_primary_model_until_fallback_succeeds(self):
         self.client.config.model = "primary-chat"
-        self.client.config.embedding_model = "primary-memory"
         self.client.config.fallback_model = "fallback-chat"
         cloud = AsyncMock(side_effect=RuntimeError("fallback unavailable"))
         self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
-        primary = SimpleNamespace(model_name="primary-memory", embed=Mock(side_effect=RuntimeError("primary unavailable")))
-        fallback = SimpleNamespace(model_name="fallback-memory", embed=Mock(side_effect=RuntimeError("fallback unavailable")))
-        self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
         self.client.lm_client.models = SimpleNamespace(list=AsyncMock(side_effect=AssertionError("Status must not probe providers")))
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1):
             for failed_attempt in (False, True):
@@ -94,37 +76,39 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                     self.create.side_effect = RuntimeError("primary unavailable")
                     with self.assertRaises(RuntimeError):
                         await self.bot.request_completion(messages=[])
-                    with self.assertRaises(RuntimeError):
-                        self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
                 interaction = self.interaction()
                 await self.bot.cmd_status.callback(interaction)
                 text = interaction.followup.send.call_args.args[0]
                 self.assertIn("**Chat model:** `primary-chat`", text)
-                self.assertIn("**Memory model:** `primary-memory`", text)
+                self.assertNotIn("Memory model", text)
                 self.assertNotIn("fallback-chat", text)
-                self.assertNotIn("fallback-memory", text)
-            cloud.side_effect = fallback.embed.side_effect = None
+            cloud.side_effect = None
             cloud.return_value = self.completion("Answer")
-            fallback.embed.return_value = [[1.0, 0.0]]
-            # Both requests now go straight to fallback during their separate cooldowns.
             await self.bot.request_completion(messages=[])
-            self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
             interaction = self.interaction()
             await self.bot.cmd_status.callback(interaction)
-            text = interaction.followup.send.call_args.args[0]
-            self.assertIn("**Chat model:** `fallback-chat (fallback)`", text)
-            self.assertIn("**Memory model:** `fallback-memory (fallback)`", text)
-            self.client.chat_dead_until = self.client.custom_ef.dead_until = 0
-            self.create.side_effect = primary.embed.side_effect = None
-            primary.embed.return_value = [[1.0, 0.0]]
+            self.assertIn("**Chat model:** `fallback-chat (fallback)`", interaction.followup.send.call_args.args[0])
+            self.client.chat_dead_until = 0
+            self.create.side_effect = None
             await self.bot.request_completion(messages=[])
-            self.client.custom_ef.embed(["Synthetic"], "retrieval.query")
             interaction = self.interaction()
             await self.bot.cmd_status.callback(interaction)
-            text = interaction.followup.send.call_args.args[0]
-            self.assertIn("**Chat model:** `primary-chat`", text)
-            self.assertIn("**Memory model:** `primary-memory`", text)
+            self.assertIn("**Chat model:** `primary-chat`", interaction.followup.send.call_args.args[0])
         self.client.lm_client.models.list.assert_not_awaited()
+
+    async def test_commands_and_help_expose_only_retained_features(self):
+        names = {command.name for command in self.bot.tree.get_commands()}
+        self.assertEqual(names, {"help", "status", "role", "clear", "imagegen"})
+        for name in ("remember", "memory", "force-forget", "admin_wipe_server"):
+            self.assertIsNone(self.bot.tree.get_command(name))
+        interaction = self.interaction()
+        self.client._connection.user = SimpleNamespace(id=99, name="Synthetic Bot")
+        await self.bot.cmd_help.callback(interaction)
+        text = str(interaction.response.send_message.call_args) + str(interaction.followup.send.call_args)
+        for name in ("status", "role", "clear", "imagegen"):
+            self.assertIn("/" + name, text)
+        for name in ("remember", "memory", "force-forget", "admin_wipe_server"):
+            self.assertNotIn("/" + name, text)
 
     async def test_status_reports_scoped_history_and_configured_input_limits(self):
         await self.seed(count=2, server_id="1")
@@ -149,7 +133,6 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_with_long_model_names_fits_discord_messages(self):
         self.client.config.model = "chat-" + "a" * 2100
-        self.client.config.embedding_model = "memory-" + "b" * 2100
         interaction = self.interaction()
         interaction.channel = self.chat().channel
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1), \
@@ -159,8 +142,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 2000 for chunk in chunks))
         text = "".join(chunks)
-        for model in (self.client.config.model, self.client.config.embedding_model):
-            self.assertIn(model, text)
+        self.assertIn(self.client.config.model, text)
         self.assertTrue(text.endswith("compatible chat model."))
 
     async def test_missing_history_uses_normal_message_and_fits_discord_limit(self):
@@ -245,121 +227,6 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.create.call_args.kwargs["tools"][0]["function"]["name"], "web_search")
         self.assertIn("incomplete document", str(self.create.call_args.kwargs["messages"]))
 
-    async def test_remember_saves_and_recalls_during_embedding_outage(self):
-        interaction = self.interaction()
-        interaction.user.display_name = "Tester"
-        await self.bot.cmd_remember.callback(interaction, "I prefer Python")
-        self.assertIn("Saved", interaction.followup.send.call_args.args[0])
-        with patch.object(self.client.custom_ef, "embed", side_effect=RuntimeError("offline")):
-            await self.bot.sync_manual_memories()
-            context = await self.bot.build_ai_context("1", "What do I prefer?")
-        self.assertIn("I prefer Python", context[0]["content"])
-        self.assertEqual(await self.count("explicit_memories"), 1)
-        await self.client.db_conn.close()
-        self.client.db_conn = await aiosqlite.connect("check.sqlite3")
-        await self.bot.init_db(self.client.db_conn)
-        await self.bot.sync_manual_memories()
-        self.assertEqual(len(self.store.facts), 1)
-
-    async def test_removed_memory_actions_are_unavailable_and_cannot_mutate_data(self):
-        self.put_fact()
-        schema = self.bot.cmd_memory.to_dict(self.bot.tree)
-        options = {option["name"]: option for option in schema["options"]}
-        self.assertEqual(set(options), {"action", "target_user"})
-        self.assertEqual({choice["value"] for choice in options["action"]["choices"]},
-                         {"list", "read", "clear"})
-        for action in ("edit", "delete"):
-            interaction = self.interaction()
-            await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value=action))
-            self.assertIn("no longer available", interaction.followup.send.call_args.args[0])
-        self.assertEqual(await self.count("explicit_memories"), 0)
-        self.assertIn("Delhi", self.store.facts["existing"][0])
-        cursor = await self.client.db_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        tables = {row[0] for row in await cursor.fetchall()}
-        self.assertTrue({"memory_overrides", "memory_suppressions"}.isdisjoint(tables))
-
-    async def test_read_defaults_to_self_and_can_read_another_member_in_same_server(self):
-        self.put_fact()
-        self.put_fact("other", "Other likes Python", user="84", name="Other")
-        self.put_fact("elsewhere", "Tester likes games", server="2")
-        interaction = self.interaction()
-        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="read"))
-        text = interaction.followup.send.call_args.args[0]
-        self.assertIn("Delhi", text)
-        self.assertNotIn("Other", text)
-        self.assertNotIn("games", text)
-        await self.bot.cmd_memory.callback(interaction, SimpleNamespace(value="read"), target_user="Other")
-        text = interaction.followup.send.call_args.args[0]
-        self.assertIn("Other likes Python", text)
-        self.assertNotIn("games", text)
-
-    async def test_explicit_memory_survives_failed_indexing_and_retries(self):
-        key = await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
-        with patch.object(self.store, "upsert", side_effect=RuntimeError("index failure")):
-            await self.bot.sync_manual_memories()
-        self.assertEqual(self.store.facts, {})
-        self.assertIn(key, await self.bot.list_memories("1", "42"))
-        context = await self.bot.build_ai_context("1", "What do I like?")
-        self.assertIn("I like hiking", context[0]["content"])
-        await self.bot.sync_manual_memories()
-        self.assertIn("I like hiking", self.store.facts[key][0])
-
-    async def test_remember_during_extraction_retries_with_new_explicit_fact(self):
-        await self.seed()
-        await self.archive()
-        entered, release = asyncio.Event(), asyncio.Event()
-        async def extract(**kwargs):
-            entered.set()
-            await release.wait()
-            return self.completion('["Tester likes Python", "Tester likes hiking"]')
-        self.create.side_effect = extract
-        task = asyncio.create_task(self.bot.process_pending_memories())
-        await asyncio.wait_for(entered.wait(), 2)
-        await self.bot.remember_fact("1", "42", "Tester", "I prefer Rust")
-        release.set()
-        await task
-        self.assertEqual(await self.count("pending_memories"), 2)
-        self.create.side_effect = None
-        self.create.return_value = self.completion('["Tester likes Python", "Tester likes hiking"]')
-        await self.bot.process_pending_memories()
-        facts = await self.bot.list_memories("1", "42")
-        text = str(facts)
-        self.assertIn("Rust", text)
-        self.assertIn("hiking", text)
-        self.assertIn("likes Python", text)
-        self.assertIn("I prefer Rust", self.create.call_args.kwargs["messages"][0]["content"])
-        self.assertEqual(await self.count("explicit_memories"), 1)
-
-    async def test_forget_during_manual_embedding_prevents_index_restoration(self):
-        await self.bot.remember_fact("1", "42", "Tester", "I like Python")
-        entered, release = asyncio.Event(), threading.Event()
-        loop = asyncio.get_running_loop()
-        def embed(*args):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
-                raise AssertionError("Unreleased embedding")
-            return [[1.0, 0.0]]
-        with patch.object(self.client.custom_ef, "embed", side_effect=embed):
-            task = asyncio.create_task(self.bot.sync_manual_memories())
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                await self.bot.forget_memories("1", "42")
-            finally:
-                release.set()
-                await task
-        self.assertEqual(self.store.facts, {})
-        self.assertEqual(await self.count("explicit_memories"), 0)
-
-    async def test_failed_sqlite_save_leaves_existing_facts_intact(self):
-        self.put_fact()
-        await self.client.db_conn.execute(
-            "CREATE TEMP TRIGGER fail_save BEFORE INSERT ON explicit_memories BEGIN SELECT RAISE(ABORT, 'failure'); END",
-        )
-        with self.assertRaises(aiosqlite.IntegrityError):
-            await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
-        self.assertEqual(await self.count("explicit_memories"), 0)
-        self.assertIn("Delhi", (await self.bot.list_memories("1", "42"))["existing"][0])
-
     async def test_turns_order_within_server_while_other_servers_progress(self):
         first, second, other = self.chat(content="Project Orion"), self.chat(author=84, content="What name?"), self.chat(server=2)
         entered, release, other_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -390,26 +257,33 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(a, b, c)
         self.assertIn("Orion confirmed", contexts["1"][1])
 
-    async def test_clear_invalidates_running_and_queued_turns(self):
-        first, second = self.chat(), self.chat(author=84)
-        entered, release = asyncio.Event(), asyncio.Event()
-        async def generate(*args):
-            entered.set()
-            await release.wait()
-            return "Old answer"
-        with patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
-                patch.object(self.bot, "generate_ai_response", side_effect=generate) as model:
-            a = asyncio.create_task(self.bot.on_message(first))
-            await asyncio.wait_for(entered.wait(), 2)
-            b = asyncio.create_task(self.bot.on_message(second))
-            await asyncio.sleep(0)
-            await self.archive()
-            release.set()
-            await asyncio.gather(a, b)
-            self.assertEqual(model.await_count, 1)
-        self.assertEqual(await self.count("chat_history"), 0)
-        first.reply.assert_not_awaited()
-        second.reply.assert_not_awaited()
+    async def test_clear_and_role_invalidate_running_and_queued_turns(self):
+        for prompt in (None, "Friendly", "clear"):
+            with self.subTest(prompt=prompt):
+                first, second = self.chat(), self.chat(author=84)
+                entered, release = asyncio.Event(), asyncio.Event()
+                async def generate(*args):
+                    entered.set()
+                    await release.wait()
+                    return "Old answer"
+                with patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
+                        patch.object(self.bot, "generate_ai_response", side_effect=generate) as model:
+                    first_task = asyncio.create_task(self.bot.on_message(first))
+                    await asyncio.wait_for(entered.wait(), 2)
+                    second_task = asyncio.create_task(self.bot.on_message(second))
+                    try:
+                        await asyncio.sleep(0)
+                        if prompt is None:
+                            await self.clear_history()
+                        else:
+                            await self.bot.cmd_role.callback(self.interaction(), prompt)
+                    finally:
+                        release.set()
+                        await asyncio.gather(first_task, second_task)
+                    self.assertEqual(model.await_count, 1)
+                self.assertEqual(await self.count("chat_history"), 0)
+                first.reply.assert_not_awaited()
+                second.reply.assert_not_awaited()
 
     async def test_cancelled_turn_releases_server_for_next_request(self):
         first, second = self.chat(), self.chat(author=84)
@@ -430,17 +304,6 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(b, 2)
         second.reply.assert_awaited_once_with("Next answer")
 
-    async def test_remember_appends_and_clear_keeps_other_members_and_servers(self):
-        key = self.put_fact()
-        own = await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
-        other = await self.bot.remember_fact("1", "84", "Other", "I like Python")
-        elsewhere = await self.bot.remember_fact("2", "42", "Tester", "I like games")
-        self.assertEqual(set(await self.bot.list_memories("1", "42")), {key, own})
-        await self.bot.sync_manual_memories()
-        await self.bot.cmd_memory.callback(self.interaction(), SimpleNamespace(value="clear"), target_user="Other")
-        self.assertEqual(set(self.store.facts), {other, elsewhere})
-        self.assertEqual(await self.bot.list_memories("1", "42"), {})
-        self.assertEqual(await self.count("explicit_memories"), 2)
 
 
 if __name__ == "__main__":

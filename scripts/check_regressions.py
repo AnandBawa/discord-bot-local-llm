@@ -1,7 +1,7 @@
-"""Focused regression checks for URL fetching, forgetting, and memory retention.
+"""Focused regression checks for URL fetching and persistent conversation history.
 
 Run: venv_bot/bin/python scripts/check_regressions.py
-Uses temporary SQLite files, synthetic models/memories, and a controlled HTTP server.
+Uses temporary SQLite files, synthetic model responses, and a controlled HTTP server.
 No .env, Discord login, real model requests, or external socket connections.
 """
 
@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import socket
 import tempfile
-import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -28,34 +27,6 @@ SOCKET_CONNECT = socket.socket.connect
 START_CONNECTION = aiohappyeyeballs.start_connection
 
 
-class MemoryStore:
-    def __init__(self):
-        self.facts = {}
-
-    def query(self, **kwargs):
-        return {"distances": [[]]}
-
-    def upsert(self, *, ids, documents, metadatas, embeddings):
-        if len(ids) != len(set(ids)):
-            raise ValueError("Chroma requires unique IDs within a write")
-        for key, document, metadata in zip(ids, documents, metadatas):
-            self.facts[key] = (document, metadata)
-
-    @staticmethod
-    def matches(metadata, where):
-        filters = where.get("$and", [where])
-        return all(all(metadata.get(k) == v for k, v in part.items()) for part in filters)
-
-    def get(self, *, where, include):
-        rows = [(key, doc, meta) for key, (doc, meta) in self.facts.items() if self.matches(meta, where)]
-        return {"ids": [r[0] for r in rows], "documents": [r[1] for r in rows], "metadatas": [r[2] for r in rows]}
-
-    def delete(self, *, where=None, ids=None):
-        for key, (_, metadata) in list(self.facts.items()):
-            if (ids is None or key in ids) and (where is None or self.matches(metadata, where)):
-                del self.facts[key]
-
-
 class BotChecks(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="discord-bot-regressions-")
@@ -66,7 +37,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.patches.enter_context(patch("discord.Client.run", side_effect=AssertionError("Discord login disabled")))
         self.patches.enter_context(patch("socket.socket.connect", side_effect=AssertionError("External sockets disabled")))
         self.patches.enter_context(patch("socket.socket.connect_ex", side_effect=AssertionError("External sockets disabled")))
-        self.create = AsyncMock(return_value=self.completion('["Tester likes Python"]'))
+        self.create = AsyncMock(return_value=self.completion("Answer"))
         model = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.create)), close=AsyncMock())
         self.old_logging = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
@@ -76,12 +47,9 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.client = self.bot.client
         self.client.lm_client = model
         self.client.db_lock = asyncio.Lock()
-        self.client.memory_lock = asyncio.Lock()
         self.client.llm_queue = asyncio.Semaphore(3)
         self.client.db_conn = await aiosqlite.connect("check.sqlite3")
         await self.bot.init_db(self.client.db_conn)
-        self.store = self.client.memory_collection = MemoryStore()
-        self.client.custom_ef = SimpleNamespace(embed=lambda texts, task: [[1.0, 0.0] for _ in texts])
         self.message = SimpleNamespace(author=SimpleNamespace(id=42), reply=AsyncMock())
 
     async def asyncTearDown(self):
@@ -106,18 +74,18 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
-    async def seed(self, count=2, user_id="42", server_id="1"):
+    async def seed(self, count=2, server_id="1"):
         async with self.bot.history_transaction():
             await self.client.db_conn.executemany(
-                "INSERT INTO chat_history (server_id, role, content, user_id, user_name) VALUES (?, ?, ?, ?, ?)",
-                [(server_id, "user", f"Synthetic message {i}", user_id, "Tester") for i in range(count)],
+                "INSERT INTO chat_history (server_id, role, content) VALUES (?, ?, ?)",
+                [(server_id, "user", f"Synthetic message {i}") for i in range(count)],
             )
 
     async def count(self, table):
         cursor = await self.client.db_conn.execute(f"SELECT COUNT(*) FROM {table}")
         return (await cursor.fetchone())[0]
 
-    async def archive(self):
+    async def clear_history(self):
         await self.bot.cmd_clear.callback(self.interaction())
 
     @contextlib.asynccontextmanager
@@ -232,196 +200,167 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
             result = await self.bot.fetch_url_content("http://public.example/file.png")
             self.assertIn("too long", result["data"])
 
-    async def test_eviction_retains_input_on_failure_then_retries(self):
-        await self.seed(98)
-        await self.bot.save_and_send_response(self.message, "1", "Tester", "Hello", "Answer")
-        self.assertEqual(await self.count("chat_history"), 50)
-        self.assertEqual(await self.count("pending_memories"), 50)
-        self.create.side_effect = RuntimeError("Model offline")
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 50)
-        self.create.side_effect = None
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 0)
-        self.assertEqual(len(self.store.facts), 1)
+    async def test_new_database_creates_only_conversation_and_persona_tables(self):
+        cursor = await self.client.db_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        tables = {row[0] for row in await cursor.fetchall() if not row[0].startswith("sqlite_")}
+        self.assertEqual(tables, {"server_config", "chat_history"})
+        cursor = await self.client.db_conn.execute("PRAGMA table_info(chat_history)")
+        self.assertEqual([row[1] for row in await cursor.fetchall()], ["id", "server_id", "role", "content"])
 
-    async def test_clear_and_persona_changes_retain_input(self):
+    async def test_eviction_drops_oldest_half_only_in_current_server(self):
+        await self.seed(count=4, server_id="2")
+        await self.seed(count=98)
+        await self.bot.save_and_send_response(self.message, "1", "Hello", "Answer")
+        cursor = await self.client.db_conn.execute(
+            "SELECT role, content FROM chat_history WHERE server_id = '1' ORDER BY id",
+        )
+        self.assertEqual(await cursor.fetchall(),
+                         [("user", f"Synthetic message {i}") for i in range(50, 98)]
+                         + [("user", "Hello"), ("assistant", "Answer")])
+        self.assertEqual(await self.count("chat_history"), 54)
+        self.create.assert_not_awaited()
+        self.message.reply.assert_awaited_once_with("Answer")
+
+    async def test_clear_and_persona_changes_affect_only_current_server(self):
+        await self.bot.cmd_role.callback(self.interaction(server_id=2), "Other persona")
+        await self.seed(server_id="2")
         for prompt in (None, "Friendly", "clear"):
             with self.subTest(prompt=prompt):
+                await self.bot.cmd_role.callback(self.interaction(), "Original")
                 await self.seed()
                 interaction = self.interaction()
                 if prompt is None:
                     await self.bot.cmd_clear.callback(interaction)
                 else:
                     await self.bot.cmd_role.callback(interaction, prompt)
-                self.assertEqual(await self.count("chat_history"), 0)
-                self.assertEqual(await self.count("pending_memories"), 2)
-                self.assertIn("queued", interaction.followup.send.call_args.args[0])
-                await self.bot.process_pending_memories()
-                self.assertEqual(await self.count("pending_memories"), 0)
+                expected = "Original" if prompt is None else (self.bot.DEFAULT_PERSONA if prompt == "clear" else prompt)
+                self.assertEqual(await self.bot.get_persona("1"), expected)
+                self.assertEqual(await self.bot.get_persona("2"), "Other persona")
+                cursor = await self.client.db_conn.execute("SELECT server_id FROM chat_history")
+                self.assertEqual(await cursor.fetchall(), [("2",), ("2",)])
+                self.assertIn("cleared", interaction.followup.send.call_args.args[0])
+                self.assertNotIn("extraction", interaction.followup.send.call_args.args[0].lower())
+        self.create.assert_not_awaited()
 
-    async def test_invalid_extraction_never_discards_input(self):
-        await self.seed()
-        await self.archive()
-        for content, reason in ((None, "stop"), ("", "stop"), ("not JSON", "stop"),
-                                ('{"fact": "x"}', "stop"), ('["ok", 7]', "stop"),
-                                ('[""]', "stop"), ('["incomplete"]', "length"),
-                                ("preamble [] trailing garbage", "stop")):
-            with self.subTest(content=content, reason=reason):
-                self.create.return_value = self.completion(content, reason)
-                await self.bot.process_pending_memories()
-                self.assertEqual(await self.count("pending_memories"), 2)
-        self.create.return_value = self.completion("```json\n[]\n```")
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 0)
-
-    async def test_embedding_failures_retain_input(self):
-        await self.seed()
-        await self.archive()
-        for task in ("retrieval.query", "retrieval.passage"):
-            for incomplete in (False, True):
-                def embed(texts, current_task):
-                    if current_task == task:
-                        if incomplete:
-                            return []
-                        raise RuntimeError("Embedding offline")
-                    return [[1.0, 0.0] for _ in texts]
-                with self.subTest(task=task, incomplete=incomplete), patch.object(self.client.custom_ef, "embed", side_effect=embed):
-                    await self.bot.process_pending_memories()
-                    self.assertEqual(await self.count("pending_memories"), 2)
-
-    async def test_partial_vector_write_can_retry_without_duplicates(self):
-        await self.seed()
-        await self.archive()
-        upsert = self.store.upsert
-        def partial_write(**kwargs):
-            upsert(**kwargs)
-            raise RuntimeError("Lost response after write")
-        with patch.object(self.store, "upsert", side_effect=partial_write):
-            await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 2)
-        self.assertEqual(len(self.store.facts), 1)
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 0)
-        self.assertEqual(len(self.store.facts), 1)
-
-    async def test_duplicate_facts_in_one_response_do_not_block_extraction(self):
-        await self.seed()
-        await self.archive()
-        self.create.return_value = self.completion('["Tester likes Python", "Tester likes Python", " Tester likes Python "]')
-        await self.bot.process_pending_memories()
-        self.assertEqual(await self.count("pending_memories"), 0)
-        self.assertEqual(len(self.store.facts), 1)
-
-    async def test_failed_archive_rolls_back_both_tables(self):
+    async def test_failed_clear_rolls_back_history(self):
         await self.seed()
         await self.client.db_conn.execute(
-            "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON chat_history BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END"
+            "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON chat_history BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
         )
         with self.assertRaises(aiosqlite.IntegrityError):
-            await self.archive()
+            await self.clear_history()
         self.assertEqual(await self.count("chat_history"), 2)
-        self.assertEqual(await self.count("pending_memories"), 0)
         await self.client.db_conn.execute("DROP TRIGGER fail_delete")
-        await self.archive()
-        self.assertEqual(await self.count("pending_memories"), 2)
+        await self.clear_history()
+        self.assertEqual(await self.count("chat_history"), 0)
 
-    async def test_restart_resumes_retained_input(self):
-        await self.seed()
-        await self.archive()
-        self.create.side_effect = RuntimeError("Model offline")
-        await self.bot.process_pending_memories()
+    async def test_failed_eviction_rolls_back_new_turn_and_keeps_existing_history(self):
+        await self.seed(count=98)
+        await self.client.db_conn.execute(
+            "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON chat_history BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
+        )
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await self.bot.save_and_send_response(self.message, "1", "New input", "New answer")
+        self.assertEqual(await self.count("chat_history"), 98)
+        self.message.reply.assert_not_awaited()
+
+    async def test_cancelled_history_transaction_rolls_back_partial_turn(self):
+        entered = asyncio.Event()
+        async def interrupted_write():
+            async with self.bot.history_transaction():
+                await self.client.db_conn.execute(
+                    "INSERT INTO chat_history (server_id, role, content) VALUES ('1', 'user', 'Partial')",
+                )
+                entered.set()
+                await asyncio.Event().wait()
+        task = asyncio.create_task(interrupted_write())
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(await self.count("chat_history"), 0)
+        await self.bot.save_and_send_response(self.message, "1", "Next input", "Next answer")
+        self.assertEqual(await self.count("chat_history"), 2)
+
+    async def test_restart_retains_recent_conversation_and_persona_without_model_calls(self):
+        await self.bot.cmd_role.callback(self.interaction(), "Persisted persona")
+        await self.bot.save_and_send_response(self.message, "1", "Project Orion", "Orion confirmed")
         await self.client.db_conn.close()
         self.client.db_conn = await aiosqlite.connect("check.sqlite3")
         await self.bot.init_db(self.client.db_conn)
-        self.create.side_effect = None
-        self.client.memory_worker = asyncio.create_task(self.bot.retry_pending_memories())
-        async with asyncio.timeout(2):
-            while await self.count("pending_memories"):
-                await asyncio.sleep(0.01)
-        self.assertEqual(len(self.store.facts), 1)
-
-    async def test_worker_retries_without_another_message(self):
-        await self.seed()
-        await self.archive()
-        self.create.side_effect = [RuntimeError("Temporary outage"), self.completion('["Tester likes Python"]')]
-        with patch.object(self.bot, "MEMORY_RETRY_INTERVAL", 0.01):
-            self.client.memory_worker = asyncio.create_task(self.bot.retry_pending_memories())
-            async with asyncio.timeout(2):
-                while await self.count("pending_memories"):
-                    await asyncio.sleep(0.01)
-        self.assertEqual(self.create.await_count, 2)
-        self.assertEqual(len(self.store.facts), 1)
-
-    async def test_deletion_during_embedding_cannot_restore_facts(self):
-        for wipe in (False, True):
-            for phase in ("retrieval.query", "retrieval.passage"):
-                with self.subTest(wipe=wipe, phase=phase):
-                    await self.seed()
-                    await self.archive()
-                    entered = asyncio.Event()
-                    release = threading.Event()
-                    loop = asyncio.get_running_loop()
-                    def embed(texts, task):
-                        if task == phase:
-                            loop.call_soon_threadsafe(entered.set)
-                            if not release.wait(5):
-                                raise AssertionError("Test failed to release embedding")
-                        return [[1.0, 0.0] for _ in texts]
-                    with patch.object(self.client.custom_ef, "embed", side_effect=embed):
-                        processing = asyncio.create_task(self.bot.process_pending_memories())
-                        try:
-                            await asyncio.wait_for(entered.wait(), 2)
-                            await self.bot.forget_memories("1", None if wipe else "42")
-                        finally:
-                            release.set()
-                            await processing
-                    self.assertEqual(await self.count("pending_memories"), 0)
-                    self.assertEqual(len(self.store.facts), 0)
-
-    async def test_work_captured_before_deletion_cannot_start_after_it(self):
-        version = self.client.memory_version("1", "42")
-        await self.bot.forget_memories("1", "42")
-        self.assertTrue(await self.bot.update_user_memory("1", "42", "Tester", [
-            {"role": "user", "content": "Old fact", "user_id": "42"},
-        ], version))
+        context = await self.bot.build_ai_context("1", "What name?")
+        self.assertIn("Persisted persona", context[0]["content"])
+        self.assertEqual(context[1:], [
+            {"role": "user", "content": "Project Orion"},
+            {"role": "assistant", "content": "Orion confirmed"},
+            {"role": "user", "content": "What name?"},
+        ])
         self.create.assert_not_awaited()
 
-    async def test_forget_invalidates_every_members_old_reply_but_allows_new_turns(self):
+    async def test_legacy_history_and_persona_work_without_reading_or_mutating_fact_tables(self):
+        await self.client.db_conn.close()
+        self.client.db_conn = await aiosqlite.connect("legacy.sqlite3")
+        await self.client.db_conn.executescript("""
+            CREATE TABLE server_config (server_id TEXT PRIMARY KEY, prompt TEXT);
+            CREATE TABLE chat_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, server_id TEXT, role TEXT, content TEXT,
+                user_id TEXT, user_name TEXT);
+            CREATE TABLE pending_memories (
+                id INTEGER PRIMARY KEY, server_id TEXT, role TEXT, content TEXT,
+                user_id TEXT, user_name TEXT);
+            CREATE TABLE explicit_memories (
+                id TEXT PRIMARY KEY, server_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL, document TEXT NOT NULL, indexed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL);
+            INSERT INTO server_config VALUES ('1', 'Legacy persona');
+            INSERT INTO chat_history VALUES (1, '1', 'user', 'Recent project Orion', '42', 'Tester');
+            INSERT INTO chat_history VALUES (2, '1', 'assistant', 'Orion confirmed', '42', 'Tester');
+            INSERT INTO pending_memories VALUES (100, '1', 'user', 'Unused pending fact', '42', 'Tester');
+            INSERT INTO explicit_memories VALUES ('saved', '1', '42', 'Tester', 'Unused explicit fact', 0, '2026-01-01');
+        """)
+        snapshots = {}
+        for table in ("pending_memories", "explicit_memories"):
+            cursor = await self.client.db_conn.execute(f"SELECT * FROM {table}")
+            snapshots[table] = await cursor.fetchall()
+        legacy_index = Path("chroma_storage/chroma.sqlite3")
+        legacy_index.parent.mkdir()
+        legacy_index.write_bytes(b"synthetic legacy index; leave untouched")
+        statements = []
+        await self.client.db_conn.set_trace_callback(statements.append)
+        try:
+            await self.bot.init_db(self.client.db_conn)
+            context = await self.bot.build_ai_context("1", "What name?")
+            self.assertIn("Legacy persona", context[0]["content"])
+            self.assertEqual(context[1]["content"], "Recent project Orion")
+            self.assertEqual(context[2]["content"], "Orion confirmed")
+            self.assertNotIn("Unused", str(context))
+            await self.bot.save_and_send_response(self.message, "1", "Next question", "Next answer")
+            cursor = await self.client.db_conn.execute(
+                "SELECT user_id, user_name FROM chat_history ORDER BY id",
+            )
+            self.assertEqual(await cursor.fetchall(), [("42", "Tester"), ("42", "Tester"), (None, None), (None, None)])
+            await self.clear_history()
+            await self.bot.cmd_role.callback(self.interaction(), "Updated persona")
+        finally:
+            await self.client.db_conn.set_trace_callback(None)
+        for table, rows in snapshots.items():
+            self.assertFalse(any(table in statement.lower() for statement in statements), statements)
+            cursor = await self.client.db_conn.execute(f"SELECT * FROM {table}")
+            self.assertEqual(await cursor.fetchall(), rows)
+        self.assertEqual(legacy_index.read_bytes(), b"synthetic legacy index; leave untouched")
+        self.create.assert_not_awaited()
+
+    async def test_clear_invalidates_every_members_old_reply_but_allows_new_turns(self):
         version = self.client.conversation_versions.get("1", 0)
-        await self.bot.forget_memories("1", "42")
+        await self.clear_history()
         for author_id in (42, 84):
             self.message.author.id = author_id
-            await self.bot.save_and_send_response(self.message, "1", "Tester", "Old input", "Old shared fact", version)
+            await self.bot.save_and_send_response(self.message, "1", "Old input", "Old answer", version)
         self.assertEqual(await self.count("chat_history"), 0)
         self.message.reply.assert_not_awaited()
-        await self.bot.save_and_send_response(self.message, "1", "Tester", "New input", "New answer")
+        await self.bot.save_and_send_response(self.message, "1", "New input", "New answer")
         self.assertEqual(await self.count("chat_history"), 2)
         self.message.reply.assert_awaited_once()
-
-    async def test_chat_started_during_delete_is_also_invalidated(self):
-        entered = asyncio.Event()
-        release = threading.Event()
-        loop = asyncio.get_running_loop()
-        def blocked_delete(**kwargs):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
-                raise AssertionError("Test failed to release deletion")
-        with patch.object(self.store, "delete", side_effect=blocked_delete):
-            deletion = asyncio.create_task(self.bot.forget_memories("1", "42"))
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                version = self.client.conversation_versions.get("1", 0)
-                self.message.author.id = 84
-                response = asyncio.create_task(self.bot.save_and_send_response(
-                    self.message, "1", "Other user", "Old context", "Deleted shared fact", version,
-                ))
-            finally:
-                release.set()
-                await deletion
-            await response
-        self.assertEqual(await self.count("chat_history"), 0)
-        self.message.reply.assert_not_awaited()
 
     async def test_message_handler_captures_version_before_loading_context(self):
         bot_user = SimpleNamespace(id=99)
@@ -439,11 +378,11 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
             return "Hello", [], [], ""
         with patch.object(self.bot, "extract_message_context", side_effect=context), \
                 patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])), \
-                patch.object(self.bot, "generate_ai_response", new=AsyncMock(return_value="Old shared fact")):
+                patch.object(self.bot, "generate_ai_response", new=AsyncMock(return_value="Old answer")):
             request = asyncio.create_task(self.bot.on_message(message))
             try:
                 await asyncio.wait_for(entered.wait(), 2)
-                await self.bot.forget_memories("1", "42")
+                await self.clear_history()
             finally:
                 release.set()
                 await request
@@ -451,87 +390,16 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         message.reply.assert_not_awaited()
 
     async def test_clear_and_role_invalidate_old_replies(self):
-        for prompt in (None, "Friendly"):
+        for prompt in (None, "Friendly", "clear"):
             with self.subTest(prompt=prompt):
                 version = self.client.conversation_versions.get("1", 0)
                 if prompt is None:
-                    await self.archive()
+                    await self.clear_history()
                 else:
                     await self.bot.cmd_role.callback(self.interaction(), prompt)
-                await self.bot.save_and_send_response(self.message, "1", "Tester", "Old", "Old answer", version)
+                await self.bot.save_and_send_response(self.message, "1", "Old", "Old answer", version)
                 self.assertEqual(await self.count("chat_history"), 0)
                 self.message.reply.assert_not_awaited()
-
-    async def test_forget_commands_remove_retained_input_with_correct_scope(self):
-        for command in ("self", "force", "server"):
-            with self.subTest(command=command):
-                await self.seed(user_id="42")
-                await self.seed(user_id="84")
-                await self.archive()
-                await self.seed(user_id="42", server_id="2")
-                await self.bot.cmd_clear.callback(self.interaction(server_id=2))
-                if command == "self":
-                    await self.bot.cmd_memory.callback(self.interaction(), SimpleNamespace(value="clear"))
-                elif command == "force":
-                    await self.bot.cmd_force_forget.callback(self.interaction(), SimpleNamespace(id=42, mention="@Tester"))
-                else:
-                    await self.bot.cmd_wipe_server.callback(self.interaction())
-                self.assertEqual(await self.count("pending_memories"), 2 if command == "server" else 4)
-                await self.bot.process_pending_memories()
-                self.assertEqual(await self.count("pending_memories"), 0)
-                self.store.facts.clear()
-
-    async def test_cancelled_vector_write_finishes_before_forget(self):
-        await self.seed()
-        await self.archive()
-        entered = asyncio.Event()
-        release = threading.Event()
-        loop = asyncio.get_running_loop()
-        upsert = self.store.upsert
-        def blocked_write(**kwargs):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
-                raise AssertionError("Test failed to release vector write")
-            upsert(**kwargs)
-        with patch.object(self.store, "upsert", side_effect=blocked_write):
-            processing = asyncio.create_task(self.bot.process_pending_memories())
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                processing.cancel()
-                deletion = asyncio.create_task(self.bot.forget_memories("1", "42"))
-                await asyncio.sleep(0.02)
-                self.assertFalse(deletion.done())
-            finally:
-                release.set()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await processing
-            await deletion
-        self.assertEqual(len(self.store.facts), 0)
-        self.assertEqual(await self.count("pending_memories"), 0)
-
-    async def test_shutdown_preserves_cancellation_when_vector_write_fails(self):
-        await self.seed()
-        await self.archive()
-        entered = asyncio.Event()
-        release = threading.Event()
-        loop = asyncio.get_running_loop()
-        def failed_write(**kwargs):
-            loop.call_soon_threadsafe(entered.set)
-            if not release.wait(5):
-                raise AssertionError("Test failed to release write")
-            raise RuntimeError("Synthetic write failure")
-        with patch.object(self.store, "upsert", side_effect=failed_write):
-            worker = asyncio.create_task(self.bot.retry_pending_memories())
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                worker.cancel()
-                await asyncio.sleep(0)
-                worker.cancel()
-            finally:
-                release.set()
-            with self.assertRaises(asyncio.CancelledError):
-                await asyncio.wait_for(worker, 2)
-        self.assertEqual(await self.count("pending_memories"), 2)
 
 
 if __name__ == "__main__":

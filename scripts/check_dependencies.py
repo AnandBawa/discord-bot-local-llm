@@ -6,6 +6,7 @@ The bot is loaded in a temporary directory with dotenv and Discord login disable
 
 import asyncio
 import base64
+import builtins
 import contextlib
 import importlib.util
 import io
@@ -39,24 +40,24 @@ class Channel:
 
 async def check_bot():
     requests_seen = []
+    primary_offline = False
 
     async def respond(request):
         assert request.extensions['timeout'] == {
             'connect': 2.0, 'read': 120.0, 'write': 120.0, 'pool': 120.0,
         }, 'The configured timeout is incompatible with the OpenAI SDK transport'
-        requests_seen.append(request.url.path)
+        assert request.url.path in ('/v1/models', '/v1/chat/completions'), 'Unexpected model or embedding request'
+        requests_seen.append((request.url.host, request.url.path))
         if request.url.path.endswith('/models'):
             return httpx2.Response(200, json={
                 'object': 'list',
                 'data': [{'id': 'local-model', 'object': 'model', 'created': 0, 'owned_by': 'test'}],
             })
+        if primary_offline and request.url.host == 'dependency-check.invalid':
+            return httpx2.Response(503, json={'error': {'message': 'Synthetic outage'}})
 
         payload = json.loads(request.content)
-        memory_request = 'strict, automated data-extraction system' in str(payload['messages'])
-        if memory_request:
-            message = {'role': 'assistant', 'content': '["Tester likes Python"]'}
-            finish_reason = 'stop'
-        elif payload.get('tools') and not any(m['role'] == 'tool' for m in payload['messages']):
+        if payload.get('tools') and not any(m['role'] == 'tool' for m in payload['messages']):
             message = {
                 'role': 'assistant', 'content': None,
                 'tool_calls': [{'id': 'search_1', 'type': 'function', 'function': {
@@ -79,20 +80,17 @@ async def check_bot():
             transport=httpx2.MockTransport(respond),
         ))
 
-    def embed(url, *, headers, json, timeout):
-        assert url.endswith('/embeddings')
-        assert timeout == (2.0, 15.0)
-        data = [{'embedding': [1.0, 0.0, 0.0]} for _ in json['input']]
-        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'data': data})
+    original_import = builtins.__import__
+
+    def import_without_chroma(name, *args, **kwargs):
+        assert name.split('.')[0] != 'chromadb', 'Chat must run without Chroma installed'
+        return original_import(name, *args, **kwargs)
 
     environment = {
-        'DISCORD_BOT_TOKEN': '', 'BOT_OWNER_ID': '0',
+        'DISCORD_BOT_TOKEN': '',
         'LLM_BASE_URL': 'https://dependency-check.invalid/v1',
         'LLM_API_KEY': 'offline-test', 'LLM_MODEL_NAME': 'local-model',
-        'EMB_MODEL_NAME': 'local-embedding', 'VISION_ENABLED': 'true',
-        'FALLBACK_BASE_URL': '', 'FALLBACK_API_KEY': '',
-        'FALLBACK_MODEL_NAME': '', 'FALLBACK_EMB_API_KEY': '',
-        'ANONYMIZED_TELEMETRY': 'False',
+        'VISION_ENABLED': 'true',
     }
     previous_directory = Path.cwd()
     with tempfile.TemporaryDirectory(prefix='discord-bot-dependencies-') as directory:
@@ -100,7 +98,8 @@ async def check_bot():
             os.chdir(directory)
             with (
                 patch.dict(os.environ, environment, clear=True),
-                patch('dotenv.load_dotenv', return_value=False),
+                patch('dotenv.load_dotenv', side_effect=AssertionError('Tests must not read .env')),
+                patch('builtins.__import__', side_effect=import_without_chroma),
                 patch('openai.AsyncOpenAI', side_effect=make_model_client),
                 patch('discord.Client.run', side_effect=AssertionError('Discord login is disabled')),
                 patch('socket.socket.connect', side_effect=AssertionError('Network access is disabled')),
@@ -113,67 +112,68 @@ async def check_bot():
                 bot.tree.sync = AsyncMock(return_value=[])
                 try:
                     await bot.client.setup_hook()
+                    assert bot.client.fallback_client is None
                     models = await bot.client.lm_client.models.list()
                     assert models.data[0].id == 'local-model'
                     print('PASS SDK import, request serialization, and timeout configuration')
 
                     names = {command.name for command in bot.tree.get_commands()}
-                    assert {'help', 'status', 'role', 'clear', 'memory', 'remember', 'force-forget', 'admin_wipe_server'} <= names
-                    # Verify the published command schema no longer offers individual edits/deletions.
-                    command = bot.tree.get_command('memory').to_dict(bot.tree)
-                    options = {option['name']: option for option in command['options']}
-                    assert set(options) == {'action', 'target_user'}
-                    assert {choice['value'] for choice in options['action']['choices']} == {'list', 'read', 'clear'}
-                    print('PASS Discord command registration and database initialization')
+                    assert names == {'help', 'status', 'role', 'clear', 'imagegen'}
+                    bot.tree.sync.assert_awaited_once()
+                    cursor = await bot.client.db_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                    tables = {row[0] for row in await cursor.fetchall() if not row[0].startswith('sqlite_')}
+                    assert tables == {'server_config', 'chat_history'}
+                    assert not Path('chroma_storage').exists()
+                    print('PASS retained Discord commands and conversation-only database initialization')
 
                     channel = Channel()
                     message = SimpleNamespace(author=SimpleNamespace(id=42), channel=channel, reply=channel.send)
                     search = AsyncMock(return_value='Synthetic search result. Source: https://example.com/')
-                    with patch('requests.post', side_effect=embed), patch.dict(bot.AVAILABLE_TOOLS, web_search=search):
+                    with patch.dict(bot.AVAILABLE_TOOLS, web_search=search):
                         content, stored = await bot.build_user_payloads('Hello', '', [], [], 'Tester')
                         context = await bot.build_ai_context('1', content)
                         answer = await bot.generate_ai_response(context, message, False)
                         assert answer == 'Synthetic answer.'
                         search.assert_awaited_once_with(query='synthetic test')
-                        await bot.save_and_send_response(message, '1', 'Tester', stored, answer)
+                        await bot.save_and_send_response(message, '1', stored, answer)
                         assert channel.messages == ['Synthetic answer.']
                         cursor = await bot.client.db_conn.execute('SELECT COUNT(*) FROM chat_history')
                         assert (await cursor.fetchone())[0] == 2
-                        print('PASS tool calling, response parsing, chat persistence, and reply delivery')
+                    assert len(requests_seen) == 3
+                    print('PASS tool calling, response parsing, chat persistence, and reply delivery')
 
-                        await bot.update_user_memory('1', '42', 'Tester', [
-                            {'role': 'user', 'content': 'I like Python', 'user_id': '42'},
-                        ])
-                        assert bot.client.memory_collection.count() == 1
-                        recalled = await bot.build_ai_context('1', 'What do I like?')
-                        assert 'Tester likes Python' in recalled[0]['content']
-                        print('PASS embedding requests and Chroma memory write and retrieval')
-
-                        # Use real temporary Chroma and SQLite to check explicit saves and full forget,
-                        # including an indexing write whose SQLite acknowledgement fails.
-                        bot.client.memory_worker.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await bot.client.memory_worker
-                        bot.client.memory_worker = None
-                        key = await bot.remember_fact('1', '42', 'Tester', 'I like hiking')
+                    async with bot.history_transaction():
                         await bot.client.db_conn.execute(
-                            "CREATE TEMP TRIGGER fail_index_ack BEFORE UPDATE OF indexed ON explicit_memories "
-                            "BEGIN SELECT RAISE(ABORT, 'synthetic acknowledgement failure'); END",
+                            "INSERT INTO server_config VALUES ('1', 'Persisted persona')",
                         )
-                        await bot.sync_manual_memories()
-                        cursor = await bot.client.db_conn.execute('SELECT indexed FROM explicit_memories')
-                        assert (await cursor.fetchone())[0] == 0
-                        assert 'hiking' in (await bot.list_memories('1', '42'))[key][0]
-                        await bot.client.db_conn.execute('DROP TRIGGER fail_index_ack')
-                        await bot.sync_manual_memories()
-                        assert bot.client.memory_collection.count() == 2
-                        assert 'hiking' in bot.client.memory_collection.get(ids=[key])['documents'][0]
-                        await bot.forget_memories('1', '42')
-                        assert bot.client.memory_collection.count() == 0
-                        assert not await bot.list_memories('1', '42')
-                        cursor = await bot.client.db_conn.execute('SELECT COUNT(*) FROM explicit_memories')
-                        assert (await cursor.fetchone())[0] == 0
-                        print('PASS explicit memory save, retry after failed acknowledgement, and scoped cleanup')
+                    await bot.client.close()
+                    bot.client = bot.MyAIClient(intents=bot.intents)
+                    bot.client.config = bot.Config({
+                        **environment,
+                        'FALLBACK_BASE_URL': 'https://cloud-check.invalid/v1',
+                        'FALLBACK_API_KEY': 'offline-cloud-key', 'FALLBACK_MODEL_NAME': 'cloud-chat',
+                    })
+                    await bot.client.setup_hook()
+                    context = await bot.build_ai_context('1', 'Follow up')
+                    assert 'Persisted persona' in context[0]['content']
+                    assert context[1:] == [
+                        {'role': 'user', 'content': stored},
+                        {'role': 'assistant', 'content': answer},
+                        {'role': 'user', 'content': 'Follow up'},
+                    ]
+                    assert len(requests_seen) == 3, 'Startup and context assembly must not invoke models'
+                    assert not Path('chroma_storage').exists()
+                    print('PASS history/persona restart persistence without Chroma or embedding calls')
+
+                    primary_offline = True
+                    response, used_fallback = await bot.request_completion(messages=[{'role': 'user', 'content': 'Hello'}])
+                    assert used_fallback and response.model == 'cloud-chat'
+                    assert response.choices[0].message.content == 'Synthetic answer.'
+                    assert requests_seen[-2:] == [
+                        ('dependency-check.invalid', '/v1/chat/completions'),
+                        ('cloud-check.invalid', '/v1/chat/completions'),
+                    ]
+                    print('PASS optional cloud chat fallback through the SDK transport')
 
                     with Image.new('RGBA', (1200, 600), (20, 40, 80, 255)) as image:
                         buffer = io.BytesIO()
@@ -188,7 +188,7 @@ async def check_bot():
                     assert 'Synthetic PDF text' in bot.extract_pdf_text(pdf)
                     assert callable(bot.DDGS().text)
                     print('PASS Pillow, PyMuPDF, and search client interfaces')
-                    assert len(requests_seen) == 4
+                    assert len(requests_seen) == 5
                 finally:
                     await bot.client.close()
                     logging.shutdown()

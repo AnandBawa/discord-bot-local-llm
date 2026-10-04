@@ -149,7 +149,6 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Image generation is active right now", reply.call_args.args[0])
                 handle.assert_not_awaited()
             self.assertEqual(await fixtures.BotChecks.count(self, "chat_history"), 0)
-            self.assertEqual(await fixtures.BotChecks.count(self, "pending_memories"), 0)
             self.create.assert_not_awaited()
         finally:
             release.set()

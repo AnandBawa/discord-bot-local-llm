@@ -4,12 +4,9 @@ import asyncio
 import contextlib
 import copy
 import io
-import json
-import threading
-import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
@@ -22,13 +19,12 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         await fixtures.BotChecks.asyncSetUp(self)
         self.client.config.comfy_url = "http://comfy.invalid:8188"
         self.client.config.model = "chat-alias"
-        self.client.config.embedding_model = "embedding-alias"
         self.service = self.client.imagegen = self.bot.ImageGeneration(self.client.config)
         self.service.backend = "lmstudio"
         self.patches.enter_context(patch.object(self.bot, "IMAGEGEN_POLL_INTERVAL", 0.001))
         self.service.request = AsyncMock(side_effect=self.request)
         self.calls, self.jobs, self.running = [], {}, []
-        self.loaded = {"native-chat": ["chat-alias"], "native-embedding": ["embedding-alias"]}
+        self.loaded = {"native-chat": ["chat-alias"]}
         self.hold_image = False
         self.started = asyncio.Event()
         self.finished_free = False
@@ -125,12 +121,12 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(picture.size, expected)
         submitted = [graph for graph in self.jobs.values() if "213" in graph]
         self.assertEqual([graph["48"]["inputs"]["value"] for graph in submitted], ["first", "second\nexactly"])
-        self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 2)
+        self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 1)
         self.assertFalse(any(path == "/free" for _, _, path, _ in self.calls))
         self.assertEqual(self.service.backend, "comfyui")
         self.create.assert_not_awaited()
 
-    async def test_round_trip_preserves_chat_and_embedding_custom_aliases(self):
+    async def test_round_trip_preserves_custom_chat_alias(self):
         await self.service.generate("first", 64, 64)
         async def infer(**kwargs):
             self.assertTrue(self.finished_free)
@@ -142,17 +138,9 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         await self.bot.request_completion(messages=[])
         self.assertEqual(sum(path == "/free" for _, _, path, _ in self.calls), 1)
         self.assertEqual(self.barriers, 2)
-        provider = self.bot.LocalAPIEmbeddingFunction("http://lm.invalid/v1", "synthetic", "embedding-alias", self.service.resolve_model)
-        self.client.custom_ef = self.bot.ResilientEmbeddingFunction(provider)
-        response = Mock()
-        response.json.return_value = {"data": [{"embedding": [1.0]}]}
-        with patch.object(self.bot.requests, "post", return_value=response) as post:
-            await self.bot.request_embeddings(["hello"], "retrieval.query")
-        self.assertEqual(post.call_args.kwargs["json"]["model"], "native-embedding")
-        self.loaded["native-embedding"] = ["native-embedding"]
         await self.service.generate("next", 64, 64)
         unloaded = [body["instance_id"] for _, _, path, body in self.calls if path == "/models/unload"]
-        self.assertEqual(unloaded, ["chat-alias", "embedding-alias", "native-chat", "native-embedding"])
+        self.assertEqual(unloaded, ["chat-alias", "native-chat"])
 
     async def test_concurrent_local_calls_decline_images_and_keep_accepting_chat(self):
         release = asyncio.Event()
@@ -185,35 +173,28 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.create.await_count, 3)
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
-    async def test_images_queue_but_decline_local_calls_without_fallback_or_cooldown(self):
+    async def test_images_queue_but_decline_chat_without_fallback_or_cooldown(self):
         cloud = AsyncMock(return_value=self.completion("cloud answer"))
         self.client.fallback_client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
         )
-        primary = SimpleNamespace(embed=Mock(return_value=[[1.0]]))
-        fallback = SimpleNamespace(embed=Mock(return_value=[[2.0]]))
-        ef = self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
         self.hold_image = True
         images = [asyncio.create_task(self.service.generate(str(i), 64, 64)) for i in range(3)]
         try:
             await asyncio.wait_for(self.started.wait(), 1)
             await asyncio.sleep(0)
             self.assertEqual(len(self.running), 1)
-            for request in (self.bot.request_completion(messages=[]),
-                            self.bot.request_embeddings(["fact"], "retrieval.query")):
-                with self.assertRaisesRegex(self.bot.ModelBusyError, "Image generation is active right now"):
-                    await asyncio.wait_for(request, 1)
+            with self.assertRaisesRegex(self.bot.ModelBusyError, "Image generation is active right now"):
+                await asyncio.wait_for(self.bot.request_completion(messages=[]), 1)
             self.create.assert_not_awaited()
             cloud.assert_not_awaited()
-            primary.embed.assert_not_called()
-            fallback.embed.assert_not_called()
-            self.assertEqual((self.client.chat_dead_until, ef.dead_until), (0, 0))
+            self.assertEqual(self.client.chat_dead_until, 0)
             self.assertFalse(any(path == "/free" for _, _, path, _ in self.calls))
         finally:
             self.hold_image = False
             await asyncio.gather(*images)
         self.assertEqual([graph["48"]["inputs"]["value"] for graph in self.jobs.values()], ["0", "1", "2"])
-        self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 2)
+        self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 1)
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
         await self.bot.request_completion(messages=[])
         self.assertTrue(self.finished_free)
@@ -242,68 +223,34 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                         await task
                 self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
-    async def test_cancelled_embedding_thread_keeps_gpu_until_it_finishes(self):
-        started, release = threading.Event(), threading.Event()
-        def embed(*args):
-            started.set()
-            release.wait(2)
-            return [[1.0]]
-        self.client.custom_ef = SimpleNamespace(embed=embed)
-        embedding = asyncio.create_task(self.bot.request_embeddings(["fact"], "retrieval.query"))
-        try:
-            await asyncio.to_thread(started.wait, 1)
-            self.assertTrue(started.is_set())
-            embedding.cancel()
-            with self.assertRaisesRegex(self.bot.ModelBusyError, "Chat is active right now"):
-                await asyncio.wait_for(self.service.generate("declined", 64, 64), 1)
-            await asyncio.sleep(0.02)
-            self.assertFalse(self.started.is_set())
-            self.assertFalse(embedding.done())
-        finally:
-            release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await embedding
-        await self.service.generate("after embedding", 64, 64)
-
-    async def test_background_memories_remain_pending_while_images_are_active(self):
-        await self.bot.remember_fact("1", "42", "Tester", "I like hiking")
-        await fixtures.BotChecks.seed(self)
-        await self.bot.cmd_clear.callback(fixtures.BotChecks.interaction())
-        self.hold_image = True
-        image = asyncio.create_task(self.service.generate("image", 64, 64))
-        try:
-            await asyncio.wait_for(self.started.wait(), 1)
-            await self.bot.process_pending_memories()
-            self.create.assert_not_awaited()
-            self.assertEqual(await fixtures.BotChecks.count(self, "pending_memories"), 2)
-            cursor = await self.client.db_conn.execute("SELECT indexed FROM explicit_memories")
-            self.assertEqual(await cursor.fetchall(), [(0,)])
-            self.assertFalse(self.store.facts)
-        finally:
-            self.hold_image = False
-            await image
-        await self.bot.process_pending_memories()
-        self.assertEqual(await fixtures.BotChecks.count(self, "pending_memories"), 0)
-        cursor = await self.client.db_conn.execute("SELECT indexed FROM explicit_memories")
-        self.assertEqual(await cursor.fetchall(), [(1,)])
-        self.assertTrue(self.store.facts)
-
-    async def test_cloud_embedding_stays_cloud_when_cooldown_expires_before_thread(self):
-        primary = SimpleNamespace(embed=Mock(side_effect=AssertionError("local GPU is busy")))
-        fallback = SimpleNamespace(embed=Mock(return_value=[[2.0]]))
-        ef = self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
-        ef.dead_until = time.monotonic() + 100
-        original = asyncio.to_thread
-        async def delayed(function, *args, **kwargs):
-            ef.dead_until = 0
-            return await original(function, *args, **kwargs)
-        async with self.service.entry:
-            self.service.backend = "comfyui"
-            with patch.object(asyncio, "to_thread", side_effect=delayed):
-                result = await asyncio.wait_for(self.bot.request_embeddings(["cloud"], "retrieval.query"), 1)
-        self.assertEqual(result, [[2.0]])
-        self.assertTrue(ef.last_used_fallback)
-        primary.embed.assert_not_called()
+    async def test_cancelled_chat_keeps_gpu_until_request_finishes_even_if_it_fails(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                started, release = asyncio.Event(), asyncio.Event()
+                self.started.clear()
+                async def infer(**kwargs):
+                    started.set()
+                    await release.wait()
+                    if failed:
+                        raise RuntimeError("Synthetic inference failure")
+                    return self.completion("Answer")
+                self.create.side_effect = infer
+                chat = asyncio.create_task(self.bot.request_completion(messages=[]))
+                try:
+                    await asyncio.wait_for(started.wait(), 1)
+                    chat.cancel()
+                    await asyncio.sleep(0)
+                    chat.cancel()
+                    with self.assertRaisesRegex(self.bot.ModelBusyError, "Chat is active right now"):
+                        await asyncio.wait_for(self.service.generate("declined", 64, 64), 1)
+                    self.assertFalse(self.started.is_set())
+                    self.assertFalse(chat.done())
+                finally:
+                    release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(chat, 2)
+                await self.service.generate("after cancelled chat", 64, 64)
+                self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
     async def test_startup_only_ignores_an_initial_refused_connection(self):
         connection = SimpleNamespace(host="comfy.invalid", port=8188, ssl=False)
@@ -351,32 +298,36 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.service.backend)
                 self.create.assert_not_awaited()
 
-    async def test_embedding_admission_failure_uses_cloud_without_local_inference(self):
-        primary = SimpleNamespace(embed=Mock(side_effect=AssertionError("must not touch local GPU")))
-        fallback = SimpleNamespace(embed=Mock(return_value=[[2.0]]))
-        ef = self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
+    async def test_chat_admission_failure_uses_cloud_without_local_inference(self):
+        cloud = AsyncMock(return_value=self.completion("Cloud answer"))
+        self.client.config.fallback_model = "cloud-chat"
+        self.client.fallback_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
+        )
         @contextlib.asynccontextmanager
         async def unavailable():
             raise self.bot.ImageGenerationError("GPU handoff failed")
             yield
         self.service.local_request = unavailable
-        self.assertEqual(await self.bot.request_embeddings(["cloud"], "retrieval.query"), [[2.0]])
-        primary.embed.assert_not_called()
-        fallback.embed.assert_called_once_with(["cloud"], "retrieval.query")
-        self.assertTrue(ef.last_used_fallback)
-        self.assertGreater(ef.dead_until, time.monotonic())
-        ef.fallback_ef = None
+        response, used_fallback = await self.bot.request_completion(messages=[])
+        self.assertEqual(response.choices[0].message.content, "Cloud answer")
+        self.assertTrue(used_fallback)
+        self.create.assert_not_awaited()
+        cloud.assert_awaited_once_with(model="cloud-chat", messages=[])
+        self.client.fallback_client = None
         with self.assertRaisesRegex(self.bot.ImageGenerationError, "handoff failed"):
-            await self.bot.request_embeddings(["local"], "retrieval.query")
+            await self.bot.request_completion(messages=[])
 
-    async def test_failed_embedding_fallback_is_not_retried_after_admission(self):
-        primary = SimpleNamespace(embed=Mock(side_effect=RuntimeError("local failed")))
-        fallback = SimpleNamespace(embed=Mock(side_effect=RuntimeError("cloud failed")))
-        self.client.custom_ef = self.bot.ResilientEmbeddingFunction(primary, fallback)
+    async def test_failed_chat_fallback_is_not_retried_after_admission(self):
+        self.create.side_effect = RuntimeError("local failed")
+        cloud = AsyncMock(side_effect=RuntimeError("cloud failed"))
+        self.client.fallback_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
+        )
         with self.assertRaisesRegex(RuntimeError, "cloud failed"):
-            await self.bot.request_embeddings(["fact"], "retrieval.query")
-        primary.embed.assert_called_once()
-        fallback.embed.assert_called_once()
+            await self.bot.request_completion(messages=[])
+        self.create.assert_awaited_once()
+        cloud.assert_awaited_once()
 
     async def test_cancellation_drains_late_submission_before_targeted_cancel(self):
         entered, accepted = asyncio.Event(), asyncio.Event()
@@ -469,11 +420,13 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
     async def test_unrelated_lm_or_comfy_jobs_are_not_unloaded_or_interrupted(self):
-        self.loaded["unrelated"] = ["other-app"]
-        with self.assertRaisesRegex(self.bot.ImageGenerationError, "Another LM Studio"):
-            await self.service.generate("busy", 64, 64)
-        self.assertFalse(any(path == "/models/unload" for _, _, path, _ in self.calls))
-        self.loaded.pop("unrelated")
+        for key, alias in (("unrelated", "other-app"), ("native-embedding", "embedding-alias")):
+            with self.subTest(model=key):
+                self.loaded[key] = [alias]
+                with self.assertRaisesRegex(self.bot.ImageGenerationError, "Another LM Studio"):
+                    await self.service.generate("busy", 64, 64)
+                self.assertFalse(any(path == "/models/unload" for _, _, path, _ in self.calls))
+                self.loaded.pop(key)
         self.running = ["another-comfy-job"]
         with self.assertRaisesRegex(self.bot.ImageGenerationError, "unfinished jobs"):
             await self.service.generate("busy", 64, 64)
