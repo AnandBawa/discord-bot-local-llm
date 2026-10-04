@@ -393,6 +393,53 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.history("channel:420"), [])
         self.assertEqual(self.replies(message), ["Answer"])
 
+    async def test_text_file_only_dm_reads_contents_and_keeps_only_attachment_note(self):
+        message = self.dm(content="")
+        body = "Answer this private question from my uploaded text file."
+        data = body.encode("utf-8")
+        message.attachments = [SimpleNamespace(filename="message.txt", content_type="text/plain",
+                                               size=len(data), read=AsyncMock(return_value=data))]
+        await self.bot.on_message(message)
+        self.assertIn(body, str(self.create.call_args.kwargs["messages"]))
+        self.assertEqual(self.replies(message), ["Answer"])
+        saved = str(await self.history("dm:42"))
+        self.assertIn("message.txt", saved)
+        self.assertNotIn(body, saved)
+
+    async def test_text_truncation_notifies_before_inference_once_for_direct_and_replied_files(self):
+        for location in ("dm", "server", "reply"):
+            for over_limit in (False, True):
+                with self.subTest(location=location, over_limit=over_limit):
+                    message = self.dm(content="") if location == "dm" else self.chat(content="")
+                    body = "é" * self.bot.MAX_TEXT_EXTRACTION_LENGTH
+                    data = (body + ("OMITTED TAIL" if over_limit else "")).encode("utf-8")
+                    attachment = SimpleNamespace(filename="message.txt", content_type="text/plain", size=len(data),
+                                                 read=AsyncMock(return_value=data))
+                    message.attachments = [attachment]
+                    if location == "reply":
+                        source = SimpleNamespace(author=SimpleNamespace(id=5, display_name="Other"), content="",
+                                                 attachments=[attachment], stickers=[])
+                        message.reference = SimpleNamespace(message_id=1, resolved=source, cached_message=None)
+
+                    async def infer(**kwargs):
+                        replies = self.replies(message)
+                        self.assertEqual(len(replies), int(over_limit))
+                        if over_limit:
+                            self.assertIn("Text file truncated", replies[0])
+                            self.assertIn("40,000 characters", replies[0])
+                            self.assertIn("remaining text is skipped", replies[0])
+                        content = kwargs["messages"][-1]["content"]
+                        self.assertIn(body, content)
+                        self.assertNotIn("OMITTED TAIL", content)
+                        self.assertEqual("[Content Truncated]" in content, over_limit)
+                        return self.create.return_value
+
+                    self.create.side_effect = infer
+                    await self.bot.on_message(message)
+                    replies = self.replies(message)
+                    self.assertEqual(len(replies), 1 + int(over_limit))
+                    self.assertEqual(replies[-1], "Answer")
+
     async def test_mixed_dm_and_server_chats_share_three_processing_slots(self):
         self.enable_images()
         entered, release = asyncio.Event(), asyncio.Event()

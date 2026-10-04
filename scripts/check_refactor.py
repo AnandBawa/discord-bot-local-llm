@@ -177,17 +177,77 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("replied reply.pdf", documents)
         self.assertEqual(documents.count("...[Content Truncated]"), 2)
 
+    async def test_direct_and_replied_text_files_share_decoding_and_truncation(self):
+        body = "café 日本語 🙂\nmore text"
+        data = body.encode("utf-8-sig")
+        for name, mime in (("message.TXT", None), ("message.txt", "application/octet-stream"),
+                           ("snippet", "Text/Plain; charset=utf-8")):
+            with self.subTest(name=name, mime=mime):
+                def attachment():
+                    return SimpleNamespace(filename=name, content_type=mime, size=len(data),
+                                           read=AsyncMock(return_value=data))
+                message = self.chat()
+                message.attachments = [attachment()]
+                referenced = SimpleNamespace(author=SimpleNamespace(id=5, display_name="Other"),
+                                             content="", attachments=[attachment()], stickers=[])
+                message.reference = SimpleNamespace(message_id=1, resolved=referenced, cached_message=None)
+                with patch.object(self.bot, "MAX_TEXT_EXTRACTION_LENGTH", 9):
+                    text, images, _, documents = await self.bot.extract_message_context(message, "Read these", "Tester")
+                self.assertEqual(images, [])
+                self.assertIn(f"Text attached: '{name}'", text)
+                self.assertIn(f"Extracted Text Content from replied {name}", documents)
+                self.assertEqual(documents.count(body[:9]), 2)
+                self.assertEqual(documents.count("...[Content Truncated]"), 2)
+                self.assertNotIn("more text", documents)
+                self.assertNotIn("\ufeff", documents)
+
+    async def test_unreadable_text_files_keep_valid_companions_and_question(self):
+        cases = ((b"\xffbad", "not readable UTF-8"), (b"binary\x00data", "not readable UTF-8"),
+                 (b"\xef\xbb\xbf \r\n\t", "is empty"), (b"", "is empty"))
+        for data, expected in cases:
+            with self.subTest(data=data):
+                message = self.chat()
+                message.attachments = [
+                    SimpleNamespace(filename="bad.txt", content_type="text/plain", size=len(data),
+                                    read=AsyncMock(return_value=data)),
+                    SimpleNamespace(filename="good.txt", content_type=None, size=10,
+                                    read=AsyncMock(return_value=b"Good input")),
+                ]
+                text, _, _, documents = await self.bot.extract_message_context(message, "My question", "Tester")
+                self.assertIn("My question", text)
+                self.assertIn(expected, text)
+                self.assertIn("Good input", documents)
+                self.assertNotIn("bad.txt", documents)
+
+    async def test_text_download_failures_and_oversized_bodies_keep_other_input(self):
+        for failure in (TimeoutError("timeout"), aiohttp.ClientConnectionError("offline"), OSError("reset")):
+            with self.subTest(error=type(failure).__name__):
+                message = self.chat()
+                message.attachments = [SimpleNamespace(filename="message.txt", content_type=None, size=10,
+                                                       read=AsyncMock(side_effect=failure))]
+                text, _, _, documents = await self.bot.extract_message_context(message, "My question", "Tester")
+                self.assertIn("My question", text)
+                self.assertIn("could not be downloaded", text)
+                self.assertEqual(documents, "")
+        message = self.chat()
+        message.attachments = [SimpleNamespace(filename="message.txt", content_type=None, size=1,
+                                               read=AsyncMock(return_value=b"Too large"))]
+        with patch.object(self.bot, "MAX_FILE_SIZE", 4):
+            text, _, _, documents = await self.bot.extract_message_context(message, "My question", "Tester")
+        self.assertIn("exceeds the size limit", text)
+        self.assertEqual(documents, "")
+
     async def test_oversized_direct_and_replied_attachments_are_never_read(self):
         message = self.chat()
         attachments = [SimpleNamespace(filename=name, content_type=kind, size=self.bot.MAX_FILE_SIZE + 1, read=AsyncMock())
-                       for name, kind in (("huge.png", "image/png"), ("huge.pdf", "application/pdf"))]
+                       for name, kind in (("huge.png", "image/png"), ("huge.pdf", "application/pdf"), ("huge.txt", "text/plain"))]
         message.attachments = attachments
         referenced = SimpleNamespace(author=SimpleNamespace(id=5, display_name="Other"), content="", attachments=attachments, stickers=[])
         message.reference = SimpleNamespace(message_id=1, resolved=referenced, cached_message=None)
         text, images, _, documents = await self.bot.extract_message_context(message, "Read these", "Tester")
         self.assertEqual(images, [])
         self.assertEqual(documents, "")
-        self.assertEqual(text.count("exceeds the size limit"), 4)
+        self.assertEqual(text.count("exceeds the size limit"), 6)
         for attachment in attachments:
             attachment.read.assert_not_awaited()
 

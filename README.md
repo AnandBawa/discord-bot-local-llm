@@ -1,6 +1,6 @@
 # Discord AI Bot
 
-A Discord bot for chat and ComfyUI image generation in server channels, threads, and private DMs. Each channel, thread, and user DM has its own conversation history and persona, saved across restarts in SQLite. Chat uses a local OpenAI-compatible endpoint, with optional cloud fallback, web search, PDF extraction, and image analysis.
+A Discord bot for chat and ComfyUI image generation in server channels, threads, and private DMs. Each channel, thread, and user DM has its own conversation history and persona, saved across restarts in SQLite. Chat uses a local OpenAI-compatible endpoint, with optional cloud fallback, web search, text/PDF reading, and image analysis.
 
 ## Key Features
 
@@ -10,7 +10,7 @@ A Discord bot for chat and ComfyUI image generation in server channels, threads,
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Image Generation:** `/imagegen` collects dimensions and a prompt in one private form, then posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
-- **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
+- **URL and Document Parsing:** Reads UTF-8 text attachments (including Discord `message.txt` uploads), extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
 - **Slash Commands:** `/help`, `/status`, `/role`, `/clear`, and `/imagegen`. Members can change their channel's shared persona; DM users control their own persona. In servers, `/clear` defaults to members with Manage Messages, subject to command settings. In a DM it clears only that user's conversation.
 - **Permission-Aware Replies:** Sends directly in DMs. In servers, uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
@@ -94,7 +94,7 @@ python scripts/check_dms.py
 
 The checks use synthetic messages, mocked API responses, temporary storage, and blocked external sockets (with a controlled loopback HTTP fixture for URL tests). They do not load `.env`, log in to Discord, or use real conversations or model endpoints.
 
-Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
+Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF/text-file processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
 
 ## Conversation Storage and Updating
 
@@ -115,7 +115,11 @@ Use mentions/replies in a server, ordinary messages in a DM, or native Slash Com
 - **`@BotName [message]`**: Chat or ask questions in a server channel/thread. The bot can analyze supported attachments and public links.
 - **Reply to the Bot**: A reply whose referenced message is delivered or cached is recognised without an extra tag. Tag the bot if the reference is unavailable. Without Read Message History, it can use its saved conversation but cannot fetch missing Discord messages or their attachments.
 
-Unsupported file attachments and oversized images/PDFs are skipped, with a note passed to the chat model; remaining text and supported attachments are processed normally. The explanation to the user depends on the model, so there is no guaranteed rejection message. Unsupported animated stickers are silently skipped; a mention with only such a sticker receives the generic `/help` greeting.
+Long messages uploaded as **`message.txt`** are supported. In a server, mention the bot in the message accompanying the file, or reply to the bot; in a DM, the file alone is enough. Files ending in `.txt` or marked by Discord as `text/*` are read as UTF-8, with an optional UTF-8 BOM. No file content is executed.
+
+Each file is limited to **10 MiB**, and only its first **40,000 characters** are sent to the model. For longer text, the bot sends a direct truncation notice before asking the model, once per request even when several files are shortened. Only the first 40,000 characters per file are read, with a `[Content Truncated]` marker in the model input; the remaining text is skipped. This is roughly 10,000 tokens for English prose, with the actual count depending on the model and content. The current-turn request includes the extracted text; saved history keeps the filename note and the bot's reply, so reattach the file for later questions requiring its original contents. Empty, unreadable, or failed downloads add explanatory notes for the model while valid companion input continues. Explanations of skipped files still depend on the model; the text-file truncation notice is sent directly by the bot.
+
+Unsupported file attachments and oversized supported files are skipped, with a note passed to the chat model; remaining text and supported attachments are processed normally. The explanation to the user depends on the model, so there is no guaranteed rejection message. Unsupported animated stickers are silently skipped; a mention with only such a sticker receives the generic `/help` greeting.
 
 ### Private DMs
 
@@ -187,9 +191,9 @@ You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section 
 
 **Hardware & Parsing Limits:**
 
-- `MAX_FILE_SIZE` (Default: 10MB) - Size limit for direct and replied-to image/PDF attachments and URL downloads.
+- `MAX_FILE_SIZE` (Default: 10 MiB) - Size limit for direct and replied-to image/PDF/text attachments and URL downloads.
 - `MAX_PDF_PAGES` (Default: 15) - Maximum pages read from a PDF.
-- `MAX_TEXT_EXTRACTION_LENGTH` (Default: 40000) - Character limit for text extracted from URLs or PDFs.
+- `MAX_TEXT_EXTRACTION_LENGTH` (Default: 40000) - Character limit per text file or text extracted from each URL/PDF.
 - `MAX_IMAGE_DIMENSION` (Default: 1024) - Images are resized to this maximum width/height to save VRAM.
 - `IMAGE_COMPRESSION_QUALITY` (Default: 85) - Pillow JPEG compression quality.
 - `SCRAPER_TIMEOUT` (Default: 15) - Seconds to wait for web scraping or large native file downloads.

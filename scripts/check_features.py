@@ -126,7 +126,8 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("123 ms" if latency == 0.123 else "Unavailable", text)
                     self.assertIn("**Images/stickers:** " + ("On" if vision else "Off"), text)
                     self.assertIn("**History:** 2/100 messages", text)
-                    self.assertIn("4.0 MB per image/PDF", text)
+                    self.assertIn("4.0 MB per image/PDF/text file", text)
+                    self.assertIn("text files/PDFs", text)
                     self.assertIn("7 PDF pages", text)
                     self.assertIn("12,345 characters", text)
                     self.assertLess(len(text), 600)
@@ -144,6 +145,26 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         text = "".join(chunks)
         self.assertIn(self.client.config.model, text)
         self.assertTrue(text.endswith("compatible chat model."))
+
+    async def test_long_message_text_attachment_reaches_model_without_a_caption(self):
+        body = "Please review this long message.\n" + "café 日本語 🙂\n" * 300
+        data = body.encode("utf-8-sig")
+        message = self.chat(content="")  # Only the bot mention remains outside the file.
+        message.attachments = [SimpleNamespace(
+            filename="message.txt", content_type="text/plain; charset=utf-8", size=len(data),
+            read=AsyncMock(return_value=data),
+        )]
+        self.create.return_value.choices[0].message.tool_calls = []
+        await self.bot.on_message(message)
+        context = str(self.create.call_args.kwargs["messages"])
+        self.assertIn(body, self.create.call_args.kwargs["messages"][-1]["content"])
+        self.assertIn("Extracted Text Content from message.txt", context)
+        message.reply.assert_awaited_once_with("Answer")
+        cursor = await self.client.db_conn.execute("SELECT content FROM chat_history ORDER BY id")
+        saved = str(await cursor.fetchall())
+        self.assertIn("message.txt", saved)
+        self.assertNotIn("Please review this long message", saved)
+        self.assertNotIn("日本語", saved)
 
     async def test_missing_history_uses_normal_message_and_fits_discord_limit(self):
         message = self.chat(history=False)
