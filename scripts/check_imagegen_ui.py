@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import random
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
@@ -251,6 +252,13 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("view", progress.kwargs)
         self.backend.generate.assert_awaited_once_with(literal, 1088, 1920)
         self.assertEqual(len(submission.uploads), 1)
+        final = submission.progress.edit.call_args.kwargs
+        header, _, spoiler = final["content"].partition("\n")
+        self.assertEqual(header, "<@42> · 1088 × 1920 · Generated in 83.2s")
+        self.assertTrue(spoiler.startswith("||") and spoiler.endswith("||"))
+        self.assertEqual(re.sub(r"\\(.)", r"\1", spoiler[2:-2], flags=re.DOTALL), literal)
+        self.assertTrue(final["suppress"])
+        submission.channel.send.assert_awaited_once()
         self.create.assert_not_awaited()
         self.assert_slots_free()
 
@@ -357,6 +365,8 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
     async def test_literal_prompt_and_expired_interaction_deliver_via_normal_message(self):
         interaction = self.interaction()
         literal = "  @everyone <@999> <@&123>\nA café in the rain.\n"
+        literal += "||spoiler|| ```code``` **bold** https://example.com/a_b\n"
+        literal += "[x||VISIBLE||](https://example.com) [x](https://example.com/```VISIBLE```)\n"
         literal += "x" * (4000 - len(literal) - 2) + "  "
         ready, release = asyncio.Event(), asyncio.Event()
 
@@ -390,12 +400,25 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.create.assert_not_awaited()
         self.backend.request.assert_not_awaited()
         interaction.followup.send.assert_not_awaited()
-        interaction.channel.send.assert_awaited_once()
         final = interaction.progress.edit.call_args
         self.assertEqual(final.kwargs["allowed_mentions"].to_dict()["parse"], [])
-        self.assertNotIn(literal, final.kwargs["content"])
-        self.assertIn("864 × 1216", final.kwargs["content"])
-        self.assertIn("Generated in 83.2s", final.kwargs["content"])
+        self.assertTrue(final.kwargs["suppress"])
+        self.assertTrue(final.kwargs["content"].startswith("<@42> · 864 × 1216 · Generated in 83.2s\n||"))
+        messages = [final.kwargs["content"]]
+        for call in interaction.channel.send.call_args_list[1:]:
+            self.assertEqual(call.kwargs["allowed_mentions"].to_dict()["parse"], [])
+            self.assertTrue(call.kwargs["suppress_embeds"])
+            self.assertTrue(call.args[0].startswith("<@42> · Prompt (continued)\n||"))
+            messages.append(call.args[0])
+        self.assertGreater(len(messages), 1)
+        bodies = []
+        for text in messages:
+            self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 2000)
+            body = text.partition("\n")[2]
+            self.assertTrue(body.startswith("||") and body.endswith("||"))
+            self.assertNotIn("||", body[2:-2])
+            bodies.append(body[2:-2])
+        self.assertEqual(re.sub(r"\\(.)", r"\1", "".join(bodies), flags=re.DOTALL), literal)
         self.assertEqual(len(interaction.uploads), 1)
         name, data = interaction.uploads[0]
         self.assertEqual(name, "SPOILER_image.png")
@@ -404,6 +427,47 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("workflow", picture.info)
             self.assertNotIn("prompt", picture.info)
         self.assert_slots_free()
+
+    async def test_prompt_spoilers_preserve_unicode_and_escape_boundaries(self):
+        for literal in ("|" * 4000, "\\" * 4000, "😀" * 4000,
+                        "[x||VISIBLE||](https://example.com)",
+                        "[x](https://example.com/```VISIBLE```)",
+                        "[x](https://example.com/a\\||VISIBLE||)",
+                        "x" * 1895 + "\\||```\n> quote\n# heading\n- bullet\n"):
+            with self.subTest(prompt=literal[:10]):
+                chunks = self.bot.image_prompt_chunks(literal, 1900)
+                bodies = []
+                for chunk in chunks:
+                    self.assertLessEqual(len(chunk.encode("utf-16-le")) // 2, 1900)
+                    self.assertTrue(chunk.startswith("||") and chunk.endswith("||"))
+                    body = chunk[2:-2]
+                    self.assertNotIn("||", body)
+                    self.assertIsNone(re.search(r"(?<!\\)`", body))
+                    self.assertEqual((len(body) - len(body.rstrip("\\"))) % 2, 0)
+                    bodies.append(body)
+                self.assertEqual(re.sub(r"\\(.)", r"\1", "".join(bodies), flags=re.DOTALL), literal)
+
+    async def test_prompt_continuation_failure_keeps_delivered_image_and_explains(self):
+        forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing permissions")
+        for error in (forbidden, TimeoutError(), OSError(), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                interaction = self.interaction()
+                interaction.channel.send.side_effect = [interaction.progress, error]
+                if isinstance(error, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.bot.run_imagegen(interaction, "x" * 4000, 1024, 1024)
+                else:
+                    await self.bot.run_imagegen(interaction, "x" * 4000, 1024, 1024)
+                self.assertEqual(len(interaction.uploads), 1)
+                self.assertEqual(interaction.uploads[0][0], "SPOILER_image.png")
+                final = interaction.progress.edit.call_args.kwargs
+                self.assertNotIn("attachments", final)
+                self.assertIn("Generated in 83.2s\n||", final["content"])
+                self.assertTrue(final["content"].endswith("The image is ready, but the rest of the prompt could not be sent."))
+                self.assertLessEqual(len(final["content"]), 2000)
+                self.assertTrue(final["suppress"])
+                self.assertEqual(final["allowed_mentions"].to_dict()["parse"], [])
+                self.assert_slots_free()
 
     async def test_duplicate_user_and_three_pending_limit_then_slots_are_reusable(self):
         ready, release = asyncio.Event(), asyncio.Event()

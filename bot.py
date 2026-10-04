@@ -967,6 +967,22 @@ class ImageGenerationModal(discord.ui.Modal, title="Generate an image (1K–2K)"
         await run_imagegen(interaction, self.prompt.value, width, height)
 
 
+def image_prompt_chunks(prompt, limit):
+    """Keep literal prompt text inside spoilers without breaking escape sequences."""
+    # Escape every delimiter, including those inside Markdown link labels/URLs.
+    escaped = re.sub(r"([\\`*_~|<>\[\]()#+.!{}-])", r"\\\1", prompt)
+    chunks, chunk, size = [], "", 4  # The opening and closing spoiler markers.
+    for token in re.findall(r"\\.|[^\\]", escaped, re.DOTALL):
+        units = len(token.encode("utf-16-le")) // 2
+        if size + units > limit:
+            chunks.append(f"||{chunk}||")
+            chunk, size = "", 4
+        chunk += token
+        size += units
+    chunks.append(f"||{chunk}||")
+    return chunks
+
+
 async def run_imagegen(interaction, prompt, width, height):
     requested = (width, height)
     error = imagegen_permission_error(interaction)
@@ -991,6 +1007,7 @@ async def run_imagegen(interaction, prompt, width, height):
     task = asyncio.current_task()
     client.image_tasks.add(task)
     progress = None
+    image_delivered = False
     mentions = discord.AllowedMentions(users=[interaction.user], roles=False, everyone=False)
     label = f"<@{user_id}> · {width} × {height}"
     try:
@@ -1005,10 +1022,27 @@ async def run_imagegen(interaction, prompt, width, height):
             )
             data, duration = await client.imagegen.generate(prompt, width, height)
             data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
+            header = f"{label} · Generated in {duration:.1f}s\n"
+            continuation = f"<@{user_id}> · Prompt (continued)\n"
+            warning = "\nThe image is ready, but the rest of the prompt could not be sent."
+            chunks = image_prompt_chunks(prompt, 2000 - max(len(header), len(continuation)) - len(warning))
+            content = header + chunks[0]
             with contextlib.closing(discord.File(io.BytesIO(data), filename=filename, spoiler=True)) as attachment:
-                await progress.edit(content=f"{label} · Generated in {duration:.1f}s", attachments=[attachment], allowed_mentions=discord.AllowedMentions.none())
+                await progress.edit(content=content, attachments=[attachment], suppress=True,
+                                    allowed_mentions=discord.AllowedMentions.none())
+            image_delivered = True
+            try:
+                for chunk in chunks[1:]:
+                    await interaction.channel.send(continuation + chunk, suppress_embeds=True,
+                                                   allowed_mentions=discord.AllowedMentions.none())
+            except (Exception, asyncio.CancelledError) as exc:
+                with contextlib.suppress(Exception):
+                    await progress.edit(content=content + warning, suppress=True,
+                                        allowed_mentions=discord.AllowedMentions.none())
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
     except asyncio.CancelledError:
-        if progress is not None:
+        if progress is not None and not image_delivered:
             with contextlib.suppress(discord.HTTPException):
                 await progress.edit(content=f"{label} — image generation stopped because the bot is shutting down.")
         raise
