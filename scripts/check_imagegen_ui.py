@@ -17,11 +17,13 @@ import discord
 from PIL import Image, PngImagePlugin
 
 import check_regressions as fixtures
+import check_features as feature_fixtures
 
 
 class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = fixtures.BotChecks.asyncTearDown
     completion = staticmethod(fixtures.BotChecks.completion)
+    chat = feature_fixtures.FeatureChecks.chat
 
     async def asyncSetUp(self):
         await fixtures.BotChecks.asyncSetUp(self)
@@ -74,6 +76,151 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
     def assert_slots_free(self):
         self.assertEqual(self.client.image_users, set())
         self.assertEqual(self.client.image_tasks, set())
+        self.assertEqual(self.backend.work, {"lmstudio": 0, "comfyui": 0})
+
+    async def test_chat_declines_images_at_every_form_step_in_any_server(self):
+        first = self.chat()
+        second = self.chat(author=84)
+        other = self.chat(server=2)
+        entered, other_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        seen = []
+
+        async def handle(message, *args):
+            seen.append(message)
+            (other_entered if message is other else entered).set()
+            await release.wait()
+
+        with patch.object(self.bot, "handle_server_message", side_effect=handle):
+            tasks = [asyncio.create_task(self.bot.on_message(first))]
+            try:
+                await asyncio.wait_for(entered.wait(), 1)
+                tasks += [asyncio.create_task(self.bot.on_message(message)) for message in (second, other)]
+                await asyncio.wait_for(other_entered.wait(), 1)
+                self.assertNotIn(second, seen)
+                for server in (1, 2, 3):
+                    for step in ("command", "resolution", "button", "prompt"):
+                        with self.subTest(server=server, step=step):
+                            interaction = self.interaction(server_id=server)
+                            if step == "command":
+                                await self.bot.cmd_imagegen.callback(interaction)
+                            elif step == "resolution":
+                                modal = self.fill(self.bot.ImageResolutionModal(), width="1024", height="1024")
+                                await modal.on_submit(interaction)
+                            elif step == "button":
+                                view = self.bot.ImagePromptView(interaction.user.id, 1024, 1024)
+                                await view.children[0].callback(interaction)
+                            else:
+                                await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
+                            reply = interaction.response.send_message.call_args
+                            self.assertIn("Chat is active right now", reply.args[0])
+                            self.assertTrue(reply.kwargs["ephemeral"])
+                            interaction.response.send_modal.assert_not_awaited()
+                            interaction.response.defer.assert_not_awaited()
+                            interaction.channel.send.assert_not_awaited()
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+        self.assertEqual(seen, [first, other, second])
+        self.backend.generate.assert_not_awaited()
+        self.assert_slots_free()
+        await self.bot.cmd_imagegen.callback(self.interaction())
+
+    async def test_image_reserves_before_discord_ack_and_declines_chat_without_history_changes(self):
+        interaction = self.interaction()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def defer(**kwargs):
+            entered.set()
+            await release.wait()
+
+        interaction.response.defer.side_effect = defer
+        task = asyncio.create_task(self.bot.run_imagegen(interaction, "A tree", 1024, 1024))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.backend.generate.assert_not_awaited()
+            # Even a previously selected cloud fallback must not bypass UI admission.
+            self.client.chat_dead_until = float("inf")
+            with patch.object(self.bot, "handle_server_message", new=AsyncMock()) as handle:
+                for server in (1, 2):
+                    for history in (True, False):
+                        message = self.chat(server=server, history=history)
+                        await asyncio.wait_for(self.bot.on_message(message), 1)
+                        reply = message.reply if history else message.channel.send
+                        self.assertIn("Image generation is active right now", reply.call_args.args[0])
+                handle.assert_not_awaited()
+            self.assertEqual(await fixtures.BotChecks.count(self, "chat_history"), 0)
+            self.assertEqual(await fixtures.BotChecks.count(self, "pending_memories"), 0)
+            self.create.assert_not_awaited()
+        finally:
+            release.set()
+            await task
+        self.assert_slots_free()
+
+    async def test_queued_chat_blocks_images_until_cancelled_or_invalidated(self):
+        for action in ("cancel", "clear"):
+            with self.subTest(action=action):
+                lock = self.client.conversation_locks["1"] = asyncio.Lock()
+                await lock.acquire()
+                with patch.object(self.bot, "handle_server_message", new=AsyncMock()) as handle:
+                    task = asyncio.create_task(self.bot.on_message(self.chat()))
+                    try:
+                        await asyncio.sleep(0)
+                        interaction = self.interaction(server_id=2)
+                        await self.bot.cmd_imagegen.callback(interaction)
+                        self.assertIn("Chat is active right now", interaction.response.send_message.call_args.args[0])
+                        if action == "cancel":
+                            task.cancel()
+                            with self.assertRaises(asyncio.CancelledError):
+                                await task
+                        else:
+                            self.client.conversation_versions["1"] = self.client.conversation_versions.get("1", 0) + 1
+                    finally:
+                        lock.release()
+                        await asyncio.gather(task, return_exceptions=True)
+                    handle.assert_not_awaited()
+                    self.assert_slots_free()
+        with patch.object(self.bot, "handle_server_message", side_effect=RuntimeError("Synthetic failure")):
+            with self.assertRaises(RuntimeError):
+                await self.bot.on_message(self.chat())
+        self.assert_slots_free()
+
+    async def test_four_chats_keep_three_processing_slots_and_queue_the_fourth(self):
+        self.backend.backend = "lmstudio"
+        entered, release = asyncio.Event(), asyncio.Event()
+        active = peak = 0
+
+        async def infer(**kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == 3:
+                entered.set()
+            try:
+                await release.wait()
+                response = self.completion("Answer")
+                response.choices[0].message.tool_calls = []
+                return response
+            finally:
+                active -= 1
+
+        self.create.side_effect = infer
+        messages = [self.chat(server=server) for server in range(1, 5)]
+        with patch.object(self.bot, "build_ai_context", new=AsyncMock(return_value=[])):
+            tasks = [asyncio.create_task(self.bot.on_message(message)) for message in messages]
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                self.assertEqual(self.create.await_count, 3)
+                self.assertTrue(all(not task.done() for task in tasks))
+                interaction = self.interaction(server_id=5)
+                await self.bot.cmd_imagegen.callback(interaction)
+                self.assertIn("Chat is active right now", interaction.response.send_message.call_args.args[0])
+            finally:
+                release.set()
+                await asyncio.gather(*tasks)
+        self.assertEqual(self.create.await_count, 4)
+        self.assertEqual(peak, 3)
+        self.assertTrue(all(message.reply.await_count == 1 for message in messages))
+        self.assert_slots_free()
 
     async def test_resolution_then_private_button_then_prompt_keeps_selected_size(self):
         interaction = self.interaction()
