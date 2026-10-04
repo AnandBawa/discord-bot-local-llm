@@ -67,12 +67,19 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def interaction(user_id=42, server_id=1, *, channel_id=None):
+        resolved_channel_id = channel_id if channel_id is not None else server_id * 10
         return SimpleNamespace(
-            guild_id=server_id, channel_id=channel_id if channel_id is not None else server_id * 10,
+            guild_id=server_id, channel_id=resolved_channel_id,
+            channel=SimpleNamespace(id=resolved_channel_id, send=AsyncMock(
+                return_value=SimpleNamespace(edit=AsyncMock()),
+            )),
             user=SimpleNamespace(id=user_id),
             permissions=SimpleNamespace(administrator=True),
             response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(
+                flags=SimpleNamespace(ephemeral=False), edit=AsyncMock(),
+            ))),
+            edit_original_response=AsyncMock(),
         )
 
     async def seed(self, count=2, server_id="channel:10"):
@@ -239,9 +246,181 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.bot.get_persona("channel:20"), "Other persona")
                 cursor = await self.client.db_conn.execute("SELECT server_id FROM chat_history")
                 self.assertEqual(await cursor.fetchall(), [("channel:20",), ("channel:20",)])
-                self.assertIn("cleared", interaction.followup.send.call_args.args[0])
-                self.assertNotIn("extraction", interaction.followup.send.call_args.args[0].lower())
+                confirmation = (interaction.followup.send.call_args.args[0] if prompt is None else
+                                interaction.followup.send.return_value.edit.call_args.kwargs["content"])
+                self.assertIn("cleared", confirmation)
+                self.assertNotIn("extraction", confirmation.lower())
         self.create.assert_not_awaited()
+
+    async def test_role_changes_require_public_reply_before_mutating_shared_state(self):
+        for prompt in ("Friendly", "clear", "@everyone ||persona|| 🙂 " * 200):
+            with self.subTest(prompt=prompt[:30]):
+                await self.bot.cmd_role.callback(self.interaction(), "Original")
+                await self.seed()
+                version = self.client.conversation_versions["channel:10"]
+                interaction = self.interaction(user_id=84)
+                # Installation context must not change the shared channel scope.
+                interaction.guild = None
+                interaction.permissions = self.bot.discord.Permissions.none()
+                interaction.app_permissions = self.bot.discord.Permissions.none()
+                announcement = SimpleNamespace(flags=SimpleNamespace(ephemeral=False), edit=AsyncMock())
+
+                async def post(content, **kwargs):
+                    self.assertEqual(await self.bot.get_persona("channel:10"), "Original")
+                    self.assertEqual(await self.count("chat_history"), 2)
+                    self.assertEqual(self.client.conversation_versions["channel:10"], version)
+                    self.assertFalse(self.client.db_lock.locked())
+                    self.assertLess(len(content), 2000)
+                    self.assertFalse(kwargs["ephemeral"])
+                    self.assertTrue(kwargs["wait"])
+                    self.assertEqual(kwargs["allowed_mentions"].to_dict()["parse"], [])
+                    return announcement
+
+                interaction.followup.send.side_effect = post
+                await self.bot.cmd_role.callback(interaction, prompt)
+                persona = self.bot.DEFAULT_PERSONA if prompt == "clear" else prompt
+                self.assertEqual(await self.bot.get_persona("channel:10"), persona)
+                self.assertEqual(await self.count("chat_history"), 0)
+                self.assertEqual(self.client.conversation_versions["channel:10"], version + 1)
+                parts = [call.args[0] for call in interaction.followup.send.call_args_list]
+                displayed = parts[0].split("**Requested Persona:**\n> ", 1)[1] + "".join(parts[1:])
+                self.assertEqual(displayed, persona)
+                interaction.channel.send.assert_not_awaited()
+                interaction.response.defer.assert_awaited_once_with(ephemeral=False)
+                announcement.edit.assert_awaited_once()
+                content = announcement.edit.call_args.kwargs["content"]
+                action = "Persona removed" if prompt == "clear" else "Saved persona"
+                self.assertTrue(content.startswith(f"✅ {action} and history cleared!\n\n**Current Persona:**\n> "))
+                self.assertEqual(content.split("**Current Persona:**\n> ", 1)[1] + "".join(parts[1:]), persona)
+                self.assertLess(len(content), 2000)
+                self.assertEqual(announcement.edit.call_args.kwargs["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_private_or_unconfirmed_role_reply_preserves_shared_state(self):
+        await self.bot.cmd_role.callback(self.interaction(), "Original")
+        await self.seed()
+        version = self.client.conversation_versions["channel:10"]
+        for result in (SimpleNamespace(flags=SimpleNamespace(ephemeral=True)), None,
+                       SimpleNamespace(), SimpleNamespace(flags=SimpleNamespace(ephemeral=None))):
+            for prompt in ("Changed", "clear"):
+                with self.subTest(result=result, prompt=prompt):
+                    interaction = self.interaction()
+                    interaction.followup.send.return_value = result
+                    await self.bot.cmd_role.callback(interaction, prompt)
+                    self.assertEqual(await self.bot.get_persona("channel:10"), "Original")
+                    self.assertEqual(await self.count("chat_history"), 2)
+                    self.assertEqual(self.client.conversation_versions["channel:10"], version)
+                    self.assertIn("not changed", interaction.edit_original_response.call_args.kwargs["content"])
+                    interaction.channel.send.assert_not_awaited()
+
+    async def test_incomplete_public_persona_display_cannot_change_shared_state(self):
+        await self.seed()
+        results = [
+            self.bot.discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "denied"),
+            TimeoutError(), asyncio.CancelledError(), SimpleNamespace(flags=SimpleNamespace(ephemeral=True)),
+        ]
+        for result in results:
+            with self.subTest(result=type(result).__name__):
+                interaction = self.interaction()
+                announcement = SimpleNamespace(flags=SimpleNamespace(ephemeral=False), edit=AsyncMock())
+                interaction.followup.send.side_effect = [announcement, result]
+                if isinstance(result, asyncio.CancelledError):
+                    with self.assertRaises(asyncio.CancelledError):
+                        await self.bot.cmd_role.callback(interaction, "Long persona " * 400)
+                    interaction.edit_original_response.assert_not_awaited()
+                else:
+                    await self.bot.cmd_role.callback(interaction, "Long persona " * 400)
+                    self.assertIn("not changed", interaction.edit_original_response.call_args.kwargs["content"])
+                self.assertEqual(interaction.followup.send.await_count, 2)
+                announcement.edit.assert_not_awaited()
+                self.assertEqual(await self.count("server_config"), 0)
+                self.assertEqual(await self.count("chat_history"), 2)
+                self.assertEqual(self.client.conversation_versions, {})
+
+    async def test_role_public_reply_failures_preserve_persona_history_and_version(self):
+        await self.bot.cmd_role.callback(self.interaction(), "Original")
+        await self.seed()
+        version = self.client.conversation_versions["channel:10"]
+        errors = [
+            self.bot.discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "denied"),
+            self.bot.discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "deleted thread"),
+            self.bot.discord.HTTPException(SimpleNamespace(status=500, reason="Server Error"), "failed"),
+            aiohttp.ClientConnectionError("disconnected"), OSError("connection lost"), TimeoutError(),
+        ]
+        for prompt in ("Changed", "clear"):
+            for error in errors:
+                with self.subTest(prompt=prompt, error=type(error).__name__):
+                    interaction = self.interaction()
+                    interaction.followup.send.side_effect = error
+                    await self.bot.cmd_role.callback(interaction, prompt)
+                    self.assertEqual(await self.bot.get_persona("channel:10"), "Original")
+                    self.assertEqual(await self.count("chat_history"), 2)
+                    self.assertEqual(self.client.conversation_versions["channel:10"], version)
+                    self.assertIn("not changed", interaction.edit_original_response.call_args.kwargs["content"])
+
+    async def test_cancelled_role_announcement_cannot_change_shared_state(self):
+        await self.seed()
+        entered = asyncio.Event()
+
+        async def blocked_post(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        interaction = self.interaction()
+        interaction.followup.send.side_effect = blocked_post
+        task = asyncio.create_task(self.bot.cmd_role.callback(interaction, "Changed"))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(await self.count("server_config"), 0)
+        self.assertEqual(await self.count("chat_history"), 2)
+        self.assertEqual(self.client.conversation_versions, {})
+        interaction.edit_original_response.assert_not_awaited()
+
+    async def test_role_completion_edit_failure_retains_announced_change(self):
+        for error in (TimeoutError(), self.bot.discord.Forbidden(
+                SimpleNamespace(status=403, reason="Forbidden"), "denied")):
+            with self.subTest(error=type(error).__name__):
+                interaction = self.interaction()
+                interaction.followup.send.return_value.edit.side_effect = error
+                await self.seed()
+                await self.bot.cmd_role.callback(interaction, "Changed")
+                self.assertEqual(await self.bot.get_persona("channel:10"), "Changed")
+                self.assertEqual(await self.count("chat_history"), 0)
+                self.assertEqual(interaction.followup.send.await_count, 2)
+                self.assertIn("Saved persona", interaction.followup.send.call_args.args[0])
+                self.assertNotIn("not changed", interaction.followup.send.call_args.args[0])
+                self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
+
+    async def test_role_failed_database_change_does_not_announce_completion(self):
+        await self.seed()
+        await self.client.db_conn.execute(
+            "CREATE TEMP TRIGGER fail_persona BEFORE INSERT ON server_config "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END",
+        )
+        interaction = self.interaction()
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await self.bot.cmd_role.callback(interaction, "Changed")
+        self.assertEqual(await self.count("server_config"), 0)
+        self.assertEqual(await self.count("chat_history"), 2)
+        self.assertEqual(self.client.conversation_versions, {})
+        interaction.followup.send.assert_awaited_once()
+        interaction.followup.send.return_value.edit.assert_not_awaited()
+
+    async def test_role_view_needs_no_public_post_and_keeps_history(self):
+        await self.bot.cmd_role.callback(self.interaction(), "Original")
+        await self.seed()
+        version = self.client.conversation_versions["channel:10"]
+        interaction = self.interaction()
+        interaction.followup.send.return_value = SimpleNamespace(flags=SimpleNamespace(ephemeral=True))
+        await self.bot.cmd_role.callback(interaction)
+        self.assertIn("Original", interaction.followup.send.call_args.args[0])
+        interaction.response.defer.assert_awaited_once_with(ephemeral=False)
+        interaction.channel.send.assert_not_awaited()
+        self.assertEqual(await self.count("chat_history"), 2)
+        self.assertEqual(self.client.conversation_versions["channel:10"], version)
 
     async def test_failed_clear_rolls_back_history(self):
         await self.seed()

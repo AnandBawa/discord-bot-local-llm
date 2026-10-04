@@ -1096,14 +1096,55 @@ async def cmd_imagegen(interaction: discord.Interaction):
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
 async def cmd_role(interaction: discord.Interaction, prompt: str = None):
     server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
-    await interaction.response.defer()
-    
+    await interaction.response.defer(ephemeral=bool(prompt) and interaction.guild_id is None)
+
     if not prompt:
         current_role = await get_persona(server_id)
         await interaction.followup.send(f"**Current Persona:**\n> *{current_role}*")
         return
 
     new_prompt = "" if prompt.lower() == "clear" else prompt
+    action = "Saved persona" if new_prompt else "Persona removed"
+    saved_header = f"✅ {action} and history cleared!\n\n**Current Persona:**\n> "
+    persona = new_prompt or DEFAULT_PERSONA
+    announcement = None
+    if interaction.guild_id is not None:
+        pending_header = (
+            "⏳ Persona change requested. Applying it will clear this conversation's history."
+            "\n\n**Requested Persona:**\n> "
+        )
+        first_size = DISCORD_CHUNK_LIMIT - max(len(pending_header), len(saved_header))
+        first_part, remaining = persona[:first_size], persona[first_size:]
+        parts = [pending_header + first_part] + [
+            remaining[offset:offset + DISCORD_CHUNK_LIMIT]
+            for offset in range(0, len(remaining), DISCORD_CHUNK_LIMIT)
+        ]
+        posted = False
+        try:
+            async with asyncio.timeout(15):
+                for part in parts:
+                    reply = await interaction.followup.send(
+                        part, ephemeral=False, wait=True, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    # Discord can force personal-app replies private despite ephemeral=False.
+                    if getattr(getattr(reply, "flags", None), "ephemeral", True) is not False:
+                        break
+                    if announcement is None:
+                        announcement = reply
+                else:
+                    posted = True
+        except (discord.HTTPException, aiohttp.ClientError, OSError, TimeoutError):
+            pass
+        if not posted:
+            with contextlib.suppress(discord.HTTPException, aiohttp.ClientError, OSError, TimeoutError):
+                async with asyncio.timeout(15):
+                    await interaction.edit_original_response(
+                        content="I couldn't post a public persona announcement here. "
+                        "The persona and history were not changed.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            return
+
     async with history_transaction():
         await delete_history(server_id)
         await client.db_conn.execute(
@@ -1111,10 +1152,22 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
             "ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt),
         )
         client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
-    action = "Saved persona" if new_prompt else "Persona removed"
-    await interaction.followup.send(
-        f"✅ {action} and history cleared!\n\n**Current Persona:**\n> {new_prompt or DEFAULT_PERSONA}"
-    )
+
+    if announcement is not None:
+        # Edit the same public reply to preserve Discord's 'member used /role' header.
+        try:
+            async with asyncio.timeout(15):
+                await announcement.edit(
+                    content=saved_header + first_part, allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except (discord.HTTPException, aiohttp.ClientError, OSError, TimeoutError):
+            await interaction.followup.send(
+                f"✅ {action} and history cleared, but I couldn't update the public announcement. "
+                "Use `/role` to view the current persona.", ephemeral=True,
+            )
+        return
+    await interaction.followup.send(saved_header + persona, ephemeral=True)
+
 
 @tree.command(name="clear", description="Clear the saved conversation in this channel or DM.")
 @app_commands.default_permissions(manage_messages=True)

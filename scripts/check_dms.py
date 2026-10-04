@@ -271,6 +271,25 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(await self.history(f"dm:{user}")), 2)
         self.assertEqual(self.create.await_count, requests_before_restart)
 
+    async def test_dm_role_changes_stay_private_and_need_no_public_announcement(self):
+        await self.seed(server_id="channel:420")
+        await self.seed(server_id="dm:84")
+        for prompt in ("Private persona", "clear"):
+            with self.subTest(prompt=prompt):
+                await self.seed(server_id="dm:42")
+                interaction = self.interaction()
+                interaction.channel.send.side_effect = AssertionError("No public announcement in a DM")
+                await self.bot.cmd_role.callback(interaction, prompt)
+                interaction.channel.send.assert_not_awaited()
+                interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+                self.assertTrue(interaction.followup.send.call_args.kwargs["ephemeral"])
+                expected = self.bot.DEFAULT_PERSONA if prompt == "clear" else prompt
+                self.assertIn(expected, interaction.followup.send.call_args.args[0])
+                self.assertEqual(await self.bot.get_persona("dm:42"), expected)
+                self.assertEqual(await self.history("dm:42"), [])
+                self.assertEqual(len(await self.history("dm:84")), 2)
+                self.assertEqual(len(await self.history("channel:420")), 2)
+
     async def test_status_counts_only_the_callers_dm_history(self):
         for key, count in (("dm:42", 2), ("dm:84", 4), ("channel:420", 6)):
             await self.seed(count=count, server_id=key)
