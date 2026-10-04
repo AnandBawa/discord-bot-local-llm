@@ -1,6 +1,6 @@
 # Discord AI Bot
 
-A Discord server bot with a shared conversation and persona, plus remembered facts associated with members. It connects to local OpenAI-compatible chat and embedding endpoints, with optional cloud fallback, web search, PDF extraction, and image analysis.
+A Discord server bot with a shared conversation and persona, plus remembered facts associated with members. It connects to local OpenAI-compatible chat and embedding endpoints, with optional cloud fallback, web search, PDF extraction, image analysis, and ComfyUI image generation.
 
 ## Key Features
 
@@ -9,6 +9,7 @@ A Discord server bot with a shared conversation and persona, plus remembered fac
 - **Ordered Conversations:** Chat turns run in arrival order within each server, including across channels. Different servers can progress concurrently, subject to the existing global limit of three chat/memory-extraction LLM tasks.
 - **Cloud Fallback:** Chat and memory extraction share local/cloud routing. Embeddings have an independent failure cooldown. A chat turn stays on its selected fallback throughout tool calls. Both chat SDK clients use a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
+- **Image Generation:** `/imagegen` asks for dimensions, then a prompt, and posts one image from the bundled Krea 2 ComfyUI workflow. The bot calculates the closest supported size up to 2048 pixels per side and passes the prompt unchanged. Local chat/embedding work and image generation share the GPU, unloading models only when switching between LM Studio and ComfyUI.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Results include source URLs; the bot requests citations and appends up to three search source links if omitted from the answer.
 - **URL and Document Parsing:** Extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
@@ -70,6 +71,12 @@ FALLBACK_EMB_API_KEY=
 # Memory Tuning (Optional)
 
 MEMORY_DISTANCE_THRESHOLD=0.45
+
+# ComfyUI Image Generation (Optional; blank disables it)
+# Use the Windows server address reachable from WSL, without /v1.
+
+COMFYUI_BASE_URL=
+IMAGEGEN_TIMEOUT=600
 ```
 
 4. **Run the Bot:**
@@ -89,6 +96,8 @@ python scripts/check_dependencies.py
 python scripts/check_regressions.py
 python scripts/check_features.py
 python scripts/check_refactor.py
+python scripts/check_imagegen.py
+python scripts/check_imagegen_ui.py
 ```
 
 The check uses synthetic messages, mocked API responses, and temporary databases. It verifies command registration, SDK timeouts and tool calls, SQLite history, Chroma memory, image processing, and PDF extraction without loading `.env` or logging in to Discord.
@@ -98,6 +107,8 @@ The regression checks cover URL restrictions, forgetting during background work,
 The feature checks cover missing Discord permissions, search queries and sources, explicit memory saves and retries, scoped clearing, and conversation ordering across servers. The dependency check also exercises saving and retry after a failed database acknowledgement with real temporary SQLite and Chroma storage.
 
 The refactor checks cover import/startup behavior, literal JSON history, image/sticker payloads, direct/replied attachment limits, failed downloads, persona recovery, transaction rollback/cancellation, shutdown cleanup, independent provider cooldowns, and tool-loop limits. The plain-text history format follows the owner's data reset; no decoder or migration for the former mixed text/JSON history is included.
+
+The image-generation checks cover both forms, resolution rounding, unchanged prompts, channel/thread permissions, queue limits, attachment delivery/compression, and GPU handoffs in both directions. They also cover concurrent local calls, cancellation during submission or embedding, uncertain submissions, fallback routing, and LM Studio model aliases. They use synthetic API responses and image files; they do not start the servers or test real GPU memory release.
 
 History removed by pruning, `/clear`, or `/role` is retained in a `pending_memories` table until extraction succeeds. The bot retries in the background and after restart. Forget/wipe commands also remove this retained input and invalidate unfinished responses. The table is created automatically in the existing SQLite database.
 
@@ -119,7 +130,8 @@ Unsupported file attachments and oversized images/PDFs are skipped, with a note 
 ### Slash Commands (`/`)
 
 - **`/help`**: Display the command guide (Ephemeral - only visible to you).
-- **`/status`**: Show ping, server history, chat/memory models, supported inputs, and key limits. Model lines reflect each service's most recent successful request across the bot; fallback appears on the relevant model line only after successful use. Before first use, the configured primary models are shown. The command makes no provider requests. Images and web search require a compatible chat model.
+- **`/status`**: Show ping, server history, chat/memory models, supported inputs, image-generation configuration, and key limits. Model lines reflect each service's most recent successful request across the bot; fallback appears on the relevant model line only after successful use. Before first use, the configured primary models are shown. The command makes no provider requests. Image analysis and web search require a compatible chat model.
+- **`/imagegen`**: Enter width and height, review the chosen size, then press **Enter prompt**. Submit a prompt of up to 4000 characters to generate an image in the channel. Available to all members when ComfyUI and channel permissions are configured; see setup below.
 - **`/role`**: View the shared persona, or change it and start a fresh server conversation. Extraction input from the previous conversation is retained until processing succeeds. Type `clear` to restore the neutral default.
 - **`/remember fact:...`**: Save a fact about yourself immediately, up to 500 characters. The confirmation is private; the saved fact is shared server memory.
 - **`/memory`**: List tracked users, read facts (your own by default), or clear your own saved facts and conversation data in the current server. `target_user` applies only to reading.
@@ -138,6 +150,25 @@ Memory command examples:
 `/remember` adds a fact; it does not edit or replace existing facts. Indexing retries if the embedding service or Chroma is unavailable. Up to 20 recent pending explicit facts are included directly in chat context while waiting for indexing. `/memory action:clear` removes your saved facts, retained extraction input, and saved conversation in the current server. Individual fact editing and deletion are not available.
 
 The per-server conversation queue also covers context loading and saving replies. Slow requests delay later turns in that server. Clear, forget, persona changes, and explicit memory changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
+
+## Image Generation Setup
+
+1. Keep your working ComfyUI installation on Windows, with the models and custom nodes used by [krea2.json](krea2.json). Use a current ComfyUI server that supports client-supplied prompt IDs, `/api/jobs/{job_id}/cancel`, and the built-in `PreviewAny` node. The bot submits the API workflow directly; you do not need to queue it manually in the ComfyUI UI. See [ComfyUI's server API](https://docs.comfy.org/development/comfyui-server/comms_routes) and [job cancellation implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/server.py).
+2. Set `COMFYUI_BASE_URL` in the bot's `.env` to the Windows server's root URL, for example `http://localhost:8188` **if that is its actual port and localhost is reachable from WSL**. Mirrored WSL networking supports Windows localhost; default NAT networking normally needs the Windows host IP and ComfyUI listening on a reachable interface. Use the same host arrangement that works for LM Studio, with ComfyUI's port. See [Microsoft's WSL networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking).
+3. Run LM Studio's API server as well. Image generation requires its native model-management API (LM Studio 0.4 or newer), in addition to the existing `/v1` endpoint. Enable **Just-in-Time model loading** so chat and embedding requests can reload their configured models after images. Disable **Idle TTL / automatic unloading** and **Auto-Evict / only keep the last JIT model** in server settings to keep the chat and embedding models loaded until the bot switches to ComfyUI. The bot unloads its configured LM Studio models before images and frees ComfyUI models before returning to LM Studio. See [LM Studio model unloading](https://lmstudio.ai/docs/developer/rest/unload) and [JIT loading and TTL](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict).
+4. Grant the bot **Attach Files**, **View Channel**, and **Send Messages** in the destination channel, or **Send Messages in Threads** inside a thread/post. **Read Message History is not required.** Effective channel overrides apply. A server administrator must grant missing permissions. Restart the bot with `python bot.py` to register `/imagegen`.
+
+For reliable reloads across bot restarts, use each model's native `key` from [LM Studio's `GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list) for `LLM_MODEL_NAME` and `EMB_MODEL_NAME`. A custom alias that is already loaded can be resolved while the bot runs, but that mapping is not saved across restarts. Keep your desired load settings saved in LM Studio for JIT loading.
+
+The resolution form accepts 64–2048 for each side. Each dimension rounds to the nearest multiple of 16; ties round up. For example, **1080 × 1920 becomes 1088 × 1920**. Krea 2 uses multiples of 16; model quality at unusual aspect ratios or very small sizes is not guaranteed by this input check. See [Krea 2's resolution guidance](https://github.com/krea-ai/krea-2#usage).
+
+The bot writes the unmodified prompt to **#48 Positive** and the calculated dimensions to **#232** and **#324**, then reads the image from **#213 SaveImage**. The disconnected manual resolution presets have been removed; #324 now scales to the selected final dimensions. The workflow's model, LoRAs, sampler, and other generation settings remain in `krea2.json`. No chat-model request is used to rewrite the prompt or calculate the size. `VISION_ENABLED` affects image analysis, not generation.
+
+One image runs at a time, with at most three waiting/running image requests across the bot and one per member. Local chat, memory extraction, and embeddings wait while an image uses the GPU; existing local concurrency resumes afterward. Cloud fallbacks do not need the local GPU. Switching happens only when a request needs the other backend, including background memory work. Keep these servers dedicated to the bot while it manages the shared GPU; independent manual requests cannot participate in its lock. The bot refuses to unload unrelated LM Studio models or interrupt unrelated ComfyUI jobs.
+
+Forms are private; the result is posted in the channel. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the server's attachment limit, and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's chat or memory history.
+
+`IMAGEGEN_TIMEOUT` defaults to 600 seconds per submitted workflow; waiting for the GPU is separate. Timed-out or interrupted jobs are cancelled by their own ID. If ComfyUI cannot confirm a submission/cancellation, the bot blocks another GPU handoff rather than risking overlapping models. Check the ComfyUI queue and connectivity before retrying. Waiting image requests are not persisted across bot restarts. Leave `COMFYUI_BASE_URL` blank to disable this feature.
 
 ## Embedding Models
 

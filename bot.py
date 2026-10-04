@@ -13,6 +13,7 @@ import hashlib
 import ipaddress
 import uuid
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pymupdf
@@ -47,6 +48,10 @@ class Config:
         self.fallback_model = env.get("FALLBACK_MODEL_NAME", "")
         self.embedding_key = env.get("FALLBACK_EMB_API_KEY", "")
         self.memory_distance = float(env.get("MEMORY_DISTANCE_THRESHOLD", "0.4"))
+        self.comfy_url = env.get("COMFYUI_BASE_URL", "").strip().rstrip("/")
+        self.image_timeout = float(env.get("IMAGEGEN_TIMEOUT", "600"))
+        if not math.isfinite(self.image_timeout) or self.image_timeout <= 0:
+            raise ValueError("IMAGEGEN_TIMEOUT must be a positive number of seconds")
 
 
 class TerminalTruncatedFormatter(logging.Formatter):
@@ -92,8 +97,9 @@ class JinaAPIEmbeddingFunction:
     
 class LocalAPIEmbeddingFunction:
     """Custom explicit Local API handler with strict fail-fast timeouts."""
-    def __init__(self, base_url: str, api_key: str, model_name: str):
+    def __init__(self, base_url: str, api_key: str, model_name: str, model_resolver=None):
         self.base_url = base_url.rstrip('/')
+        self.model_resolver = model_resolver
         self.api_key = api_key
         self.model_name = model_name
 
@@ -103,7 +109,7 @@ class LocalAPIEmbeddingFunction:
             "Authorization": f"Bearer {self.api_key}"
         }
         data = {
-            "model": self.model_name,
+            "model": self.model_resolver(self.model_name) if self.model_resolver else self.model_name,
             "input": input_texts
         }
         # Tuple: (2 seconds to connect, 15 seconds to read)
@@ -142,6 +148,359 @@ class ResilientEmbeddingFunction:
                 return result
             raise
 
+class ImageGenerationError(Exception):
+    """A failure that can be explained to the person requesting an image."""
+    def __init__(self, message, *, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+IMAGEGEN_MAX_SIDE = 2048
+IMAGEGEN_MIN_SIDE = 64
+IMAGEGEN_MAX_PENDING = 3
+IMAGEGEN_POLL_INTERVAL = 1.0
+IMAGEGEN_SWITCH_TIMEOUT = 60.0
+IMAGEGEN_DOWNLOAD_LIMIT = 32 * 1024 * 1024
+
+
+def image_resolution(width, height):
+    """Nearest supported dimensions; ties round up, with at most 2048 per side."""
+    if any(type(side) is not int or not IMAGEGEN_MIN_SIDE <= side <= IMAGEGEN_MAX_SIDE
+           for side in (width, height)):
+        raise ImageGenerationError("Enter a width and height between 64 and 2048 pixels.")
+    return tuple(min(IMAGEGEN_MAX_SIDE, ((side + 8) // 16) * 16) for side in (width, height))
+
+
+async def finish_model_call(awaitable):
+    """Do not release GPU access while a cancelled request/thread is still running."""
+    task = asyncio.ensure_future(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(task)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            task.result()
+        raise
+
+
+class ImageGeneration:
+    """ComfyUI jobs and shared access to the local GPU."""
+    def __init__(self, config):
+        self.config = config
+        self.comfy_url = config.comfy_url.rstrip("/")
+        self.lm_url = config.base_url.rstrip("/").removesuffix("/v1") + "/api/v1"
+        self.session = None
+        self.backend = None
+        self.comfy_contacted = False
+        self.entry = asyncio.Lock()
+        self.local_active = 0
+        self.local_idle = asyncio.Event()
+        self.local_idle.set()
+        self.active_job = None
+        self.submission_uncertain = False
+        self.model_keys = {}
+
+    def resolve_model(self, name):
+        return self.model_keys.get(name, name)
+
+    async def close(self):
+        if self.session is not None:
+            await self.session.close()
+
+    async def request(self, backend, method, path, *, body=None, params=None, binary=False):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, connect=3),
+            )
+        base = self.comfy_url if backend == "comfyui" else self.lm_url
+        headers = {"Authorization": f"Bearer {self.config.api_key}"} if backend == "lmstudio" else {}
+        async with self.session.request(method, base + path, json=body, params=params,
+                                        headers=headers, allow_redirects=False) as response:
+            if not 200 <= response.status < 300:
+                raise ImageGenerationError(
+                    f"{backend} returned HTTP {response.status}. Check its server and configuration.", status=response.status
+                )
+            limit = IMAGEGEN_DOWNLOAD_LIMIT if binary else 2 * 1024 * 1024
+            data = bytearray()
+            async for chunk in response.content.iter_chunked(65536):
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise ImageGenerationError(f"{backend} returned a response that is too large.")
+            if binary:
+                return bytes(data)
+            if not data:
+                return {}
+            try:
+                return json.loads(data)
+            except (ValueError, UnicodeError) as exc:
+                raise ImageGenerationError(f"{backend} returned an invalid response.") from exc
+
+    async def queue(self):
+        data = await self.request("comfyui", "GET", "/queue")
+        self.comfy_contacted = True
+        if not isinstance(data, dict) or any(not isinstance(data.get(key), list)
+                                             for key in ("queue_running", "queue_pending")):
+            raise ImageGenerationError("ComfyUI returned an invalid queue response.")
+        return data
+
+    async def require_comfy_idle(self):
+        if self.submission_uncertain:
+            await self.cancel_job()
+        queue = await self.queue()
+        if queue["queue_running"] or queue["queue_pending"]:
+            raise ImageGenerationError("ComfyUI has unfinished jobs. Wait for them to finish and try again.")
+        self.active_job = None
+
+    async def loaded_lm_models(self):
+        data = await self.request("lmstudio", "GET", "/models")
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            raise ImageGenerationError("LM Studio's model-management API is unavailable. Use LM Studio 0.4 or newer.")
+        configured = {self.config.model, self.config.embedding_model,
+                      self.resolve_model(self.config.model), self.resolve_model(self.config.embedding_model)}
+        owned, other = [], []
+        for model in data["models"]:
+            if not isinstance(model, dict) or not isinstance(model.get("loaded_instances"), list):
+                raise ImageGenerationError("LM Studio returned invalid model information.")
+            for instance in model["loaded_instances"]:
+                instance_id = instance.get("id") if isinstance(instance, dict) else None
+                if not isinstance(instance_id, str) or not instance_id:
+                    raise ImageGenerationError("LM Studio returned an invalid loaded model identifier.")
+                key = model.get("key")
+                if not isinstance(key, str) or not key:
+                    raise ImageGenerationError("LM Studio returned an invalid model key.")
+                target = owned if key in configured or instance_id in configured else other
+                if instance_id in configured:
+                    self.model_keys[instance_id] = key
+                target.append(instance_id)
+        return owned, other
+
+    async def unload_lm(self):
+        owned, other = await self.loaded_lm_models()
+        if other:
+            raise ImageGenerationError("Another LM Studio model is loaded. Unload it before generating images.")
+        for instance_id in owned:
+            await self.request("lmstudio", "POST", "/models/unload", body={"instance_id": instance_id})
+        async with asyncio.timeout(IMAGEGEN_SWITCH_TIMEOUT):
+            while owned:
+                owned, other = await self.loaded_lm_models()
+                if other:
+                    raise ImageGenerationError("Another LM Studio model was loaded while switching to images.")
+                if owned:
+                    await asyncio.sleep(IMAGEGEN_POLL_INTERVAL)
+
+    async def unload_comfy(self):
+        await self.require_comfy_idle()
+        await self.request("comfyui", "POST", "/free", body={"unload_models": True, "free_memory": True})
+        # /free only queues flags. The worker publishes job history before it
+        # processes those flags. Two sequential CPU-only completions establish
+        # that the worker has finished unloading/resetting its caches, including
+        # dynamic VRAM which /system_stats' PyTorch counters do not account for.
+        async with asyncio.timeout(IMAGEGEN_SWITCH_TIMEOUT):
+            for _ in range(2):
+                await self.execute({
+                    "1": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": uuid.uuid4().hex}},
+                    "2": {"class_type": "PreviewAny", "inputs": {"source": ["1", 0]}},
+                })
+        await self.require_comfy_idle()
+
+    async def switch(self, backend):
+        if self.backend == backend:
+            return
+        if backend == "comfyui":
+            # Check the destination before unloading the working chat model.
+            await self.require_comfy_idle()
+            await self.unload_lm()
+        else:
+            if self.backend is None and not self.comfy_contacted:
+                try:
+                    await self.queue()
+                except aiohttp.ClientConnectorError as exc:
+                    # Only the initial refused connection can mean ComfyUI is
+                    # stopped. Once reachable, every unload step must succeed.
+                    if not isinstance(exc.os_error, ConnectionRefusedError):
+                        raise
+                    self.backend = backend
+                    return
+            await self.unload_comfy()
+        self.backend = backend
+
+    @contextlib.asynccontextmanager
+    async def local_request(self):
+        # The entry lock is held only during admission/switching: local requests
+        # can still run concurrently. An image takes the lock until it completes.
+        async with self.entry:
+            await self.switch("lmstudio")
+            self.local_active += 1
+            self.local_idle.clear()
+        try:
+            yield
+        finally:
+            self.local_active -= 1
+            if self.local_active == 0:
+                self.local_idle.set()
+
+    @staticmethod
+    def workflow(prompt, width, height):
+        width, height = image_resolution(width, height)
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
+            raise ImageGenerationError("Enter an image prompt between 1 and 4000 characters.")
+        try:
+            workflow = json.loads(Path(__file__).with_name("krea2.json").read_text(encoding="utf-8"))
+            required = {"48": "PrimitiveStringMultiline", "232": "EmptyLatentImage",
+                        "213": "SaveImage", "324": "ImageScale"}
+            if any(workflow[key]["class_type"] != kind for key, kind in required.items()):
+                raise ValueError("unexpected workflow nodes")
+            workflow["48"]["inputs"]["value"] = prompt
+            workflow["232"]["inputs"].update(width=width, height=height, batch_size=1)
+            workflow["324"]["inputs"].update(width=width, height=height)
+            return workflow
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ImageGenerationError("The bot's krea2.json workflow is missing or incompatible.") from exc
+
+    async def cancel_job(self):
+        """The jobs API atomically cancels our ID, including the queued/running race."""
+        if self.active_job is None:
+            return
+        job_id = self.active_job
+        async with asyncio.timeout(30):
+            result = await self.request("comfyui", "POST", f"/api/jobs/{job_id}/cancel")
+            confirmed = isinstance(result, dict) and result.get("cancelled") is True
+            while True:
+                queue = await self.queue()
+                if not any(item[1] == job_id for item in queue["queue_running"] + queue["queue_pending"]):
+                    if self.submission_uncertain and not confirmed:
+                        history = await self.request("comfyui", "GET", f"/history/{job_id}")
+                        if not isinstance(history, dict) or job_id not in history:
+                            raise ImageGenerationError("ComfyUI has not confirmed the previous submission. Check its queue before retrying.")
+                    self.active_job = None
+                    self.submission_uncertain = False
+                    return
+                await asyncio.sleep(IMAGEGEN_POLL_INTERVAL)
+
+    async def execute(self, workflow):
+        """Submit once, drain its acknowledgement, then wait for this job's result."""
+        job_id = str(uuid.uuid4())
+        self.active_job = job_id
+        self.submission_uncertain = True
+        if "213" in workflow:
+            workflow["213"]["inputs"]["filename_prefix"] = f"krea/discord_{job_id}"
+
+        async def submit():
+            try:
+                result = await self.request("comfyui", "POST", "/prompt",
+                                            body={"prompt": workflow, "prompt_id": job_id})
+            except ImageGenerationError as exc:
+                if exc.status in (400, 401, 403, 404, 422):
+                    self.active_job = None  # Validation/auth rejection cannot enqueue work.
+                    self.submission_uncertain = False
+                raise
+            returned_id = result.get("prompt_id") if isinstance(result, dict) else None
+            try:
+                uuid.UUID(returned_id)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ImageGenerationError("ComfyUI did not confirm a valid workflow job ID.") from exc
+            if returned_id != job_id:
+                raise ImageGenerationError("ComfyUI must support client-supplied job IDs. Update ComfyUI before using /imagegen.")
+            self.submission_uncertain = False
+
+        try:
+            async with asyncio.timeout(self.config.image_timeout):
+                # Cancelling while ComfyUI validates a graph must not let a later
+                # accepted job appear after we've checked an empty queue.
+                await finish_model_call(submit())
+                while True:
+                    history = await self.request("comfyui", "GET", f"/history/{job_id}")
+                    entry = history.get(job_id) if isinstance(history, dict) else None
+                    if isinstance(entry, dict):
+                        status = entry.get("status", {})
+                        if status.get("status_str") == "error":
+                            self.active_job = None
+                            raise ImageGenerationError("ComfyUI could not run the workflow. Check its error log.")
+                        if status.get("completed") is True:
+                            self.active_job = None
+                            return entry
+                    await asyncio.sleep(IMAGEGEN_POLL_INTERVAL)
+        except BaseException:
+            if self.active_job is not None:
+                with contextlib.suppress(Exception):
+                    await finish_model_call(self.cancel_job())
+            raise
+
+    async def generate(self, prompt, width, height):
+        workflow = self.workflow(prompt, width, height)
+        async with self.entry:
+            await self.local_idle.wait()
+            if self.active_job is not None:
+                await self.require_comfy_idle()
+            await self.switch("comfyui")
+            await self.require_comfy_idle()
+            result = await self.execute(workflow)
+            images = result.get("outputs", {}).get("213", {}).get("images", [])
+            if len(images) != 1:
+                raise ImageGenerationError("The workflow must produce one image at Save Image #213.")
+            output = images[0]
+            filename, subfolder = output.get("filename", ""), output.get("subfolder", "")
+            if (not isinstance(filename, str) or not filename.lower().endswith(".png")
+                    or any(c in filename for c in ("/", "\\"))
+                    or not isinstance(subfolder, str) or subfolder.startswith(("/", "\\"))
+                    or ".." in subfolder.replace("\\", "/").split("/")
+                    or output.get("type") != "output"):
+                raise ImageGenerationError("ComfyUI returned an unexpected image file.")
+            return await self.request("comfyui", "GET", "/view", binary=True,
+                                      params={"filename": filename, "subfolder": subfolder, "type": "output"})
+
+
+
+def image_attachment(data, width, height, limit):
+    """Validate the final resolution and fit Discord's actual per-file limit."""
+    try:
+        with Image.open(io.BytesIO(data)) as picture:
+            if picture.format != "PNG" or picture.size != (width, height):
+                raise ImageGenerationError("ComfyUI returned an image with an unexpected format or resolution.")
+            picture.load()
+            # Re-encoding strips workflow metadata from the publicly attached image.
+            output = io.BytesIO()
+            picture.save(output, format="PNG")
+            if output.tell() <= limit:
+                return output.getvalue(), "image.png"
+            rgb = picture.convert("RGB")
+            for quality in (90, 80, 70, 60):
+                output = io.BytesIO()
+                rgb.save(output, format="JPEG", quality=quality, optimize=True)
+                if output.tell() <= limit:
+                    return output.getvalue(), "image.jpg"
+    except ImageGenerationError:
+        raise
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise ImageGenerationError("ComfyUI returned an unreadable image.") from exc
+    raise ImageGenerationError("The generated image exceeds this server's attachment limit.")
+
+
+async def request_embeddings(texts, task):
+    ef = client.custom_ef
+    fallback = getattr(ef, "fallback_ef", None)
+    if not (fallback and time.monotonic() < getattr(ef, "dead_until", 0)):
+        admitted = False
+        try:
+            access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
+            async with access:
+                admitted = True
+                return await finish_model_call(asyncio.to_thread(ef.embed, texts, task))
+        except Exception as exc:
+            if admitted or not fallback:
+                raise  # The dispatcher already attempted its own fallback.
+            logging.warning(f"Local embedding access failed: {exc}. Routing to cloud...")
+            ef.dead_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+    # Bind the provider before scheduling the thread: cooldown expiry must not
+    # turn a cloud call into an unguarded local one. Admission failures also
+    # reach this path, without retrying a fallback that the dispatcher ran.
+    result = await finish_model_call(asyncio.to_thread(fallback.embed, texts, task))
+    ef.last_used_fallback = True
+    return result
+
+
 class MyAIClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -150,6 +509,9 @@ class MyAIClient(discord.Client):
         self.fallback_client = None
         self.chat_dead_until = 0.0
         self.chat_last_used_fallback = False
+        self.imagegen = None
+        self.image_users = set()
+        self.image_tasks = set()
         self.db_path = "bot_database.db"
         self.memory_path = "./chroma_storage"
         self.memory_lock = None
@@ -182,6 +544,8 @@ class MyAIClient(discord.Client):
                 base_url=self.config.fallback_url, api_key=self.config.fallback_key,
                 timeout=Timeout(120.0, connect=2.0), max_retries=0,
             )
+        if self.config.comfy_url:
+            self.imagegen = ImageGeneration(self.config)
         self.db_conn = await aiosqlite.connect(self.db_path)
         await self.db_conn.execute('PRAGMA journal_mode=WAL;')
         await self.db_conn.commit()
@@ -190,7 +554,10 @@ class MyAIClient(discord.Client):
         await self.db_conn.execute('VACUUM;') 
         await init_db(self.db_conn)
         
-        primary_ef = LocalAPIEmbeddingFunction(self.config.base_url, self.config.api_key, self.config.embedding_model)
+        primary_ef = LocalAPIEmbeddingFunction(
+            self.config.base_url, self.config.api_key, self.config.embedding_model,
+            self.imagegen.resolve_model if self.imagegen else None,
+        )
         fallback_ef = JinaAPIEmbeddingFunction(self.config.embedding_key) if self.config.embedding_key else None
         self.custom_ef = ResilientEmbeddingFunction(primary_ef, fallback_ef)
         self.vector_db = await asyncio.to_thread(chromadb.PersistentClient, path=self.memory_path)
@@ -207,9 +574,14 @@ class MyAIClient(discord.Client):
         # Run every cleanup even if a worker or resource close fails.
         async with contextlib.AsyncExitStack() as cleanup:
             cleanup.push_async_callback(super().close)
-            for resource in (self.fallback_client, self.lm_client, self.db_conn):
+            for resource in (self.fallback_client, self.lm_client, self.db_conn, self.imagegen):
                 if resource is not None:
                     cleanup.push_async_callback(resource.close)
+            image_tasks = list(self.image_tasks)
+            for task in image_tasks:
+                task.cancel()
+            if image_tasks:
+                await asyncio.gather(*image_tasks, return_exceptions=True)
             if self.memory_worker:
                 self.memory_worker.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -695,7 +1067,7 @@ async def sync_manual_memories():
         rows = await cursor.fetchall()
     for key, server_id, user_id, name, document in rows:
         try:
-            embeddings = await asyncio.to_thread(client.custom_ef.embed, [document], "retrieval.passage")
+            embeddings = await request_embeddings([document], "retrieval.passage")
             if len(embeddings) != 1:
                 raise ValueError("Embedding service returned an incomplete batch")
             async with client.memory_lock:
@@ -720,7 +1092,11 @@ async def request_completion(*, prefer_fallback=False, **kwargs):
     ))
     if not use_fallback:
         try:
-            response = await client.lm_client.chat.completions.create(model=client.config.model, **kwargs)
+            access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
+            async with access:
+                model = client.imagegen.resolve_model(client.config.model) if client.imagegen else client.config.model
+                call = client.lm_client.chat.completions.create(model=model, **kwargs)
+                response = await finish_model_call(call) if client.imagegen else await call
             client.chat_dead_until = 0.0
         except Exception:
             if client.fallback_client is None:
@@ -798,11 +1174,7 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
             fact_ids = []
             
             # 1. Embed the raw facts to query the database
-            raw_embeddings = await asyncio.to_thread(
-                client.custom_ef.embed,
-                facts_list,
-                "retrieval.query" # Use query task to search existing memories
-            )
+            raw_embeddings = await request_embeddings(facts_list, "retrieval.query")
             if len(raw_embeddings) != len(facts_list):
                 raise ValueError("Embedding service returned an incomplete batch")
             
@@ -837,11 +1209,7 @@ async def update_user_memory(server_id, user_id, user_name, forgotten_messages, 
                 metadatas = [{"server_id": server_id, "user_id": str(user_id), "user_name": user_name} for _ in unique_facts]
 
                 # Re-embed the final timestamped strings for permanent storage
-                doc_embeddings = await asyncio.to_thread(
-                    client.custom_ef.embed,
-                    unique_facts,
-                    "retrieval.passage"
-                )
+                doc_embeddings = await request_embeddings(unique_facts, "retrieval.passage")
                 if len(doc_embeddings) != len(unique_facts):
                     raise ValueError("Embedding service returned an incomplete batch")
 
@@ -918,6 +1286,7 @@ async def cmd_help(interaction: discord.Interaction):
 **Slash Commands:**
 • **`/help`** - Display this guide.
 • **`/status`** - See models, supported inputs, and limits.
+• **`/imagegen`** - Choose an image size up to 2K, then enter your prompt.
 • **`/role`** - View, change, or clear the AI's personality.
 • **`/remember`** - Save a fact about yourself for this server.\n• **`/memory`** - List users, read saved facts, or clear your own memory.
 • **`/clear`** - Clear the temporary conversation history (core facts retained).
@@ -943,6 +1312,7 @@ async def cmd_status(interaction: discord.Interaction):
         )
         history_length = (await cursor.fetchone())[0]
     vision = "On" if client.config.vision_enabled else "Off"
+    imagegen = "Configured (up to 2K)" if client.config.comfy_url else "Off"
     status = (
         "**Bot status**\n"
         f"• **Ping:** {ping} | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
@@ -950,11 +1320,148 @@ async def cmd_status(interaction: discord.Interaction):
         f"• **Memory model:** `{memory_model}`\n"
         "• **Inputs:** Text/code, text PDFs, public links\n"
         f"• **Images/stickers:** {vision} | **Web search:** Available\n"
+        f"• **Image generation:** {imagegen}\n"
         f"• **Limits:** ~{MAX_FILE_SIZE / 1_000_000:.1f} MB per image/PDF; "
         f"{MAX_PDF_PAGES} PDF pages; {MAX_TEXT_EXTRACTION_LENGTH:,} characters per document\n"
-        "Images and web search require a compatible chat model."
+        "Image analysis and web search require a compatible chat model."
     )
     await send_chunked_message(interaction, status, is_interaction_followup=True)
+
+def imagegen_permission_error(interaction):
+    if client.imagegen is None:
+        return "Image generation is not configured. Set COMFYUI_BASE_URL on the bot."
+    if interaction.guild is None or interaction.channel is None:
+        return "Use /imagegen in a server channel."
+    permissions = interaction.app_permissions
+    can_send = permissions.send_messages_in_threads if isinstance(interaction.channel, discord.Thread) else permissions.send_messages
+    if not permissions.view_channel or not can_send or not permissions.attach_files:
+        return "I need View Channel, Send Messages (in threads when applicable), and Attach Files here."
+    return None
+
+
+class ImageResolutionModal(discord.ui.Modal, title="Image resolution (up to 2K)"):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.width = discord.ui.TextInput(placeholder="e.g. 1080", min_length=1, max_length=4)
+        self.height = discord.ui.TextInput(placeholder="e.g. 1920", min_length=1, max_length=4)
+        self.add_item(discord.ui.Label(text="Width in pixels (64–2048)", component=self.width))
+        self.add_item(discord.ui.Label(text="Height in pixels (64–2048)", component=self.height))
+
+    async def on_submit(self, interaction):
+        try:
+            requested = (int(self.width.value), int(self.height.value))
+            width, height = image_resolution(*requested)
+        except (ValueError, ImageGenerationError):
+            await interaction.response.send_message("Enter a width and height between 64 and 2048 pixels. Run /imagegen to try again.", ephemeral=True)
+            return
+        error = imagegen_permission_error(interaction)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        adjusted = f" (closest to {requested[0]} × {requested[1]})" if requested != (width, height) else ""
+        await interaction.response.send_message(
+            f"Image size: **{width} × {height}**{adjusted}. Now enter your prompt.",
+            view=ImagePromptView(interaction.user.id, width, height), ephemeral=True,
+        )
+
+
+class ImagePromptView(discord.ui.View):
+    def __init__(self, user_id, width, height):
+        super().__init__(timeout=300)
+        self.user_id, self.width, self.height = user_id, width, height
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Run /imagegen to start your own image.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Enter prompt", style=discord.ButtonStyle.primary)
+    async def enter_prompt(self, interaction, button):
+        await interaction.response.send_modal(ImagePromptModal(self.width, self.height))
+
+
+class ImagePromptModal(discord.ui.Modal, title="Image prompt"):
+    def __init__(self, width, height):
+        super().__init__(timeout=300)
+        self.width, self.height = width, height
+        self.prompt = discord.ui.TextInput(style=discord.TextStyle.paragraph, min_length=1, max_length=4000,
+                                           placeholder="Describe the image you want to create.")
+        self.add_item(discord.ui.Label(text="Your prompt", component=self.prompt))
+
+    async def on_submit(self, interaction):
+        await run_imagegen(interaction, self.prompt.value, self.width, self.height)
+
+
+async def run_imagegen(interaction, prompt, width, height):
+    error = imagegen_permission_error(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    try:
+        width, height = image_resolution(width, height)
+        # Validate the workflow before claiming a slot or posting a progress message.
+        client.imagegen.workflow(prompt, width, height)
+    except ImageGenerationError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+    user_id = interaction.user.id
+    if user_id in client.image_users:
+        await interaction.response.send_message("You already have an image request waiting or running.", ephemeral=True)
+        return
+    if len(client.image_users) >= IMAGEGEN_MAX_PENDING:
+        await interaction.response.send_message("The image queue is full. Please try again after a request finishes.", ephemeral=True)
+        return
+    client.image_users.add(user_id)
+    task = asyncio.current_task()
+    client.image_tasks.add(task)
+    progress = None
+    mentions = discord.AllowedMentions(users=[interaction.user], roles=False, everyone=False)
+    label = f"<@{user_id}> · {width} × {height}"
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        # Use a normal bot message: delivery/editing keeps working beyond the
+        # interaction token's 15-minute lifetime, including time spent in the queue.
+        progress = await interaction.channel.send(f"{label} — queued for image generation.", allowed_mentions=mentions)
+        await interaction.edit_original_response(content="Your image will appear in this channel.")
+        data = await client.imagegen.generate(prompt, width, height)
+        data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.guild.filesize_limit)
+        with contextlib.closing(discord.File(io.BytesIO(data), filename=filename)) as attachment:
+            await progress.edit(content=label, attachments=[attachment], allowed_mentions=discord.AllowedMentions.none())
+    except asyncio.CancelledError:
+        if progress is not None:
+            with contextlib.suppress(discord.HTTPException):
+                await progress.edit(content=f"{label} — image generation stopped because the bot is shutting down.")
+        raise
+    except Exception as exc:
+        logging.warning("Image generation failed: %s", type(exc).__name__)
+        if isinstance(exc, ImageGenerationError):
+            detail = str(exc)
+        elif isinstance(exc, TimeoutError):
+            detail = "Image generation or model switching timed out. Check the local servers before retrying."
+        elif isinstance(exc, discord.HTTPException):
+            detail = "I couldn't upload the image. Check channel permissions and the server's attachment limit."
+        else:
+            detail = "Couldn't complete image generation. Check that ComfyUI and LM Studio's API servers are reachable."
+        with contextlib.suppress(discord.HTTPException):
+            if progress is not None:
+                await progress.edit(content=f"{label} — {detail}", allowed_mentions=discord.AllowedMentions.none())
+            else:
+                await interaction.followup.send(detail, ephemeral=True)
+    finally:
+        client.image_users.discard(user_id)
+        client.image_tasks.discard(task)
+
+
+@tree.command(name="imagegen", description="Choose a resolution, then enter a prompt to generate an image.")
+@app_commands.guild_only()
+async def cmd_imagegen(interaction: discord.Interaction):
+    error = imagegen_permission_error(interaction)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_modal(ImageResolutionModal())
+
 
 @tree.command(name="role", description="View or change the AI's personality for this server.")
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
@@ -1196,11 +1703,7 @@ async def build_ai_context(server_id, api_user_content):
 
     if query_text.strip():
         try:
-            query_embeddings = await asyncio.to_thread(
-                client.custom_ef.embed, 
-                [query_text], 
-                "retrieval.query"
-            )
+            query_embeddings = await request_embeddings([query_text], "retrieval.query")
             results = await asyncio.to_thread(
                 client.memory_collection.query,
                 query_embeddings=query_embeddings,
