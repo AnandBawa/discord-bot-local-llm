@@ -96,6 +96,8 @@ The checks use synthetic messages, mocked API responses, temporary storage, and 
 
 Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF/text-file processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
 
+The [October 5 application audit](docs/AUDIT-2026-10-05.md) records ten open findings, reproduction evidence, and focused fixes at baseline `6f08bab`, including failures not covered by the 116 passing tests. Its [dependency scan](docs/dependency-audit-2026-10-05.json) found no known advisory matches for the 31 pinned versions; the running environment and external model services were not inventoried.
+
 ## Conversation Storage and Updating
 
 The bot stores recent messages and personas in `bot_database.db`. A message can still refer to something a member said in the saved conversation; the bot no longer extracts separate facts about that member. On reaching 100 saved user/assistant messages in a channel, thread, or DM, it deletes the oldest 50 there. `/clear` deletes only the current conversation; changing `/role` does the same while saving its new persona. Deleted context is not archived or summarized.
