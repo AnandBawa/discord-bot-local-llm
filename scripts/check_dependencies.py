@@ -15,6 +15,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -24,6 +25,7 @@ from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 class Channel:

@@ -10,7 +10,7 @@ A Discord bot for chat and ComfyUI image generation in server channels, threads,
 - **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
 - **Image Generation:** `/imagegen` collects dimensions and a prompt in one private form, then posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
 - **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. Search terms and dates are preserved. Source URLs remain available to the model, but citations and source lists are requested only when the user explicitly asks for them in the current request (for example, “sources?” or “where did you get that?”). There is no automatic source footer. Ordinary website/download/code links can still be part of a requested answer.
-- **URL and Document Parsing:** Reads UTF-8 text attachments (including Discord `message.txt` uploads), extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations.
+- **URL and Document Parsing:** Reads UTF-8 text attachments (including Discord `message.txt` uploads), extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations. PDF parsing uses one isolated worker that starts on the first PDF; no extra configuration is needed.
 - **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
 - **Slash Commands:** `/help`, `/status`, `/role`, `/clear`, and `/imagegen`. Members can change their channel's shared persona; DM users control their own persona. In servers, `/clear` defaults to members with Manage Messages, subject to command settings. In a DM it clears only that user's conversation.
 - **Permission-Aware Replies:** Sends directly in DMs. In servers, uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
@@ -90,13 +90,15 @@ python scripts/check_refactor.py
 python scripts/check_imagegen.py
 python scripts/check_imagegen_ui.py
 python scripts/check_dms.py
+python scripts/check_audit_media.py
+python scripts/check_audit_state.py
 ```
 
 The checks use synthetic messages, mocked API responses, temporary storage, and blocked external sockets (with a controlled loopback HTTP fixture for URL tests). They do not load `.env`, log in to Discord, or use real conversations or model endpoints.
 
 Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF/text-file processing, and provider fallback. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
 
-The [October 5 application audit](docs/AUDIT-2026-10-05.md) records ten open findings, reproduction evidence, and focused fixes at baseline `6f08bab`, including failures not covered by the 116 passing tests. Its [dependency scan](docs/dependency-audit-2026-10-05.json) found no known advisory matches for the 31 pinned versions; the running environment and external model services were not inventoried.
+The [October 5 application audit](docs/AUDIT-2026-10-05.md) records ten findings at baseline `6f08bab`. Nine are now fixed, with 138 passing tests covering the original suite and the new failure cases. Context-overflow handling remains deferred at the owner's request; history is still limited by message count. The [dependency scan](docs/dependency-audit-2026-10-05.json) found no known advisory matches for the unchanged 31 pinned versions; the running environment and external model services were not inventoried.
 
 ## Conversation Storage and Updating
 

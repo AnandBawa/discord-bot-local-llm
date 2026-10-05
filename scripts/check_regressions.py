@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -23,6 +24,7 @@ import aiosqlite
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 SOCKET_CONNECT = socket.socket.connect
 START_CONNECTION = aiohappyeyeballs.start_connection
 

@@ -10,11 +10,15 @@ import time
 import math
 import ipaddress
 import uuid
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pymupdf
+from pdf_worker import extract_pdf_text
 import aiohttp
 import discord
 from discord import app_commands
@@ -353,6 +357,11 @@ class ImageGeneration:
             try:
                 result = await self.request("comfyui", "POST", "/prompt",
                                             body={"prompt": workflow, "prompt_id": job_id})
+            except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
+                # The connection was never established, so /prompt was not sent.
+                self.active_job = None
+                self.submission_uncertain = False
+                raise
             except ImageGenerationError as exc:
                 if exc.status in (400, 401, 403, 404, 422):
                     self.active_job = None  # Validation/auth rejection cannot enqueue work.
@@ -455,6 +464,9 @@ class MyAIClient(discord.Client):
         self.imagegen = None
         self.image_users = set()
         self.image_tasks = set()
+        self.chat_tasks = set()
+        self.shutting_down = False
+        self.pdf_executor = None
         self.db_path = "bot_database.db"
         self.db_lock = None
         self.llm_queue = None
@@ -487,18 +499,25 @@ class MyAIClient(discord.Client):
         await tree.sync()
         logging.info('🔄 Database loaded and slash commands synced globally!')
 
+    async def close_pdf_executor(self):
+        executor, self.pdf_executor = self.pdf_executor, None
+        if executor is not None:
+            await finish_model_call(asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True))
+
     async def close(self):
+        self.shutting_down = True
         # Run every cleanup even if a resource close fails.
         async with contextlib.AsyncExitStack() as cleanup:
             cleanup.push_async_callback(super().close)
             for resource in (self.fallback_client, self.lm_client, self.db_conn, self.imagegen):
                 if resource is not None:
                     cleanup.push_async_callback(resource.close)
-            image_tasks = list(self.image_tasks)
-            for task in image_tasks:
+            cleanup.push_async_callback(self.close_pdf_executor)
+            tasks = list((self.image_tasks | self.chat_tasks) - {asyncio.current_task()})
+            for task in tasks:
                 task.cancel()
-            if image_tasks:
-                await asyncio.gather(*image_tasks, return_exceptions=True)
+            if tasks:
+                await finish_model_call(asyncio.gather(*tasks, return_exceptions=True))
             logging.info("Disconnecting from Discord. Goodbye!")
 
 
@@ -550,14 +569,23 @@ async def init_db(db_conn):
 
 
 @contextlib.asynccontextmanager
-async def history_transaction():
+async def history_transaction(*, invalidate_conversation=None):
     async with client.db_lock:
+        async def commit():
+            await client.db_conn.commit()
+            if invalidate_conversation is not None:
+                versions = client.conversation_versions
+                versions[invalidate_conversation] = versions.get(invalidate_conversation, 0) + 1
+
         try:
             yield
-            await client.db_conn.commit()
+            # SQLite can finish COMMIT after caller cancellation. Keep the lock
+            # until its outcome and the corresponding version are both known.
+            await finish_model_call(commit())
         except BaseException:
-            await client.db_conn.rollback()
+            await finish_model_call(client.db_conn.rollback())
             raise
+
 
 async def delete_history(server_id, limit=None):
     """Delete selected rows inside the caller's existing history transaction."""
@@ -585,7 +613,7 @@ async def safe_typing(channel):
     try:
         await typing_ctx.__aenter__()
         success = True
-    except (discord.Forbidden, discord.HTTPException): 
+    except (discord.HTTPException, aiohttp.ClientError, OSError):
         pass 
     try: 
         yield
@@ -617,8 +645,14 @@ def available_reference(message):
         return resolved
     return reference.cached_message
 
-async def reply_or_send(message, text):
+def conversation_is_current(conversation):
+    return conversation is None or client.conversation_versions.get(conversation[0], 0) == conversation[1]
+
+
+async def reply_or_send(message, text, *, conversation=None):
     """Send directly in DMs; use native replies or a mention in server channels."""
+    if not conversation_is_current(conversation):
+        return
     if isinstance(getattr(message, "channel", None), discord.DMChannel):
         await message.channel.send(text)
         return
@@ -629,49 +663,60 @@ async def reply_or_send(message, text):
         except discord.HTTPException as exc:
             if not isinstance(exc, (discord.Forbidden, discord.NotFound)) and exc.code != 50035:
                 raise
-    await message.channel.send(
-        f"<@{message.author.id}> {text}",
-        allowed_mentions=discord.AllowedMentions(users=[message.author], roles=False, everyone=False),
-    )
+    # A clear/persona change may have completed while the native reply failed.
+    if conversation_is_current(conversation):
+        await message.channel.send(
+            f"<@{message.author.id}> {text}",
+            allowed_mentions=discord.AllowedMentions(users=[message.author], roles=False, everyone=False),
+        )
 
-async def send_chunked_message(target, text: str, is_interaction_followup=False):
-    """Chunks and sends long texts to bypass Discord's character limit."""
+
+async def send_chunked_message(target, text: str, is_interaction_followup=False, *,
+                               ephemeral=False, conversation=None):
+    """Split long text while keeping follow-ups private and old turns invalidated."""
     remaining_text = text
     is_first = True
     in_code_block = False
-    
-    while len(remaining_text) > 0:
+
+    while remaining_text:
+        if not conversation_is_current(conversation):
+            return
         # Leave space for the fallback mention and reopened/closed code fences.
         chunk_limit = min(DISCORD_CHUNK_LIMIT, 1950)
-        if len(remaining_text) <= chunk_limit: 
-            chunk = remaining_text
-            remaining_text = ""
+        if len(remaining_text) <= chunk_limit:
+            chunk, remaining_text = remaining_text, ""
         else:
             split_index = remaining_text.rfind('\n', 0, chunk_limit)
-            if split_index == -1: split_index = remaining_text.rfind(' ', 0, chunk_limit)
-            if split_index == -1: split_index = chunk_limit
-            else: split_index += 1 
-            
-            chunk = remaining_text[:split_index]
-            remaining_text = remaining_text[split_index:]
+            if split_index == -1:
+                split_index = remaining_text.rfind(' ', 0, chunk_limit)
+            split_index = chunk_limit if split_index == -1 else split_index + 1
+            chunk, remaining_text = remaining_text[:split_index], remaining_text[split_index:]
 
         code_markers = chunk.count("```")
-        if in_code_block: chunk = "```\n" + chunk
-        if code_markers % 2 != 0: in_code_block = not in_code_block
-        if in_code_block and len(remaining_text) > 0: chunk += "\n```"
-        
+        if in_code_block:
+            chunk = "```\n" + chunk
+        if code_markers % 2 != 0:
+            in_code_block = not in_code_block
+        if in_code_block and remaining_text:
+            chunk += "\n```"
+
         try:
-            if is_first:
+            if not is_first:
                 if is_interaction_followup:
-                    await target.followup.send(chunk)
+                    await asyncio.sleep(CHUNK_MESSAGE_DELAY)
                 else:
-                    await reply_or_send(target, chunk)
-                is_first = False
+                    channel = target.channel if hasattr(target, 'channel') else target
+                    async with safe_typing(channel):
+                        await asyncio.sleep(CHUNK_MESSAGE_DELAY)
+            if not conversation_is_current(conversation):
+                return
+            if is_interaction_followup:
+                await target.followup.send(chunk, ephemeral=ephemeral)
+            elif is_first:
+                await reply_or_send(target, chunk, conversation=conversation)
             else:
-                channel = target.channel if hasattr(target, 'channel') else target
-                async with safe_typing(channel): 
-                    await asyncio.sleep(CHUNK_MESSAGE_DELAY) 
                 await channel.send(chunk)
+            is_first = False
         except discord.Forbidden:
             logging.warning("Discord denied message delivery in channel %s", getattr(target.channel, "id", "unknown"))
             break
@@ -686,32 +731,46 @@ def truncate_document(text):
     return text
 
 
-def extract_pdf_text(pdf_bytes):
-    text = ""
+async def extract_pdf_text_async(pdf_bytes):
+    if client.shutting_down:
+        raise asyncio.CancelledError
+    if client.pdf_executor is None:
+        client.pdf_executor = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+        )
+    executor = client.pdf_executor
     try:
-        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-            for i, page in enumerate(doc):
-                if i >= MAX_PDF_PAGES:
-                    text += "\n...[Additional pages skipped to save memory]"
-                    break
-                text += page.get_text() + "\n"
-        return text.strip()
-    except Exception as e: 
-        return f"Error reading PDF: {str(e)}"
-    
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, extract_pdf_text, pdf_bytes, MAX_PDF_PAGES,
+        )
+    except BrokenProcessPool:
+        # Retire the failed worker without automatically retrying its input.
+        if client.pdf_executor is executor:
+            await client.close_pdf_executor()
+        return "Error reading PDF: The PDF worker stopped. Please try the upload again."
+
+
 def process_image_bytes(img_bytes):
     try:
         with Image.open(io.BytesIO(img_bytes)) as pil_img:
-            if pil_img.mode in ("RGBA", "P"): 
+            if pil_img.mode.startswith("I;16") or (pil_img.mode == "I" and pil_img.format == "PNG"):
+                # Preserve 16-bit grayscale intensity instead of clipping at 255.
+                pil_img = pil_img.convert("I").point(lambda value: value / 257).convert("RGB")
+            elif "A" in pil_img.getbands() or "transparency" in pil_img.info:
+                rgba = pil_img.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, "white")
+                pil_img = Image.alpha_composite(background, rgba).convert("RGB")
+            else:
                 pil_img = pil_img.convert("RGB")
             pil_img.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION))
             buffer = io.BytesIO()
             pil_img.save(buffer, format="JPEG", quality=IMAGE_COMPRESSION_QUALITY)
             return base64.b64encode(buffer.getvalue()).decode('utf-8')
-    except Exception as e:
-        logging.warning(f"⚠️ Pillow failed to process image: {e}")
+    except Exception as exc:
+        logging.warning("Pillow failed to process image: %s", exc)
         return None
-    
+
+
 def process_sticker_bytes(sticker_bytes):
     try:
         return base64.b64encode(sticker_bytes).decode('utf-8')
@@ -832,7 +891,7 @@ async def fetch_url_content(url):
                 if 'image' in content_type or url_lower.endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
                     return {"type": "image", "data": file_bytes}
                 elif 'pdf' in content_type or url_lower.endswith('.pdf'):
-                    extracted_text = await asyncio.to_thread(extract_pdf_text, file_bytes)
+                    extracted_text = await extract_pdf_text_async(file_bytes)
                     return {"type": "text", "data": f"[Extracted PDF Document]:\n{truncate_document(extracted_text)}"}
                 elif 'text' in content_type or 'json' in content_type or 'markdown' in content_type or 'xml' in content_type:
                     try:
@@ -952,6 +1011,8 @@ async def cmd_status(interaction: discord.Interaction):
     await send_chunked_message(interaction, status, is_interaction_followup=True)
 
 def imagegen_permission_error(interaction):
+    if client.shutting_down:
+        return "The bot is shutting down. Please try again after it restarts."
     if client.imagegen is None:
         return "Image generation is not configured. Set COMFYUI_BASE_URL on the bot."
     if interaction.channel is None or (interaction.guild is None and not isinstance(interaction.channel, discord.DMChannel)):
@@ -1096,11 +1157,14 @@ async def cmd_imagegen(interaction: discord.Interaction):
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
 async def cmd_role(interaction: discord.Interaction, prompt: str = None):
     server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
-    await interaction.response.defer(ephemeral=bool(prompt) and interaction.guild_id is None)
+    await interaction.response.defer(ephemeral=interaction.guild_id is None)
 
     if not prompt:
         current_role = await get_persona(server_id)
-        await interaction.followup.send(f"**Current Persona:**\n> *{current_role}*")
+        await send_chunked_message(
+            interaction, f"**Current Persona:**\n> *{current_role}*",
+            is_interaction_followup=True, ephemeral=interaction.guild_id is None,
+        )
         return
 
     new_prompt = "" if prompt.lower() == "clear" else prompt
@@ -1145,13 +1209,12 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
                     )
             return
 
-    async with history_transaction():
+    async with history_transaction(invalidate_conversation=server_id):
         await delete_history(server_id)
         await client.db_conn.execute(
             "INSERT INTO server_config (server_id, prompt) VALUES (?, ?) "
             "ON CONFLICT(server_id) DO UPDATE SET prompt=excluded.prompt", (server_id, new_prompt),
         )
-        client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
 
     if announcement is not None:
         # Edit the same public reply to preserve Discord's 'member used /role' header.
@@ -1166,7 +1229,9 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
                 "Use `/role` to view the current persona.", ephemeral=True,
             )
         return
-    await interaction.followup.send(saved_header + persona, ephemeral=True)
+    await send_chunked_message(
+        interaction, saved_header + persona, is_interaction_followup=True, ephemeral=True,
+    )
 
 
 @tree.command(name="clear", description="Clear the saved conversation in this channel or DM.")
@@ -1175,9 +1240,8 @@ async def cmd_clear(interaction: discord.Interaction):
     server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
     await interaction.response.defer()
 
-    async with history_transaction():
+    async with history_transaction(invalidate_conversation=server_id):
         await delete_history(server_id)
-        client.conversation_versions[server_id] = client.conversation_versions.get(server_id, 0) + 1
     await interaction.followup.send("🗑️ Conversation history cleared here!")
 
 # ==========================================
@@ -1212,7 +1276,7 @@ async def collect_attachments(source, channel, *, replied=False):
                         notes.append(f"[System note: {label.capitalize()}{kind} '{attachment.filename}' exceeds the size limit.]")
                         continue
                     if kind == "PDF":
-                        text = await asyncio.to_thread(extract_pdf_text, data)
+                        text = await extract_pdf_text_async(data)
                     else:
                         text = data.decode("utf-8-sig")
                         if "\x00" in text:
@@ -1231,7 +1295,37 @@ async def collect_attachments(source, channel, *, replied=False):
     return images, stickers, documents, notes, text_truncated
 
 
+def extract_urls(text):
+    """Ignore enclosing Markdown/quotes without stripping balanced URL parentheses."""
+    urls = []
+    for match in re.finditer(r'https?://[^\s<>"`]+', text):
+        url = match.group()
+        preceding = text[match.start() - 1] if match.start() else ""
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        if preceding in pairs:
+            depth = 0
+            for index, character in enumerate(url):
+                if character == preceding:
+                    depth += 1
+                elif character == pairs[preceding]:
+                    if depth == 0:
+                        url = url[:index]
+                        break
+                    depth -= 1
+        if preceding == "'":
+            url = re.sub(r"'[.,;:!?]*$", "", url)
+        while url and url[-1] in ")]}":
+            closer = url[-1]
+            opener = {value: key for key, value in pairs.items()}[closer]
+            if url.count(closer) <= url.count(opener):
+                break
+            url = url[:-1]
+        urls.append(url)
+    return urls
+
+
 async def extract_message_context(message, clean_message, user_name):
+    urls = extract_urls(clean_message)
     sources = [(message, False)]
     if message.reference and message.reference.message_id:
         try:
@@ -1240,6 +1334,7 @@ async def extract_message_context(message, clean_message, user_name):
                 replied_msg = await message.channel.fetch_message(message.reference.message_id)
             if replied_msg is not None:
                 if replied_msg.content:
+                    urls.extend(extract_urls(replied_msg.content))
                     name = f"{replied_msg.author.display_name}_{str(replied_msg.author.id)[-4:]}"
                     clean_message += f'\n\n[Context: {user_name} is replying to {name}: "{replied_msg.content}"]'
                     if replied_msg.author == client.user:
@@ -1267,7 +1362,6 @@ async def extract_message_context(message, clean_message, user_name):
             f"⚠️ Text file truncated: only the first **{MAX_TEXT_EXTRACTION_LENGTH:,} characters** per file will be read. The remaining text is skipped.",
         )
 
-    urls = re.findall(r'(https?://[^\s<>]+)', clean_message)
     if urls:
         async with safe_typing(message.channel):
             results = await asyncio.gather(*(fetch_url_content(url) for url in urls))
@@ -1415,7 +1509,7 @@ async def save_and_send_response(message, server_id, stored_text, final_reply, e
         cursor = await client.db_conn.execute("SELECT COUNT(*) FROM chat_history WHERE server_id = ?", (server_id,))
         if (await cursor.fetchone())[0] >= MAX_HISTORY_LENGTH:
             await delete_history(server_id, MAX_HISTORY_LENGTH // 2)
-    await send_chunked_message(message, final_reply)
+    await send_chunked_message(message, final_reply, conversation=(server_id, expected_version))
 
 
 # ==========================================
@@ -1429,6 +1523,8 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    if client.shutting_down:
+        return
     # Check if the bot was mentioned directly
     is_mention = client.user in message.mentions
     is_reply_to_bot = False
@@ -1447,6 +1543,8 @@ async def on_message(message):
     conversation_version = client.conversation_versions.get(server_id, 0)
     lock = client.conversation_locks.setdefault(server_id, asyncio.Lock())
     access = client.imagegen.reserve("lmstudio") if client.imagegen else contextlib.nullcontext()
+    task = asyncio.current_task()
+    client.chat_tasks.add(task)
     try:
         with access:
             async with lock:
@@ -1455,6 +1553,8 @@ async def on_message(message):
                 await handle_server_message(message, server_id, conversation_version)
     except ModelBusyError as exc:
         await reply_or_send(message, str(exc))
+    finally:
+        client.chat_tasks.discard(task)
 
 async def handle_server_message(message, server_id, conversation_version):
     bot_mention = f'<@{client.user.id}>'

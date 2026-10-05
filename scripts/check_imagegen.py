@@ -375,20 +375,89 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.service.active_job)
         self.assertTrue(any(path.startswith("/api/jobs/") and path.endswith("/cancel") for _, _, path, _ in self.calls))
 
+    async def test_connection_failure_before_submission_allows_next_image_or_chat(self):
+        connection = SimpleNamespace(host="comfy.invalid", port=8188, ssl=False)
+        failures = (
+            self.bot.aiohttp.ClientConnectorError(connection, ConnectionRefusedError(111, "refused")),
+            self.bot.aiohttp.ConnectionTimeoutError("connection establishment timed out"),
+        )
+        for failure in failures:
+            for next_backend in ("comfyui", "lmstudio"):
+                with self.subTest(failure=type(failure).__name__, next_backend=next_backend):
+                    self.service = self.client.imagegen = self.bot.ImageGeneration(self.client.config)
+                    self.service.backend = "lmstudio"
+                    self.loaded = {"native-chat": ["chat-alias"]}
+                    self.create.reset_mock()
+                    attempted_ids = []
+
+                    async def disconnected(backend, method, path, **kwargs):
+                        if path == "/prompt":
+                            attempted_ids.append(kwargs["body"]["prompt_id"])
+                            raise failure
+                        return await self.request(backend, method, path, **kwargs)
+
+                    self.service.request = AsyncMock(side_effect=disconnected)
+                    with self.assertRaises(type(failure)):
+                        await self.service.generate("not submitted", 64, 64)
+                    self.assertEqual(len(attempted_ids), 1)
+                    self.assertNotIn(attempted_ids[0], self.jobs)
+                    self.assertIsNone(self.service.active_job)
+                    self.assertFalse(self.service.submission_uncertain)
+                    self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
+
+                    # Connectivity recovers without restarting the bot. Either
+                    # request type must be able to use the local GPU next.
+                    self.service.request.side_effect = self.request
+                    if next_backend == "comfyui":
+                        data, _ = await self.service.generate("retry image", 64, 64)
+                        with Image.open(io.BytesIO(data)) as picture:
+                            self.assertEqual(picture.size, (1024, 1024))
+                        self.create.assert_not_awaited()
+                    else:
+                        _, used_fallback = await self.bot.request_completion(messages=[])
+                        self.assertFalse(used_fallback)
+                        self.create.assert_awaited_once()
+                        self.assertTrue(self.finished_free)
+                    self.assertEqual(self.service.backend, next_backend)
+                    self.assertIsNone(self.service.active_job)
+                    self.assertFalse(self.service.submission_uncertain)
+                    self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
+
     async def test_lost_submission_ack_does_not_treat_empty_queue_as_safe(self):
-        async def lost(backend, method, path, **kwargs):
-            if path == "/prompt":
-                raise TimeoutError("unknown submission result")
-            return await self.request(backend, method, path, **kwargs)
-        self.service.request.side_effect = lost
-        with self.assertRaises(TimeoutError):
-            await self.service.generate("unknown", 64, 64)
-        self.assertTrue(self.service.submission_uncertain)
-        self.assertIsNotNone(self.service.active_job)
-        self.assertTrue(any(path.startswith("/history/") for _, _, path, _ in self.calls))
-        with self.assertRaises(self.bot.ImageGenerationError):
-            await self.bot.request_completion(messages=[])
-        self.create.assert_not_awaited()
+        failures = (
+            TimeoutError("unknown submission result"),
+            self.bot.aiohttp.ClientOSError(104, "connection reset after submission"),
+            self.bot.aiohttp.ServerDisconnectedError("disconnected before acknowledgement"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                self.service = self.client.imagegen = self.bot.ImageGeneration(self.client.config)
+                self.service.backend = "lmstudio"
+
+                async def lost(backend, method, path, **kwargs):
+                    if path == "/prompt":
+                        raise failure
+                    return await self.request(backend, method, path, **kwargs)
+
+                self.service.request = AsyncMock(side_effect=lost)
+                with self.assertRaises(type(failure)):
+                    await self.service.generate("unknown", 64, 64)
+                self.assertTrue(self.service.submission_uncertain)
+                self.assertIsNotNone(self.service.active_job)
+                job_id = self.service.active_job
+                self.assertTrue(any(path == f"/history/{job_id}" for _, _, path, _ in self.calls))
+
+                # A restored connection and empty queue do not establish whether
+                # the server is still validating an already-sent submission.
+                self.service.request.side_effect = self.request
+                with self.assertRaisesRegex(self.bot.ImageGenerationError, "not confirmed"):
+                    await self.service.generate("unsafe retry", 64, 64)
+                with self.assertRaisesRegex(self.bot.ImageGenerationError, "not confirmed"):
+                    await self.bot.request_completion(messages=[])
+                self.assertEqual(self.service.active_job, job_id)
+                self.assertTrue(self.service.submission_uncertain)
+                self.assertFalse(self.jobs)
+                self.create.assert_not_awaited()
 
     async def test_timeout_cancels_only_our_job(self):
         self.client.config.image_timeout = 0.025
