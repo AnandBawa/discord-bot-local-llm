@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,8 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 import aiosqlite
 import discord
+import httpx2
+from openai import AsyncOpenAI
 from PIL import Image, ImageFile
 
 import check_features
@@ -345,15 +348,102 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "Found it")
         self.assertEqual(self.client.highest_token_count, 77)
 
-    async def test_tool_round_limit_is_preserved(self):
+    async def test_tool_limit_finishes_with_results_on_primary_and_fallback(self):
+        cases = (
+            ("primary", "Web search results:\nURL: https://example.com/source\nExcerpt: Verified detail", "Found the detail."),
+            ("fallback", "No results.", "I couldn't verify the requested detail."),
+            ("fallback_at_limit", "Search error: No results found.", "I couldn't verify the requested detail."),
+        )
+        for route, search_result, expected in cases:
+            with self.subTest(route=route):
+                seen = []
+                rounds = 0
+
+                async def respond(request):
+                    nonlocal rounds
+                    self.assertEqual(request.url.path, "/v1/chat/completions")
+                    body = json.loads(request.content)
+                    seen.append((request.url.host, body))
+                    final = body.get("tool_choice") == "none"
+                    if request.url.host == "primary.invalid" and (route == "fallback" or (route == "fallback_at_limit" and final)):
+                        return httpx2.Response(503, json={"error": {"message": "Synthetic outage"}})
+                    if final:
+                        self.assertEqual(rounds, 3)
+                        self.assertNotIn("tools", body)
+                        results = [m for m in body["messages"] if m["role"] == "tool"]
+                        self.assertEqual(len(results), 6)
+                        self.assertTrue(all(m["content"] == search_result for m in results))
+                        self.assertEqual(len({m["tool_call_id"] for m in results}), 6)
+                        self.assertIn("Test persona", body["messages"][0]["content"])
+                        self.assertIn("SOURCE DISPLAY RULE", body["messages"][0]["content"])
+                        self.assertEqual(body["messages"][-1]["role"], "system")
+                        self.assertIn("could not verify", body["messages"][-1]["content"])
+                        self.assertIn("Do not invent", body["messages"][-1]["content"])
+                        output = {"role": "assistant", "content": expected}
+                    else:
+                        self.assertEqual(body["tool_choice"], "auto")
+                        self.assertEqual(body["tools"], self.bot.tools_schema)
+                        self.assertLess(rounds, 3)
+                        self.assertNotIn("search limit", json.dumps(body["messages"]).lower())
+                        rounds += 1
+                        output = {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": f"search-{rounds}-{i}", "type": "function", "function": {
+                                "name": "web_search", "arguments": json.dumps({"query": f"query-{rounds}-{i}"}),
+                            }} for i in range(2)
+                        ]}
+                    return httpx2.Response(200, json={
+                        "id": "synthetic", "object": "chat.completion", "created": 0, "model": body["model"],
+                        "choices": [{"index": 0, "message": output, "finish_reason": "stop" if final else "tool_calls"}],
+                    })
+
+                async with AsyncOpenAI(
+                    api_key="synthetic", base_url="https://primary.invalid/v1", max_retries=0,
+                    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
+                ) as primary, AsyncOpenAI(
+                    api_key="synthetic", base_url="https://fallback.invalid/v1", max_retries=0,
+                    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
+                ) as fallback:
+                    self.client.lm_client = primary
+                    self.client.fallback_client = fallback
+                    self.client.config.fallback_model = "cloud-model"
+                    self.client.chat_dead_until = 0
+                    await self.bot.cmd_role.callback(self.interaction(), "Test persona")
+                    search = AsyncMock(return_value=search_result)
+                    with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+                        await self.bot.on_message(self.chat(content="Please verify this detail."))
+                    self.assertEqual(search.await_count, 6)
+                    self.assertEqual(len(seen), 4 if route == "primary" else 5)
+                    self.assertEqual(seen[-1][0], "primary.invalid" if route == "primary" else "fallback.invalid")
+                    self.assertEqual(self.client.chat_last_used_fallback, route != "primary")
+                    if route == "fallback_at_limit":
+                        self.assertEqual(seen[-2][1]["messages"], seen[-1][1]["messages"])
+                        self.assertNotIn("tools", seen[-2][1])
+                    cursor = await self.client.db_conn.execute(
+                        "SELECT role, content FROM chat_history WHERE server_id='channel:10' ORDER BY id",
+                    )
+                    history = await cursor.fetchall()
+                    self.assertEqual([role for role, _ in history], ["user", "assistant"])
+                    self.assertEqual(history[-1][1], expected)
+                    next_turn = await self.bot.build_ai_context("channel:10", "Next question")
+                    self.assertNotIn("The search limit for this reply", json.dumps(next_turn))
+
+    async def test_tool_limit_does_not_execute_provider_requests_after_final_attempt(self):
         call = SimpleNamespace(id="search", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
-        self.create.return_value = self.answer(None, [call])
-        search = AsyncMock(return_value="No results")
-        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
-            answer = await self.bot.generate_ai_response([], self.chat(), False)
-        self.assertIn("too many", answer)
-        self.assertEqual(search.await_count, self.bot.MAX_TOOL_ITERATIONS)
-        self.assertEqual(self.create.await_count, self.bot.MAX_TOOL_ITERATIONS + 1)
+        for text, calls in ((None, [call]), ("", [call]), (" \n", [call]), (None, []), ("Partial answer.", [call])):
+            with self.subTest(text=text, calls=bool(calls)):
+                self.create.reset_mock()
+                self.create.side_effect = [self.answer(None, [call]) for _ in range(3)] + [self.answer(text, calls)]
+                search = AsyncMock(return_value="No results")
+                with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+                    answer = await self.bot.generate_ai_response([], self.chat(), False)
+                if text and text.strip():
+                    self.assertEqual(answer, text)
+                else:
+                    self.assertEqual(answer, "⚠️ *I reached the search limit and couldn't complete an answer from the available results.*")
+                self.assertEqual(search.await_count, 3)
+                self.assertEqual(self.create.await_count, 4)
+                self.assertEqual(self.create.call_args.kwargs["tool_choice"], "none")
+                self.assertNotIn("tools", self.create.call_args.kwargs)
 
 
 if __name__ == "__main__":

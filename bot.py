@@ -534,7 +534,7 @@ tree = app_commands.CommandTree(
 
 # --- MODEL & CONTEXT LIMITS ---
 MAX_HISTORY_LENGTH = 100            # At this many saved messages, delete the oldest half
-MAX_TOOL_ITERATIONS = 3             # Max consecutive tool calls (like web searches) the AI can make in a single turn
+MAX_TOOL_ITERATIONS = 3             # Search rounds before a final answer with tools disabled
 LLM_TEMPERATURE = 1.0               # Creativity/randomness of the AI's standard chat responses (higher = more creative)
 LLM_MAX_TOKENS = 4096               # Maximum output token length for standard chat responses
 
@@ -1481,18 +1481,32 @@ async def generate_ai_response(messages_to_send, message, has_media):
         async with client.llm_queue:
             try:
                 for iteration in range(MAX_TOOL_ITERATIONS + 1):
+                    final_attempt = iteration == MAX_TOOL_ITERATIONS
+                    tool_options = {"tools": tools_schema, "tool_choice": "auto"}
+                    if final_attempt:
+                        tool_options = {"tool_choice": "none"}
+                        messages_to_send = [*messages_to_send, {
+                            "role": "system",
+                            "content": (
+                                "The search limit for this reply has been reached. No more searches or tools "
+                                "are available. Give your final answer to the user's request using the "
+                                "information already available. If that information is insufficient, "
+                                "clearly state what you could not verify. Do not invent missing facts or "
+                                "promise further searches. Follow the existing source-display rules."
+                            ),
+                        }]
                     response, used_fallback = await request_completion(
                         prefer_fallback=used_fallback, messages=messages_to_send,
                         temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS,
-                        tools=tools_schema, tool_choice="auto",
+                        **tool_options,
                     )
                     response_message = response.choices[0].message
                     calls = response_message.tool_calls
+                    if final_attempt:
+                        if (response_message.content or "").strip():
+                            return response_message.content
+                        return "⚠️ *I reached the search limit and couldn't complete an answer from the available results.*"
                     if not calls:
-                        break
-                    if iteration == MAX_TOOL_ITERATIONS:
-                        if not response_message.content:
-                            return "⚠️ *I needed to search too many things at once to answer that. Could you be more specific?*"
                         break
                     msg_dump = response_message.model_dump(exclude_none=True)
                     msg_dump.setdefault("content", "")
