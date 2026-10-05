@@ -424,6 +424,78 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.count("chat_history"), 2)
         self.assertEqual(self.client.conversation_versions["channel:10"], version)
 
+    async def test_role_view_unwraps_old_confirmations_without_writing_state(self):
+        persona = "You are a neutral AI.\nKeep answers short.\n*Keep this emphasis.*"
+        saved = f"✅ Saved persona and history cleared!\n\n**Current Persona:**\n> {persona}"
+        wrapped = f"**Current Persona:**\n> *{saved}*"
+        for guild_id, channel_id, key, stored in (
+            (1, 10, "channel:10", saved),
+            (None, 9420, "dm:42", wrapped),
+        ):
+            with self.subTest(scope=key):
+                await self.client.db_conn.execute(
+                    "INSERT INTO server_config VALUES (?, ?)", (key, stored),
+                )
+                await self.seed(server_id=key)
+                cursor = await self.client.db_conn.execute("SELECT * FROM chat_history ORDER BY id")
+                history = await cursor.fetchall()
+                versions = dict(self.client.conversation_versions)
+                for _ in range(2):
+                    interaction = self.interaction(server_id=guild_id, channel_id=channel_id)
+                    await self.bot.cmd_role.callback(interaction)
+                    interaction.followup.send.assert_awaited_once_with(
+                        f"**Current Persona:**\n> *{persona}*", ephemeral=guild_id is None,
+                    )
+                    self.assertEqual(await self.bot.get_persona(key), persona)
+                    cursor = await self.client.db_conn.execute(
+                        "SELECT prompt FROM server_config WHERE server_id = ?", (key,),
+                    )
+                    self.assertEqual((await cursor.fetchone())[0], stored)
+                    cursor = await self.client.db_conn.execute("SELECT * FROM chat_history ORDER BY id")
+                    self.assertEqual(await cursor.fetchall(), history)
+                    self.assertEqual(self.client.conversation_versions, versions)
+
+    async def test_role_save_unwraps_reply_but_keeps_public_change_requirement(self):
+        # A wrapped persona literally named 'clear' must not become a reset command.
+        for persona in ("You are a neutral AI.", "clear", self.bot.DEFAULT_PERSONA):
+            with self.subTest(persona=persona):
+                action = "Persona removed" if persona == self.bot.DEFAULT_PERSONA else "Saved persona"
+                copied_reply = f"✅ {action} and history cleared!\n\n**Current Persona:**\n> {persona}"
+                await self.bot.cmd_role.callback(self.interaction(), "Original")
+                await self.seed()
+                interaction = self.interaction()
+                interaction.followup.send.return_value.flags.ephemeral = True
+                await self.bot.cmd_role.callback(interaction, copied_reply)
+                self.assertEqual(await self.bot.get_persona("channel:10"), "Original")
+                self.assertEqual(await self.count("chat_history"), 2)
+
+                interaction = self.interaction()
+                await self.bot.cmd_role.callback(interaction, copied_reply)
+                cursor = await self.client.db_conn.execute(
+                    "SELECT prompt FROM server_config WHERE server_id = 'channel:10'",
+                )
+                self.assertEqual((await cursor.fetchone())[0], persona)
+                self.assertEqual(await self.count("chat_history"), 0)
+                confirmation = interaction.followup.send.return_value.edit.call_args.kwargs["content"]
+                self.assertEqual(confirmation,
+                                 f"✅ Saved persona and history cleared!\n\n**Current Persona:**\n> {persona}")
+
+    async def test_persona_reply_cleanup_preserves_ordinary_text_and_incomplete_wrappers(self):
+        header = "✅ Saved persona and history cleared!\n\n**Current Persona:**\n> "
+        for persona in (
+            "  A neutral AI.\n> Keep this quote.\n*Keep these asterisks.*  ",
+            "Explain this example:\n" + header + "Example persona",
+            "✅ Saved persona and history cleared!\nKeep this literal sentence.",
+            "**Current Persona:**\n> Literal text without the view's closing markup",
+            "**Current Persona:**\n> **",
+            header,
+        ):
+            with self.subTest(persona=persona):
+                await self.client.db_conn.execute(
+                    "INSERT OR REPLACE INTO server_config VALUES ('channel:10', ?)", (persona,),
+                )
+                self.assertEqual(await self.bot.get_persona("channel:10"), persona)
+
     async def test_failed_clear_rolls_back_history(self):
         await self.seed()
         await self.client.db_conn.execute(

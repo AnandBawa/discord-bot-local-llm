@@ -599,11 +599,28 @@ async def delete_history(server_id, limit=None):
         )
 
 
+def persona_text(prompt):
+    """Remove complete /role reply wrappers, preserving the enclosed persona."""
+    wrappers = (
+        ("✅ Saved persona and history cleared!\n\n**Current Persona:**\n> ", ""),
+        ("✅ Persona removed and history cleared!\n\n**Current Persona:**\n> ", ""),
+        ("**Current Persona:**\n> *", "*"),
+    )
+    while True:
+        for prefix, suffix in wrappers:
+            if (prompt.startswith(prefix) and prompt.endswith(suffix)
+                    and len(prompt) > len(prefix) + len(suffix)):
+                prompt = prompt[len(prefix):len(prompt) - len(suffix)]
+                break
+        else:
+            return prompt
+
+
 async def get_persona(server_id):
     async with client.db_lock:
         cursor = await client.db_conn.execute("SELECT prompt FROM server_config WHERE server_id = ?", (server_id,))
         row = await cursor.fetchone()
-        return (row[0] if row else None) or DEFAULT_PERSONA
+        return persona_text((row[0] if row else None) or DEFAULT_PERSONA)
 
 
 @contextlib.asynccontextmanager
@@ -1167,7 +1184,7 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
         )
         return
 
-    new_prompt = "" if prompt.lower() == "clear" else prompt
+    new_prompt = "" if prompt.lower() == "clear" else persona_text(prompt)
     action = "Saved persona" if new_prompt else "Persona removed"
     saved_header = f"✅ {action} and history cleared!\n\n**Current Persona:**\n> "
     persona = new_prompt or DEFAULT_PERSONA

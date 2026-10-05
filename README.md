@@ -139,6 +139,8 @@ These are direct messages with the bot, not group DMs or commands from a user-in
 - **`/role`**: View or change the persona for this channel/thread or your DM. Changing it clears only that conversation. Type `clear` to restore the neutral default. Server changes keep the normal command-linked reply showing who used `/role` and the new persona. Before saving, the bot checks that Discord actually made the reply public; a private or failed reply leaves the persona and history unchanged. Long personas continue in additional public replies, all of which must succeed. This also applies to personally installed apps. DM changes stay private, and viewing a persona changes nothing. Each thread is independent of its parent channel; personas do not carry over.
 - **`/clear`**: Delete the current channel/thread or DM conversation, retaining its persona. It clears saved context, not Discord messages.
 
+Complete bot `/role` reply wrappers are unwrapped when reading a saved persona and before saving newly submitted persona text. This prevents an old “Saved persona and history cleared!” confirmation from appearing inside the current persona. Viewing `/role` remains read-only: it does not rewrite the stored value or clear history. The enclosed persona text is preserved.
+
 The queue for each channel, thread, or DM covers context loading, generation, saving, and reply delivery. Slow requests delay later turns in the same conversation. Clear and persona changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
 
 ## Image Generation Setup
