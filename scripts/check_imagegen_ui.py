@@ -136,8 +136,6 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(entered.wait(), 1)
             self.backend.generate.assert_not_awaited()
-            # Even a previously selected cloud fallback must not bypass UI admission.
-            self.client.chat_dead_until = float("inf")
             with patch.object(self.bot, "handle_server_message", new=AsyncMock()) as handle:
                 for server in (1, 2):
                     for history in (True, False):

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx2
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 from PIL import Image
 
 
@@ -102,7 +102,7 @@ async def check_bot():
                 patch.dict(os.environ, environment, clear=True),
                 patch('dotenv.load_dotenv', side_effect=AssertionError('Tests must not read .env')),
                 patch('builtins.__import__', side_effect=import_without_chroma),
-                patch('openai.AsyncOpenAI', side_effect=make_model_client),
+                patch('openai.AsyncOpenAI', side_effect=make_model_client) as model_client_factory,
                 patch('discord.Client.run', side_effect=AssertionError('Discord login is disabled')),
                 patch('socket.socket.connect', side_effect=AssertionError('Network access is disabled')),
                 patch('socket.socket.connect_ex', side_effect=AssertionError('Network access is disabled')),
@@ -114,7 +114,7 @@ async def check_bot():
                 bot.tree.sync = AsyncMock(return_value=[])
                 try:
                     await bot.client.setup_hook()
-                    assert bot.client.fallback_client is None
+                    model_client_factory.assert_called_once()
                     models = await bot.client.lm_client.models.list()
                     assert models.data[0].id == 'local-model'
                     print('PASS SDK import, request serialization, and timeout configuration')
@@ -156,6 +156,10 @@ async def check_bot():
                         'FALLBACK_API_KEY': 'offline-cloud-key', 'FALLBACK_MODEL_NAME': 'cloud-chat',
                     })
                     await bot.client.setup_hook()
+                    assert model_client_factory.call_count == 2, 'Each startup must create only one chat client'
+                    assert all(call.kwargs['base_url'] == environment['LLM_BASE_URL']
+                               for call in model_client_factory.call_args_list)
+                    assert all(call.kwargs['max_retries'] == 0 for call in model_client_factory.call_args_list)
                     context = await bot.build_ai_context('channel:10', 'Follow up')
                     assert 'Persisted persona' in context[0]['content']
                     assert context[1:] == [
@@ -168,14 +172,19 @@ async def check_bot():
                     print('PASS history/persona restart persistence without Chroma or embedding calls')
 
                     primary_offline = True
-                    response, used_fallback = await bot.request_completion(messages=[{'role': 'user', 'content': 'Hello'}])
-                    assert used_fallback and response.model == 'cloud-chat'
+                    try:
+                        await bot.request_completion(messages=[{'role': 'user', 'content': 'Hello'}])
+                    except APIStatusError as exc:
+                        assert exc.status_code == 503
+                    else:
+                        raise AssertionError('The configured endpoint failure must propagate')
+                    assert len(requests_seen) == 4, 'Failures must not retry or use another endpoint'
+                    primary_offline = False
+                    response = await bot.request_completion(messages=[{'role': 'user', 'content': 'Hello'}])
+                    assert response.model == 'local-model'
                     assert response.choices[0].message.content == 'Synthetic answer.'
-                    assert requests_seen[-2:] == [
-                        ('dependency-check.invalid', '/v1/chat/completions'),
-                        ('cloud-check.invalid', '/v1/chat/completions'),
-                    ]
-                    print('PASS optional cloud chat fallback through the SDK transport')
+                    assert all(host == 'dependency-check.invalid' for host, _ in requests_seen)
+                    print('PASS single-endpoint failures, no retries, and recovery despite obsolete fallback settings')
 
                     with Image.new('RGBA', (1200, 600), (20, 40, 80, 255)) as image:
                         buffer = io.BytesIO()

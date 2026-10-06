@@ -1,7 +1,6 @@
 """Offline ComfyUI API and GPU handoff checks; no live models or Discord login."""
 
 import asyncio
-import contextlib
 import copy
 import io
 from types import SimpleNamespace
@@ -198,11 +197,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.create.await_count, 3)
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
-    async def test_images_queue_but_decline_chat_without_fallback_or_cooldown(self):
-        cloud = AsyncMock(return_value=self.completion("cloud answer"))
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
-        )
+    async def test_images_queue_but_decline_chat_until_all_images_finish(self):
         self.hold_image = True
         images = [asyncio.create_task(self.service.generate(str(i), 64, 64)) for i in range(3)]
         try:
@@ -212,8 +207,6 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(self.bot.ModelBusyError, "Image generation is active right now"):
                 await asyncio.wait_for(self.bot.request_completion(messages=[]), 1)
             self.create.assert_not_awaited()
-            cloud.assert_not_awaited()
-            self.assertEqual(self.client.chat_dead_until, 0)
             self.assertFalse(any(path == "/free" for _, _, path, _ in self.calls))
         finally:
             self.hold_image = False
@@ -253,6 +246,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             with self.subTest(failed=failed):
                 started, release = asyncio.Event(), asyncio.Event()
                 self.started.clear()
+                self.create.reset_mock()
                 async def infer(**kwargs):
                     started.set()
                     await release.wait()
@@ -274,6 +268,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                     release.set()
                 with self.assertRaises(asyncio.CancelledError):
                     await asyncio.wait_for(chat, 2)
+                self.create.assert_awaited_once()
                 await self.service.generate("after cancelled chat", 64, 64)
                 self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
@@ -323,36 +318,31 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.service.backend)
                 self.create.assert_not_awaited()
 
-    async def test_chat_admission_failure_uses_cloud_without_local_inference(self):
-        cloud = AsyncMock(return_value=self.completion("Cloud answer"))
-        self.client.config.fallback_model = "cloud-chat"
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
-        )
-        @contextlib.asynccontextmanager
-        async def unavailable():
-            raise self.bot.ImageGenerationError("GPU handoff failed")
-            yield
-        self.service.local_request = unavailable
-        response, used_fallback = await self.bot.request_completion(messages=[])
-        self.assertEqual(response.choices[0].message.content, "Cloud answer")
-        self.assertTrue(used_fallback)
-        self.create.assert_not_awaited()
-        cloud.assert_awaited_once_with(model="cloud-chat", messages=[])
-        self.client.fallback_client = None
-        with self.assertRaisesRegex(self.bot.ImageGenerationError, "handoff failed"):
-            await self.bot.request_completion(messages=[])
+    async def test_chat_admission_failure_blocks_inference_and_releases_gpu(self):
+        with patch.object(self.service, "switch", new=AsyncMock(
+            side_effect=self.bot.ImageGenerationError("GPU handoff failed"),
+        )) as switch:
+            with self.assertRaisesRegex(self.bot.ImageGenerationError, "handoff failed"):
+                await self.bot.request_completion(messages=[])
+            switch.assert_awaited_once_with("lmstudio")
+            self.create.assert_not_awaited()
+        self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
+        self.assertFalse(self.service.entry.locked())
+        response = await self.bot.request_completion(messages=[])
+        self.assertIs(response, self.create.return_value)
+        self.create.assert_awaited_once_with(model="chat-alias", messages=[])
 
-    async def test_failed_chat_fallback_is_not_retried_after_admission(self):
+    async def test_failed_local_chat_is_not_retried_and_releases_gpu(self):
         self.create.side_effect = RuntimeError("local failed")
-        cloud = AsyncMock(side_effect=RuntimeError("cloud failed"))
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
-        )
-        with self.assertRaisesRegex(RuntimeError, "cloud failed"):
+        with self.assertRaisesRegex(RuntimeError, "local failed"):
             await self.bot.request_completion(messages=[])
-        self.create.assert_awaited_once()
-        cloud.assert_awaited_once()
+        self.create.assert_awaited_once_with(model="chat-alias", messages=[])
+        self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
+        self.assertFalse(self.service.entry.locked())
+        self.create.side_effect = None
+        response = await self.bot.request_completion(messages=[])
+        self.assertIs(response, self.create.return_value)
+        self.assertEqual(self.create.await_count, 2)
 
     async def test_cancellation_drains_late_submission_before_targeted_cancel(self):
         entered, accepted = asyncio.Event(), asyncio.Event()
@@ -414,8 +404,8 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(picture.size, (1024, 1024))
                         self.create.assert_not_awaited()
                     else:
-                        _, used_fallback = await self.bot.request_completion(messages=[])
-                        self.assertFalse(used_fallback)
+                        response = await self.bot.request_completion(messages=[])
+                        self.assertIs(response, self.create.return_value)
                         self.create.assert_awaited_once()
                         self.assertTrue(self.finished_free)
                     self.assertEqual(self.service.backend, next_backend)
@@ -469,10 +459,6 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(path == "/interrupt" for _, _, path, _ in self.calls))
 
     async def test_failed_image_cancellation_declines_chat_until_remote_job_finishes(self):
-        cloud = AsyncMock(return_value=self.completion("cloud answer"))
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
-        )
         self.client.config.image_timeout = 0.025
         self.hold_image = True
         cancellations = []
@@ -502,14 +488,13 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             self.assertIn("unfinished jobs", message.reply.call_args.args[0])
         self.assertEqual(await fixtures.BotChecks.count(self, "chat_history"), 0)
         self.create.assert_not_awaited()
-        cloud.assert_not_awaited()
-        self.assertEqual(self.client.chat_dead_until, 0)
         # A later retry checks the remote queue again, instead of remaining locked.
         self.hold_image = False
         self.running.clear()
         self.service.request.side_effect = self.request
-        _, used_fallback = await self.bot.request_completion(messages=[])
-        self.assertFalse(used_fallback)
+        response = await self.bot.request_completion(messages=[])
+        self.assertIs(response, self.create.return_value)
+        self.create.assert_awaited_once()
         self.assertTrue(self.finished_free)
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 

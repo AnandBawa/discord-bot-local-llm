@@ -42,58 +42,47 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             content=f"<@99> {content}", attachments=[], stickers=[], reply=AsyncMock(),
         )
 
-    async def test_status_reports_chat_model_from_last_successful_request(self):
-        self.client.config.model = "primary-chat"
-        self.client.config.fallback_model = "fallback-chat"
-        cloud = AsyncMock(return_value=self.completion("Answer"))
-        self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
-        models = self.client.lm_client.models = SimpleNamespace(list=AsyncMock())
+    async def test_status_reports_configured_chat_model_without_inference_or_probe(self):
+        models = self.client.lm_client.models = SimpleNamespace(
+            list=AsyncMock(side_effect=AssertionError("Status must not probe the model server")),
+        )
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.123):
-            for chat_fallback in (True, False):
-                with self.subTest(chat_fallback=chat_fallback):
-                    self.client.chat_dead_until = 0
-                    self.create.side_effect = RuntimeError("chat unavailable") if chat_fallback else None
-                    await self.bot.request_completion(messages=[])
-                    # Cooldown expiry does not change the provider that handled the last request.
-                    self.client.chat_dead_until = 0
+            for model in ("configured-chat", "another-local-model"):
+                with self.subTest(model=model):
+                    self.client.config.model = model
                     interaction = self.interaction()
                     await self.bot.cmd_status.callback(interaction)
                     text = interaction.followup.send.call_args.args[0]
-                    self.assertIn("**Chat model:** `" + ("fallback-chat (fallback)" if chat_fallback else "primary-chat") + "`", text)
+                    self.assertIn(f"**Chat model:** `{model}`", text)
                     self.assertNotIn("Memory model", text)
                     self.assertNotIn("backup:", text.lower())
+        self.create.assert_not_awaited()
         models.list.assert_not_awaited()
 
-    async def test_status_keeps_primary_model_until_fallback_succeeds(self):
-        self.client.config.model = "primary-chat"
-        self.client.config.fallback_model = "fallback-chat"
-        cloud = AsyncMock(side_effect=RuntimeError("fallback unavailable"))
-        self.client.fallback_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock())
-        self.client.lm_client.models = SimpleNamespace(list=AsyncMock(side_effect=AssertionError("Status must not probe providers")))
+    async def test_local_failure_is_not_retried_and_status_recovers_without_delay(self):
+        self.client.config.model = "configured-chat"
+        self.client.lm_client.models = SimpleNamespace(
+            list=AsyncMock(side_effect=AssertionError("Status must not probe the model server")),
+        )
         with patch.object(discord.Client, "latency", new_callable=PropertyMock, return_value=0.1):
-            for failed_attempt in (False, True):
-                if failed_attempt:
-                    self.create.side_effect = RuntimeError("primary unavailable")
-                    with self.assertRaises(RuntimeError):
-                        await self.bot.request_completion(messages=[])
-                interaction = self.interaction()
-                await self.bot.cmd_status.callback(interaction)
-                text = interaction.followup.send.call_args.args[0]
-                self.assertIn("**Chat model:** `primary-chat`", text)
-                self.assertNotIn("Memory model", text)
-                self.assertNotIn("fallback-chat", text)
-            cloud.side_effect = None
-            cloud.return_value = self.completion("Answer")
-            await self.bot.request_completion(messages=[])
-            interaction = self.interaction()
-            await self.bot.cmd_status.callback(interaction)
-            self.assertIn("**Chat model:** `fallback-chat (fallback)`", interaction.followup.send.call_args.args[0])
-            self.client.chat_dead_until = 0
-            self.create.side_effect = None
-            await self.bot.request_completion(messages=[])
-            interaction = self.interaction()
-            await self.bot.cmd_status.callback(interaction)
-            self.assertIn("**Chat model:** `primary-chat`", interaction.followup.send.call_args.args[0])
+            for failed_attempt in (True, False):
+                with self.subTest(failed_attempt=failed_attempt):
+                    self.create.reset_mock()
+                    self.create.side_effect = RuntimeError("local unavailable") if failed_attempt else None
+                    if failed_attempt:
+                        with self.assertRaisesRegex(RuntimeError, "local unavailable"):
+                            await self.bot.request_completion(messages=[])
+                    else:
+                        response = await self.bot.request_completion(messages=[])
+                        self.assertIs(response, self.create.return_value)
+                    self.create.assert_awaited_once_with(model="configured-chat", messages=[])
+                    interaction = self.interaction()
+                    await self.bot.cmd_status.callback(interaction)
+                    text = interaction.followup.send.call_args.args[0]
+                    self.assertIn("**Chat model:** `configured-chat`", text)
+                    self.assertNotIn("Memory model", text)
+                    self.assertNotIn("backup:", text.lower())
+                    self.create.assert_awaited_once()
         self.client.lm_client.models.list.assert_not_awaited()
 
     async def test_commands_and_help_expose_only_retained_features(self):

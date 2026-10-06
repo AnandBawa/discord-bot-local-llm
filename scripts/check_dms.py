@@ -500,11 +500,6 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
 
     async def test_dm_and_server_images_block_all_chat_before_discord_acknowledges(self):
         self.enable_images()
-        cloud = AsyncMock()
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=cloud)), close=AsyncMock(),
-        )
-        self.client.chat_dead_until = float("inf")
         for server in (None, 42):
             with self.subTest(image_server=server):
                 entered, release = asyncio.Event(), asyncio.Event()
@@ -525,7 +520,6 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("Image generation is active right now", replies[0])
                     self.assertEqual(await self.count("chat_history"), 0)
                     self.create.assert_not_awaited()
-                    cloud.assert_not_awaited()
                 finally:
                     release.set()
                     await task

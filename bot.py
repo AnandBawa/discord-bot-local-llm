@@ -39,9 +39,6 @@ class Config:
         self.api_key = env.get("LLM_API_KEY", "lm-studio")
         self.model = env.get("LLM_MODEL_NAME", "local-model")
         self.vision_enabled = env.get("VISION_ENABLED", "True").lower() in ("true", "1", "yes")
-        self.fallback_url = env.get("FALLBACK_BASE_URL", "")
-        self.fallback_key = env.get("FALLBACK_API_KEY", "")
-        self.fallback_model = env.get("FALLBACK_MODEL_NAME", "")
         self.comfy_url = env.get("COMFYUI_BASE_URL", "").strip().rstrip("/")
         self.image_timeout = float(env.get("IMAGEGEN_TIMEOUT", "600"))
         if not math.isfinite(self.image_timeout) or self.image_timeout <= 0:
@@ -64,8 +61,6 @@ def configure_logging():
     for name in ("httpx", "httpx2", "openai", "httpcore", "primp", "ddgs"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-
-CIRCUIT_BREAKER_COOLDOWN = 60.0
 
 class ImageGenerationError(Exception):
     """A failure that can be explained to the person requesting an image."""
@@ -458,9 +453,6 @@ class MyAIClient(discord.Client):
         super().__init__(*args, **kwargs)
         self.config = Config({})
         self.lm_client = None
-        self.fallback_client = None
-        self.chat_dead_until = 0.0
-        self.chat_last_used_fallback = False
         self.imagegen = None
         self.image_users = set()
         self.image_tasks = set()
@@ -481,11 +473,6 @@ class MyAIClient(discord.Client):
         if self.lm_client is None:
             self.lm_client = AsyncOpenAI(
                 base_url=self.config.base_url, api_key=self.config.api_key,
-                timeout=Timeout(120.0, connect=2.0), max_retries=0,
-            )
-        if self.fallback_client is None and self.config.fallback_url and self.config.fallback_key:
-            self.fallback_client = AsyncOpenAI(
-                base_url=self.config.fallback_url, api_key=self.config.fallback_key,
                 timeout=Timeout(120.0, connect=2.0), max_retries=0,
             )
         if self.config.comfy_url:
@@ -509,7 +496,7 @@ class MyAIClient(discord.Client):
         # Run every cleanup even if a resource close fails.
         async with contextlib.AsyncExitStack() as cleanup:
             cleanup.push_async_callback(super().close)
-            for resource in (self.fallback_client, self.lm_client, self.db_conn, self.imagegen):
+            for resource in (self.lm_client, self.db_conn, self.imagegen):
                 if resource is not None:
                     cleanup.push_async_callback(resource.close)
             cleanup.push_async_callback(self.close_pdf_executor)
@@ -938,37 +925,20 @@ tools_schema = [{
 AVAILABLE_TOOLS = {"web_search": perform_web_search}
 
 # ==========================================
-# 4. CHAT MODEL ROUTING
+# 4. CHAT MODEL REQUESTS
 # ==========================================
 
-async def request_completion(*, prefer_fallback=False, **kwargs):
-    """Route chat calls; callers own the LLM concurrency slot."""
-    use_fallback = bool(client.fallback_client and (
-        prefer_fallback or time.monotonic() < client.chat_dead_until
-    ))
-    if not use_fallback:
-        try:
-            access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
-            async with access:
-                model = client.imagegen.resolve_model(client.config.model) if client.imagegen else client.config.model
-                call = client.lm_client.chat.completions.create(model=model, **kwargs)
-                response = await finish_model_call(call) if client.imagegen else await call
-            client.chat_dead_until = 0.0
-        except ModelBusyError:
-            raise
-        except Exception:
-            if client.fallback_client is None:
-                raise
-            logging.warning("Local chat request failed; using the configured fallback")
-            client.chat_dead_until = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
-            use_fallback = True
-    if use_fallback:
-        response = await client.fallback_client.chat.completions.create(model=client.config.fallback_model, **kwargs)
-    client.chat_last_used_fallback = use_fallback
+async def request_completion(**kwargs):
+    """Call the configured chat endpoint; callers own the LLM concurrency slot."""
+    access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
+    async with access:
+        model = client.imagegen.resolve_model(client.config.model) if client.imagegen else client.config.model
+        call = client.lm_client.chat.completions.create(model=model, **kwargs)
+        response = await finish_model_call(call) if client.imagegen else await call
     usage = getattr(response, "usage", None)
     if usage and usage.total_tokens is not None:
         client.highest_token_count = max(client.highest_token_count, usage.total_tokens)
-    return response, use_fallback
+    return response
 
 
 # ==========================================
@@ -1001,8 +971,6 @@ async def cmd_status(interaction: discord.Interaction):
     latency = client.latency
     ping = f"{round(latency * 1000)} ms" if math.isfinite(latency) else "Unavailable"
     chat_model = client.config.model
-    if client.chat_last_used_fallback:
-        chat_model = f"{client.config.fallback_model} (fallback)"
     async with client.db_lock:
         cursor = await client.db_conn.execute(
             "SELECT COUNT(*) FROM chat_history WHERE server_id = ?",
@@ -1476,7 +1444,6 @@ def merge_history(messages):
 
 
 async def generate_ai_response(messages_to_send, message, has_media):
-    used_fallback = False
     async with safe_typing(message.channel):
         async with client.llm_queue:
             try:
@@ -1485,18 +1452,24 @@ async def generate_ai_response(messages_to_send, message, has_media):
                     tool_options = {"tools": tools_schema, "tool_choice": "auto"}
                     if final_attempt:
                         tool_options = {"tool_choice": "none"}
-                        messages_to_send = [*messages_to_send, {
-                            "role": "system",
-                            "content": (
-                                "The search limit for this reply has been reached. No more searches or tools "
-                                "are available. Give your final answer to the user's request using the "
-                                "information already available. If that information is insufficient, "
-                                "clearly state what you could not verify. Do not invent missing facts or "
-                                "promise further searches. Follow the existing source-display rules."
-                            ),
-                        }]
-                    response, used_fallback = await request_completion(
-                        prefer_fallback=used_fallback, messages=messages_to_send,
+                        final_instruction = (
+                            "The search limit for this reply has been reached. No more searches or tools "
+                            "are available. Give your final answer to the user's request using the "
+                            "information already available. If that information is insufficient, "
+                            "clearly state what you could not verify. Do not invent missing facts or "
+                            "promise further searches. Follow the existing source-display rules."
+                        )
+                        # Some model templates accept a system message only at the start.
+                        # Copy it so this temporary instruction cannot alter saved context.
+                        if messages_to_send and messages_to_send[0]["role"] == "system":
+                            messages_to_send = [
+                                {**messages_to_send[0], "content": messages_to_send[0]["content"] + "\n\n" + final_instruction},
+                                *messages_to_send[1:],
+                            ]
+                        else:
+                            messages_to_send = [{"role": "system", "content": final_instruction}, *messages_to_send]
+                    response = await request_completion(
+                        messages=messages_to_send,
                         temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS,
                         **tool_options,
                     )

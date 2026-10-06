@@ -36,14 +36,6 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         message.model_dump = lambda **kwargs: {"role": "assistant", "content": text or "", "tool_calls": []}
         return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=SimpleNamespace(total_tokens=tokens))
 
-    def fallback(self, response):
-        create = AsyncMock(return_value=response)
-        self.client.config.fallback_model = "cloud-model"
-        self.client.fallback_client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=AsyncMock(),
-        )
-        return create
-
     @staticmethod
     def picture():
         with Image.new("RGB", (2, 2), "white") as image:
@@ -293,14 +285,13 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.count("chat_history"), 0)
 
     async def test_shutdown_closes_remaining_resources_after_failure(self):
-        for failing in ("database", "primary", "fallback", "imagegen"):
+        for failing in ("database", "primary", "imagegen"):
             with self.subTest(failing=failing):
                 closing = self.bot.MyAIClient(intents=discord.Intents.none())
-                resources = {name: SimpleNamespace(close=AsyncMock()) for name in ("database", "primary", "fallback", "imagegen")}
+                resources = {name: SimpleNamespace(close=AsyncMock()) for name in ("database", "primary", "imagegen")}
                 resources[failing].close.side_effect = RuntimeError(f"{failing} close failed")
                 closing.db_conn = resources["database"]
                 closing.lm_client = resources["primary"]
-                closing.fallback_client = resources["fallback"]
                 closing.imagegen = resources["imagegen"]
                 with patch.object(discord.Client, "close", new=AsyncMock()) as discord_close:
                     with self.assertRaisesRegex(RuntimeError, f"{failing} close failed"):
@@ -309,64 +300,74 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                 for resource in resources.values():
                     resource.close.assert_awaited_once()
 
-    async def test_chat_uses_configured_fallback_and_cooldown(self):
-        self.create.side_effect = RuntimeError("local offline")
-        cloud = self.fallback(self.answer("Cloud answer"))
+    async def test_chat_failure_propagates_without_retry_or_cooldown(self):
+        failure = RuntimeError("local offline")
+        self.create.side_effect = failure
         for _ in range(2):
-            response, used_fallback = await self.bot.request_completion(messages=[{"role": "user", "content": "Hello"}])
-            self.assertTrue(used_fallback)
-            self.assertEqual(response.choices[0].message.content, "Cloud answer")
-        self.assertEqual(self.create.await_count, 1)
-        self.assertEqual(cloud.await_count, 2)
-        self.assertEqual(cloud.call_args.kwargs["model"], "cloud-model")
-        self.assertEqual(cloud.call_args.kwargs["messages"], [{"role": "user", "content": "Hello"}])
+            with self.assertRaises(RuntimeError) as raised:
+                await self.bot.request_completion(messages=[{"role": "user", "content": "Hello"}])
+            self.assertIs(raised.exception, failure)
+        self.assertEqual(self.create.await_count, 2)
+        self.assertEqual(self.client.highest_token_count, 0)
+        self.create.side_effect = None
+        self.create.return_value = self.answer("Recovered", tokens=77)
+        response = await self.bot.request_completion(messages=[{"role": "user", "content": "Hello"}])
+        self.assertEqual(self.create.await_count, 3)
+        self.assertIs(response, self.create.return_value)
+        self.assertEqual(self.client.highest_token_count, 77)
+        for call in self.create.call_args_list:
+            self.assertEqual(call.kwargs["model"], self.client.config.model)
+            self.assertEqual(call.kwargs["messages"], [{"role": "user", "content": "Hello"}])
 
-    async def test_config_ignores_removed_owner_and_embedding_settings(self):
+    async def test_config_ignores_removed_owner_embedding_and_fallback_settings(self):
         settings = {
             "LLM_MODEL_NAME": "configured-chat", "VISION_ENABLED": "false",
             "BOT_OWNER_ID": "obsolete-not-an-integer", "MEMORY_DISTANCE_THRESHOLD": "obsolete-not-a-number",
             "EMB_MODEL_NAME": "obsolete-embedding", "FALLBACK_EMB_API_KEY": "obsolete-key",
+            "FALLBACK_BASE_URL": "https://unused.invalid/v1", "FALLBACK_API_KEY": "obsolete-key",
+            "FALLBACK_MODEL_NAME": "obsolete-model",
         }
         config = self.bot.Config(settings)
         self.assertEqual(config.model, "configured-chat")
         self.assertFalse(config.vision_enabled)
-        for name in ("owner_id", "embedding_model", "embedding_key", "memory_distance"):
+        for name in ("owner_id", "embedding_model", "embedding_key", "memory_distance",
+                     "fallback_url", "fallback_key", "fallback_model"):
             self.assertFalse(hasattr(config, name))
 
-    async def test_tool_loop_keeps_fallback_even_if_another_call_resets_cooldown(self):
+    async def test_tool_round_failure_reports_error_without_saving_a_turn(self):
         call = SimpleNamespace(id="search", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
-        self.create.side_effect = RuntimeError("local offline")
-        cloud = self.fallback(None)
-        cloud.side_effect = [self.answer(None, [call]), self.answer("Found it", tokens=77)]
-        async def search(**kwargs):
-            self.client.chat_dead_until = 0
-            return "URL: https://example.com/source\n"
-        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
-            answer = await self.bot.generate_ai_response([], self.chat(), False)
-        self.assertEqual(self.create.await_count, 1)
-        self.assertEqual(cloud.await_count, 2)
-        self.assertEqual(answer, "Found it")
-        self.assertEqual(self.client.highest_token_count, 77)
+        self.create.side_effect = [self.answer(None, [call]), RuntimeError("local offline")]
+        search = AsyncMock(return_value="URL: https://example.com/source\n")
+        with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search), \
+                patch.object(self.bot, "send_chunked_message", new_callable=AsyncMock) as send:
+            await self.bot.on_message(self.chat(content="Please verify this detail."))
+        self.assertEqual(self.create.await_count, 2)
+        search.assert_awaited_once()
+        send.assert_awaited_once()
+        self.assertIn("couldn't process", send.call_args.args[1])
+        self.assertEqual(await self.count("chat_history"), 0)
 
-    async def test_tool_limit_finishes_with_results_on_primary_and_fallback(self):
+    async def test_tool_limit_finishes_with_one_leading_system_message(self):
         cases = (
-            ("primary", "Web search results:\nURL: https://example.com/source\nExcerpt: Verified detail", "Found the detail."),
-            ("fallback", "No results.", "I couldn't verify the requested detail."),
-            ("fallback_at_limit", "Search error: No results found.", "I couldn't verify the requested detail."),
+            ("Web search results:\nURL: https://example.com/source\nExcerpt: Verified detail", "Found the detail."),
+            ("No results.", "I couldn't verify the requested detail."),
+            ("Search error: No results found.", "I couldn't verify the requested detail."),
         )
-        for route, search_result, expected in cases:
-            with self.subTest(route=route):
+        for search_result, expected in cases:
+            with self.subTest(search_result=search_result):
                 seen = []
                 rounds = 0
 
                 async def respond(request):
                     nonlocal rounds
+                    self.assertEqual(request.url.host, "primary.invalid")
                     self.assertEqual(request.url.path, "/v1/chat/completions")
                     body = json.loads(request.content)
                     seen.append((request.url.host, body))
+                    # The installed LM Studio model rejects non-leading system messages.
+                    if any(m["role"] == "system" for m in body["messages"][1:]):
+                        return httpx2.Response(500, json={"error": {"message": "System message must be at the beginning."}})
                     final = body.get("tool_choice") == "none"
-                    if request.url.host == "primary.invalid" and (route == "fallback" or (route == "fallback_at_limit" and final)):
-                        return httpx2.Response(503, json={"error": {"message": "Synthetic outage"}})
                     if final:
                         self.assertEqual(rounds, 3)
                         self.assertNotIn("tools", body)
@@ -376,9 +377,10 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(len({m["tool_call_id"] for m in results}), 6)
                         self.assertIn("Test persona", body["messages"][0]["content"])
                         self.assertIn("SOURCE DISPLAY RULE", body["messages"][0]["content"])
-                        self.assertEqual(body["messages"][-1]["role"], "system")
-                        self.assertIn("could not verify", body["messages"][-1]["content"])
-                        self.assertIn("Do not invent", body["messages"][-1]["content"])
+                        self.assertEqual(body["messages"][-1]["role"], "tool")
+                        self.assertEqual(sum(m["role"] == "system" for m in body["messages"]), 1)
+                        self.assertIn("could not verify", body["messages"][0]["content"])
+                        self.assertIn("Do not invent", body["messages"][0]["content"])
                         output = {"role": "assistant", "content": expected}
                     else:
                         self.assertEqual(body["tool_choice"], "auto")
@@ -399,25 +401,18 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                 async with AsyncOpenAI(
                     api_key="synthetic", base_url="https://primary.invalid/v1", max_retries=0,
                     http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
-                ) as primary, AsyncOpenAI(
-                    api_key="synthetic", base_url="https://fallback.invalid/v1", max_retries=0,
-                    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
-                ) as fallback:
+                ) as primary:
                     self.client.lm_client = primary
-                    self.client.fallback_client = fallback
-                    self.client.config.fallback_model = "cloud-model"
-                    self.client.chat_dead_until = 0
                     await self.bot.cmd_role.callback(self.interaction(), "Test persona")
                     search = AsyncMock(return_value=search_result)
-                    with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+                    with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search), \
+                            patch.object(self.bot, "generate_ai_response", wraps=self.bot.generate_ai_response) as generate:
                         await self.bot.on_message(self.chat(content="Please verify this detail."))
                     self.assertEqual(search.await_count, 6)
-                    self.assertEqual(len(seen), 4 if route == "primary" else 5)
-                    self.assertEqual(seen[-1][0], "primary.invalid" if route == "primary" else "fallback.invalid")
-                    self.assertEqual(self.client.chat_last_used_fallback, route != "primary")
-                    if route == "fallback_at_limit":
-                        self.assertEqual(seen[-2][1]["messages"], seen[-1][1]["messages"])
-                        self.assertNotIn("tools", seen[-2][1])
+                    self.assertEqual(len(seen), 4)
+                    original_context = generate.call_args.args[0]
+                    self.assertEqual(original_context[0], seen[0][1]["messages"][0])
+                    self.assertNotIn("The search limit for this reply", json.dumps(original_context))
                     cursor = await self.client.db_conn.execute(
                         "SELECT role, content FROM chat_history WHERE server_id='channel:10' ORDER BY id",
                     )
@@ -444,6 +439,8 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.create.await_count, 4)
                 self.assertEqual(self.create.call_args.kwargs["tool_choice"], "none")
                 self.assertNotIn("tools", self.create.call_args.kwargs)
+                self.assertEqual(self.create.call_args.kwargs["messages"][0]["role"], "system")
+                self.assertEqual(self.create.call_args.kwargs["messages"][-1]["role"], "tool")
 
 
 if __name__ == "__main__":
