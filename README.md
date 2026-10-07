@@ -7,7 +7,7 @@ Host the bot and its AI models on your own hardware. Enable chat through a local
 Requires Python 3.12 and the local server for each enabled feature. Chat uses an OpenAI-compatible API; image analysis needs a vision-capable model, and web search needs tool calling. Discord and web features require an internet connection.
 
 1. Create a Discord application and bot in the [Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent**. Invite it with the `bot` and `applications.commands` scopes.
-2. Grant **View Channel**, **Send Messages**, and **Send Messages in Threads** where needed. Image generation also needs **Attach Files**. **Read Message History** is optional and enables fetching referenced messages. Check channel overrides as well as server permissions.
+2. Grant **View Channel**, **Send Messages**, and **Send Messages in Threads** where needed. Image generation also needs **Attach Files**. **Read Message History** is optional and enables fetching referenced messages. Check channel overrides as well as server permissions. Members need **Use Application Commands**; check **Server Settings → Integrations** if slash commands are missing.
 3. From the repository directory, create the environment and install dependencies:
 
 ```bash
@@ -54,7 +54,7 @@ For chat, mention or reply to the bot in a server, or open its profile and **Mes
 | --- | --- |
 | `/help` | Show usage instructions. |
 | `/status` | Show models, supported inputs, limits, and this conversation's history count. |
-| `/role` | View the current persona. Supply persona text to change it, or `clear` to reset it. Changes clear this conversation's history and require a public confirmation in servers. |
+| `/role` | View the current persona. Supply persona text to change it, or `clear` to reset it. Changes clear this conversation's history and post a public bot announcement in servers. |
 | `/clear` | Clear this conversation's history, keeping its persona. Server access defaults to members with Manage Messages. |
 | `/imagegen` | Enter width, height, and prompt in one form. |
 
@@ -87,6 +87,6 @@ The result includes the original prompt and image as spoilers, with dimensions a
 
 ## Queues and local data
 
-All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted. Keep both model servers dedicated to the bot so it can coordinate GPU use.
+All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Each user can have **one pending or running image request** across all servers and DMs. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted. Keep both model servers dedicated to the bot so it can coordinate GPU use.
 
 Conversations are stored in `bot_database.db`; activity is logged to `bot.log`. Credentials, workflows, images, logs, and databases are ignored by Git. Keep other personal material in `private/` or `local/`; Git cannot detect personal content inside an otherwise tracked file.
