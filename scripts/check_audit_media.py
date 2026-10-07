@@ -2,38 +2,24 @@
 
 Run: venv_bot/bin/python scripts/check_audit_media.py
 Reuses temporary SQLite/model fixtures and a controlled HTTP server. Spawned PDF
-workers also block external sockets, .env loading, and Discord login.
+workers block external sockets and never import the bot or its configuration.
 """
 
 import asyncio
 import base64
-from concurrent.futures.process import BrokenProcessPool
 import io
-import os
-import socket
+import json
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
 import discord
-import dotenv
 from PIL import Image, ImageDraw
 
 import check_features
 import check_regressions as fixtures
-
-
-def reject_external_access(*args, **kwargs):
-    raise AssertionError("External access is disabled in PDF checks")
-
-
-def initialize_pdf_checks():
-    """Spawn does not inherit the parent fixture's network/config patches."""
-    socket.socket.connect = reject_external_access
-    socket.socket.connect_ex = reject_external_access
-    dotenv.load_dotenv = reject_external_access
-    discord.Client.run = reject_external_access
 
 
 class AuditMediaChecks(unittest.IsolatedAsyncioTestCase):
@@ -45,13 +31,28 @@ class AuditMediaChecks(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await fixtures.BotChecks.asyncSetUp(self)
         self.create.return_value.choices[0].message.tool_calls = []
-        executor_type = self.bot.ProcessPoolExecutor
+        self.worker_path = self.bot.pdf_worker.__file__
+        self.worker_script = Path("isolated_pdf_worker.py").resolve()
+        self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
+        self.patches.enter_context(patch.object(self.bot.pdf_worker, "__file__", str(self.worker_script)))
+        self.processes = []
+        spawn = asyncio.create_subprocess_exec
 
-        def isolated_executor(*args, **kwargs):
-            kwargs["initializer"] = initialize_pdf_checks
-            return executor_type(*args, **kwargs)
+        async def recorded_spawn(*args, **kwargs):
+            process = await spawn(*args, **kwargs)
+            self.processes.append(process)
+            return process
 
-        self.patches.enter_context(patch.object(self.bot, "ProcessPoolExecutor", side_effect=isolated_executor))
+        self.patches.enter_context(patch.object(self.bot.asyncio, "create_subprocess_exec", side_effect=recorded_spawn))
+
+    def use_worker(self, code):
+        self.worker_script.write_text(
+            "import socket, runpy\n"
+            "def denied(*args, **kwargs):\n"
+            "    raise AssertionError('External sockets disabled')\n"
+            "socket.socket.connect = socket.socket.connect_ex = denied\n" + code,
+            encoding="utf-8",
+        )
 
     def pdf(self, *pages):
         with self.bot.pymupdf.open() as document:
@@ -109,32 +110,134 @@ class AuditMediaChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Third page", text)
         self.assertIn("Additional pages skipped", text)
 
-    async def test_pdf_worker_starts_lazily_and_stops_when_client_closes(self):
-        self.assertIsNone(self.client.pdf_executor)
+    async def test_pdf_worker_starts_lazily_and_is_reaped_after_each_file(self):
+        self.assertIsNone(self.client.pdf_spawn)
+        self.assertEqual(self.processes, [])
         text = await self.bot.extract_pdf_text_async(self.pdf("Worker lifecycle"))
         self.assertIn("Worker lifecycle", text)
-        executor = self.client.pdf_executor
-        worker_pid = await asyncio.get_running_loop().run_in_executor(executor, os.getpid)
-        self.assertNotEqual(worker_pid, os.getpid())
-
-        await self.client.close()
-        with self.assertRaises(RuntimeError):
-            executor.submit(os.getpid)
+        self.assertIsNone(self.client.pdf_spawn)
+        self.assertEqual(len(self.processes), 1)
+        self.assertEqual(self.processes[0].returncode, 0)
 
     async def test_exited_pdf_worker_reports_failure_and_next_upload_recovers(self):
         data = self.pdf("Valid PDF after worker failure")
-        await self.bot.extract_pdf_text_async(data)
-        broken_executor = self.client.pdf_executor
-        # Exit only this test's owned child; do not induce a native parser crash.
-        with self.assertRaises(BrokenProcessPool):
-            await asyncio.get_running_loop().run_in_executor(broken_executor, os._exit, 23)
-
+        self.use_worker("raise SystemExit(23)")
         error = await self.bot.extract_pdf_text_async(data)
-        self.assertIn("PDF worker stopped", error)
-        self.assertIsNone(self.client.pdf_executor)
+        self.assertIn("Error reading PDF", error)
+        self.assertEqual(self.processes[0].returncode, 23)
+        self.assertIsNone(self.client.pdf_spawn)
+        self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
         recovered = await self.bot.extract_pdf_text_async(data)
         self.assertIn("Valid PDF after worker failure", recovered)
-        self.assertIsNot(self.client.pdf_executor, broken_executor)
+        self.assertEqual(self.processes[-1].returncode, 0)
+
+    async def test_pdf_timeout_kills_worker_and_next_upload_recovers(self):
+        self.use_worker("import time\ntime.sleep(60)")
+        data = self.pdf("Queued PDF recovered")
+        with patch.object(self.bot, "PDF_TIMEOUT", 0.15):
+            error = await asyncio.wait_for(self.bot.extract_pdf_text_async(data), 3)
+        self.assertIn("took too long", error)
+        self.assertIsNotNone(self.processes[0].returncode)
+        self.assertIsNone(self.client.pdf_spawn)
+        self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
+        self.assertIn("Queued PDF recovered", await self.bot.extract_pdf_text_async(data))
+
+    async def test_pdf_cancellation_reaps_child_even_during_startup(self):
+        self.use_worker("import time\ntime.sleep(60)")
+        created, release = asyncio.Event(), asyncio.Event()
+        spawn = self.bot.asyncio.create_subprocess_exec
+
+        async def delayed_spawn(*args, **kwargs):
+            process = await spawn(*args, **kwargs)
+            created.set()
+            await release.wait()
+            return process
+
+        with patch.object(self.bot.asyncio, "create_subprocess_exec", side_effect=delayed_spawn):
+            task = asyncio.create_task(self.bot.extract_pdf_text_async(b"synthetic"))
+            try:
+                await asyncio.wait_for(created.wait(), 2)
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()  # A second cancellation must not interrupt cleanup.
+            finally:
+                release.set()
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 3)
+        self.assertTrue(all(process.returncode is not None for process in self.processes))
+        self.assertIsNone(self.client.pdf_spawn)
+        self.assertFalse(self.client.pdf_lock.locked())
+
+    async def test_shutdown_stops_running_pdf_and_declines_waiting_pdf(self):
+        self.use_worker("import time\ntime.sleep(60)")
+        running = asyncio.create_task(self.bot.extract_pdf_text_async(b"synthetic"))
+        waiting = asyncio.create_task(self.bot.extract_pdf_text_async(b"synthetic"))
+        try:
+            async with asyncio.timeout(2):
+                while not self.processes:
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(self.client.close(), 3)
+            results = await asyncio.wait_for(asyncio.gather(running, waiting, return_exceptions=True), 3)
+            self.assertIsInstance(results[1], asyncio.CancelledError)
+            self.assertEqual(len(self.processes), 1)
+            self.assertIsNotNone(self.processes[0].returncode)
+            self.assertIsNone(self.client.pdf_spawn)
+        finally:
+            running.cancel()
+            waiting.cancel()
+            await asyncio.gather(running, waiting, return_exceptions=True)
+
+    async def test_pdf_child_limits_memory_cpu_and_text_before_returning(self):
+        self.use_worker(
+            "import json, resource\n"
+            f"worker = runpy.run_path({self.worker_path!r})\n"
+            "def inspect(*args):\n"
+            "    return json.dumps([resource.getrlimit(resource.RLIMIT_AS), resource.getrlimit(resource.RLIMIT_CPU)])\n"
+            "worker['main'].__globals__['extract_pdf_text'] = inspect\n"
+            "worker['main']()\n"
+        )
+        limits = json.loads(await self.bot.extract_pdf_text_async(b"synthetic"))
+        self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_MEMORY_LIMIT for limit in limits[0]))
+        self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_CPU_SECONDS for limit in limits[1]))
+        self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
+        with patch.object(self.bot, "MAX_TEXT_EXTRACTION_LENGTH", 20):
+            text = await self.bot.extract_pdf_text_async(self.pdf("A long first page with text", "Second page"))
+        self.assertEqual(text, "A long first page with text"[:20] + "\n...[Content Truncated]")
+        self.assertNotIn("Second page", text)
+
+    async def test_pdf_full_unicode_output_drains_before_worker_cleanup(self):
+        self.use_worker(
+            f"worker = runpy.run_path({self.worker_path!r})\n"
+            "worker['main'].__globals__['extract_pdf_text'] = lambda *args: '\\u754c' * 40000\n"
+            "worker['main']()\n"
+        )
+        text = await asyncio.wait_for(self.bot.extract_pdf_text_async(b"synthetic"), 3)
+        self.assertEqual(text, "\u754c" * 40000)
+        self.assertIsNone(self.client.pdf_spawn)
+        self.assertEqual(self.processes[-1].returncode, 0)
+
+    async def test_pdf_memory_and_cpu_limits_stop_child_and_allow_recovery(self):
+        for kind in ("memory", "cpu"):
+            with self.subTest(kind=kind):
+                # Extra outer caps protect this test if the worker regresses.
+                action = "bytearray(64 * 1024 * 1024)" if kind == "memory" else "exec('while True: pass')"
+                self.use_worker(
+                    "import resource\n"
+                    "resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024,) * 2)\n"
+                    "resource.setrlimit(resource.RLIMIT_CPU, (3, 3))\n"
+                    f"worker = runpy.run_path({self.worker_path!r})\n"
+                    "namespace = worker['main'].__globals__\n"
+                    "namespace.update(PDF_MEMORY_LIMIT=32 * 1024 * 1024, PDF_CPU_SECONDS=1)\n"
+                    f"def consume(*args):\n    {action}\n    return 'limit failed'\n"
+                    "namespace['extract_pdf_text'] = consume\nworker['main']()\n"
+                )
+                error = await asyncio.wait_for(self.bot.extract_pdf_text_async(b"synthetic"), 5)
+                self.assertIn("Error reading PDF", error)
+                self.assertNotEqual(self.processes[-1].returncode, 0)
+                self.assertIsNone(self.client.pdf_spawn)
+        self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
+        self.assertIn("Still works", await self.bot.extract_pdf_text_async(self.pdf("Still works")))
 
     async def test_formatted_urls_keep_real_path_characters(self):
         with Image.new("RGB", (4, 4), "white") as image:

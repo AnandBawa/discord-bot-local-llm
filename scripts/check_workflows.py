@@ -189,6 +189,46 @@ class WorkflowChecks(unittest.TestCase):
         self.assertEqual(result["7"]["inputs"], {
             "clip": ["317", 0], "text": "keep negative", "width": 1536, "height": 1024, "ascore": 2.5})
 
+    def test_zeroed_sdxl_negative_keeps_text_and_updates_size_metadata(self):
+        for kind, fields in (
+            ("CLIPTextEncodeSDXL", {"text_g": "keep negative", "text_l": ["48", 0],
+                                    "target_width": 512, "target_height": 512, "crop_w": 16, "crop_h": 32}),
+            ("CLIPTextEncodeSDXLRefiner", {"text": "keep negative", "ascore": 2.5}),
+        ):
+            with self.subTest(kind=kind):
+                graph = self.graph()
+                graph["7"] = {"class_type": kind, "inputs": {
+                    "clip": ["317", 0], "width": 512, "height": 512, **fields}}
+                graph["zero"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["7", 0]}}
+                graph["265"]["inputs"]["negative"] = ["zero", 0]
+                before = copy.deepcopy(graph)
+                result = ComfyWorkflow(graph).prepare("new positive", 1536, 1024)
+                expected = copy.deepcopy(graph["7"]["inputs"])
+                expected.update(width=1536, height=1024)
+                if kind == "CLIPTextEncodeSDXL":
+                    expected.update(target_width=1536, target_height=1024)
+                self.assertEqual(result["7"]["inputs"], expected)
+                self.assertEqual(result["6"]["inputs"]["text"], "new positive")
+                self.assertEqual(result["232"]["inputs"], {"width": 1536, "height": 1024, "batch_size": 1})
+                self.assertEqual(result["zero"], graph["zero"])
+                self.assertEqual(result["48"], graph["48"])
+                self.assertEqual(graph, before)
+
+    def test_zeroed_sdxl_branch_does_not_select_another_positive_prompt(self):
+        graph = self.graph()
+        graph["7"] = {"class_type": "CLIPTextEncodeSDXL", "inputs": {
+            "clip": ["317", 0], "text_g": "keep g", "text_l": "keep l", "width": 512,
+            "height": 512, "target_width": 512, "target_height": 512}}
+        graph["zero"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["7", 0]}}
+        graph["combine"] = {"class_type": "ConditioningCombine", "inputs": {
+            "conditioning_1": ["6", 0], "conditioning_2": ["zero", 0]}}
+        graph["265"]["inputs"].update(positive=["combine", 0], negative=["zero", 0])
+        result = ComfyWorkflow(graph).prepare("new positive", 1536, 1024)
+        self.assertEqual(result["6"]["inputs"]["text"], "new positive")
+        self.assertEqual(result["7"]["inputs"], {
+            "clip": ["317", 0], "text_g": "keep g", "text_l": "keep l", "width": 1536,
+            "height": 1024, "target_width": 1536, "target_height": 1024})
+
     def test_controlnet_routes_positive_and_negative_by_output_port(self):
         for kind in ("ControlNetApplyAdvanced", "ControlNetApplySD3"):
             with self.subTest(kind=kind):

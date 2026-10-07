@@ -17,7 +17,7 @@ import tempfile
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import aiohappyeyeballs
 import aiohttp
@@ -249,7 +249,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
                          + [("user", "Hello"), ("assistant", "Answer")])
         self.assertEqual(await self.count("chat_history"), 54)
         self.create.assert_not_awaited()
-        self.message.reply.assert_awaited_once_with("Answer")
+        self.message.reply.assert_awaited_once_with("Answer", allowed_mentions=ANY)
 
     async def test_clear_and_persona_changes_affect_only_current_conversation(self):
         await self.bot.cmd_role.callback(self.interaction(server_id=2), "Other persona")
@@ -465,6 +465,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
                     await self.bot.cmd_role.callback(interaction)
                     interaction.followup.send.assert_awaited_once_with(
                         f"**Current Persona:**\n> *{persona}*", ephemeral=guild_id is None,
+                        allowed_mentions=ANY,
                     )
                     self.assertEqual(await self.bot.get_persona(key), persona)
                     cursor = await self.client.db_conn.execute(

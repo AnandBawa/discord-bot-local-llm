@@ -62,7 +62,7 @@ class ComfyWorkflow:
         # unused presets must not start another model or influence discovery.
         self.graph = copy.deepcopy({key: node for key, node in graph.items() if key in self.parents})
 
-    def conditioning_encoders(self, roots):
+    def conditioning_encoders(self, roots, *, include_zeroed=False):
         encoders, visited = set(), set()
         pending = list(roots)
         while pending:
@@ -78,7 +78,7 @@ class ComfyWorkflow:
             if kind in TEXT_INPUTS and port == 0:
                 encoders.add(key)
                 continue
-            if kind == "ConditioningZeroOut" and port == 0:
+            if kind == "ConditioningZeroOut" and port == 0 and not include_zeroed:
                 continue
             if kind == "ReferenceLatent":
                 raise WorkflowError("Reference-image conditioning (ReferenceLatent) is unsupported. Use a text-to-image workflow for /imagegen.")
@@ -169,7 +169,9 @@ class ComfyWorkflow:
         # Override only this encoder's text fields, preserving negative text even
         # when its encoder shares the original upstream string source.
         encoder["inputs"].update({name: prompt for name in text_fields})
-        for key in encoders | negative_encoders:
+        # Zeroing removes text tensors but retains SDXL size metadata. Follow
+        # these paths without counting them as editable prompt encoders.
+        for key in self.conditioning_encoders(positive + negative, include_zeroed=True):
             conditioning = self.graph[key]
             if conditioning["class_type"] in {"CLIPTextEncodeSDXL", "CLIPTextEncodeSDXLRefiner"}:
                 for name, value in (("width", width), ("height", height),

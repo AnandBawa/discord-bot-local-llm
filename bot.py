@@ -10,14 +10,13 @@ import time
 import math
 import ipaddress
 import uuid
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-from concurrent.futures.process import BrokenProcessPool
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import pymupdf
+import pdf_worker
 from pdf_worker import extract_pdf_text
 from comfy_workflow import ComfyWorkflow, WorkflowError
 import aiohttp
@@ -433,6 +432,12 @@ def image_attachment(data, width, height, limit):
         with Image.open(io.BytesIO(data)) as picture:
             if picture.format != "PNG" or picture.size != (width, height):
                 raise ImageGenerationError("ComfyUI returned an image with an unexpected format or resolution.")
+            # Pillow.verify stops at the IEND header without checking its CRC.
+            if not data.endswith(bytes.fromhex("0000000049454e44ae426082")):
+                raise ImageGenerationError("ComfyUI returned an unreadable image.")
+            picture.verify()
+        # verify consumes the image stream. Reopen only after integrity checks.
+        with Image.open(io.BytesIO(data)) as picture:
             picture.load()
             # Re-encoding strips workflow metadata from the publicly attached image.
             output = io.BytesIO()
@@ -447,7 +452,7 @@ def image_attachment(data, width, height, limit):
                     return output.getvalue(), "image.jpg"
     except ImageGenerationError:
         raise
-    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
         raise ImageGenerationError("ComfyUI returned an unreadable image.") from exc
     raise ImageGenerationError("The generated image exceeds the attachment limit here.")
 
@@ -462,7 +467,8 @@ class MyAIClient(discord.Client):
         self.image_tasks = set()
         self.chat_tasks = set()
         self.shutting_down = False
-        self.pdf_executor = None
+        self.pdf_lock = asyncio.Lock()
+        self.pdf_spawn = None
         self.db_path = "bot_database.db"
         self.db_lock = None
         self.llm_queue = None
@@ -490,10 +496,27 @@ class MyAIClient(discord.Client):
         await tree.sync()
         logging.info('🔄 Database loaded and slash commands synced globally!')
 
-    async def close_pdf_executor(self):
-        executor, self.pdf_executor = self.pdf_executor, None
-        if executor is not None:
-            await finish_model_call(asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True))
+    async def close_pdf_worker(self):
+        spawn = self.pdf_spawn
+        if spawn is None:
+            return
+
+        async def stop():
+            try:
+                process = await spawn
+            except Exception:
+                return  # Startup failed before a child was created.
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+            await process.wait()
+
+        try:
+            # Reap the child even if cancellation arrived during its startup.
+            await finish_model_call(stop())
+        finally:
+            if self.pdf_spawn is spawn:
+                self.pdf_spawn = None
 
     async def close(self):
         self.shutting_down = True
@@ -503,7 +526,7 @@ class MyAIClient(discord.Client):
             for resource in (self.lm_client, self.db_conn, self.imagegen):
                 if resource is not None:
                     cleanup.push_async_callback(resource.close)
-            cleanup.push_async_callback(self.close_pdf_executor)
+            cleanup.push_async_callback(self.close_pdf_worker)
             tasks = list((self.image_tasks | self.chat_tasks) - {asyncio.current_task()})
             for task in tasks:
                 task.cancel()
@@ -532,6 +555,7 @@ LLM_MAX_TOKENS = 4096               # Maximum output token length for standard c
 # --- HARDWARE & PARSING LIMITS ---
 MAX_FILE_SIZE = 10 * 1024 * 1024    # 10MB hard limit for Discord attachments and web scraper downloads
 MAX_PDF_PAGES = 15                  # Maximum number of pages to read from an uploaded PDF
+PDF_TIMEOUT = 15                    # Wall seconds per PDF, excluding queue wait
 MAX_TEXT_EXTRACTION_LENGTH = 40000  # Character limit for text files, PDFs, or scraped web pages
 MAX_IMAGE_DIMENSION = 1024          # Uploaded images are resized to this max width/height to save VRAM
 IMAGE_COMPRESSION_QUALITY = 85      # JPEG compression quality used when downscaling images via Pillow
@@ -662,11 +686,13 @@ async def reply_or_send(message, text, *, conversation=None):
     if not conversation_is_current(conversation):
         return
     if isinstance(getattr(message, "channel", None), discord.DMChannel):
-        await message.channel.send(text)
+        await message.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
         return
     if can_read_history(message):
         try:
-            await message.reply(text)
+            await message.reply(text, allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=False, replied_user=True,
+            ))
             return
         except discord.HTTPException as exc:
             if not isinstance(exc, (discord.Forbidden, discord.NotFound)) and exc.code != 50035:
@@ -719,11 +745,12 @@ async def send_chunked_message(target, text: str, is_interaction_followup=False,
             if not conversation_is_current(conversation):
                 return
             if is_interaction_followup:
-                await target.followup.send(chunk, ephemeral=ephemeral)
+                await target.followup.send(chunk, ephemeral=ephemeral,
+                                           allowed_mentions=discord.AllowedMentions.none())
             elif is_first:
                 await reply_or_send(target, chunk, conversation=conversation)
             else:
-                await channel.send(chunk)
+                await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
             is_first = False
         except discord.Forbidden:
             logging.warning("Discord denied message delivery in channel %s", getattr(target.channel, "id", "unknown"))
@@ -740,22 +767,33 @@ def truncate_document(text):
 
 
 async def extract_pdf_text_async(pdf_bytes):
-    if client.shutting_down:
-        raise asyncio.CancelledError
-    if client.pdf_executor is None:
-        client.pdf_executor = ProcessPoolExecutor(
-            max_workers=1, mp_context=multiprocessing.get_context("spawn"),
-        )
-    executor = client.pdf_executor
-    try:
-        return await asyncio.get_running_loop().run_in_executor(
-            executor, extract_pdf_text, pdf_bytes, MAX_PDF_PAGES,
-        )
-    except BrokenProcessPool:
-        # Retire the failed worker without automatically retrying its input.
-        if client.pdf_executor is executor:
-            await client.close_pdf_executor()
-        return "Error reading PDF: The PDF worker stopped. Please try the upload again."
+    # A fresh, resource-limited process per file can be killed without affecting
+    # another request or accumulating CPU usage across otherwise ordinary PDFs.
+    async with client.pdf_lock:
+        if client.shutting_down:
+            raise asyncio.CancelledError
+        try:
+            async with asyncio.timeout(PDF_TIMEOUT):
+                client.pdf_spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+                    sys.executable, "-I", str(Path(pdf_worker.__file__).resolve()),
+                    str(MAX_PDF_PAGES), str(MAX_TEXT_EXTRACTION_LENGTH),
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    # The child emits bounded UTF-8 text. Keep it below the pipe
+                    # reader's pause threshold so kill/wait cannot block on output.
+                    limit=4 * MAX_TEXT_EXTRACTION_LENGTH + 65536,
+                ))
+                process = await asyncio.shield(client.pdf_spawn)
+                output, _ = await process.communicate(pdf_bytes)
+            if process.returncode:
+                return pdf_worker.PDF_RESOURCE_ERROR
+            return output.decode("utf-8")
+        except TimeoutError:
+            return pdf_worker.PDF_RESOURCE_ERROR
+        except (OSError, UnicodeError):
+            return "Error reading PDF: The PDF reader could not start or return readable text."
+        finally:
+            await client.close_pdf_worker()
 
 
 def process_image_bytes(img_bytes):
@@ -1324,11 +1362,14 @@ async def collect_attachments(source, channel, *, replied=False):
 
 
 def extract_urls(text):
-    """Ignore enclosing Markdown/quotes without stripping balanced URL parentheses."""
+    """Strip prose delimiters while preserving explicitly enclosed URL characters."""
     urls = []
     for match in re.finditer(r'https?://[^\s<>"`]+', text):
         url = match.group()
         preceding = text[match.start() - 1] if match.start() else ""
+        following = text[match.end():match.end() + 1]
+        delimiters = {'<': '>', '"': '"', '`': '`'}
+        delimited = preceding in delimiters and following == delimiters[preceding]
         pairs = {"(": ")", "[": "]", "{": "}"}
         if preceding in pairs:
             depth = 0
@@ -1338,16 +1379,25 @@ def extract_urls(text):
                 elif character == pairs[preceding]:
                     if depth == 0:
                         url = url[:index]
+                        delimited = True
                         break
                     depth -= 1
         if preceding == "'":
-            url = re.sub(r"'[.,;:!?]*$", "", url)
-        while url and url[-1] in ")]}":
-            closer = url[-1]
-            opener = {value: key for key, value in pairs.items()}[closer]
-            if url.count(closer) <= url.count(opener):
-                break
-            url = url[:-1]
+            url, delimited = re.subn(r"'[.,;:!?]*$", "", url)
+        if not delimited:
+            # Query/fragment punctuation may be signed or otherwise significant.
+            trim_punctuation = not re.search(r"[?#].", url)
+            while url:
+                if trim_punctuation and url[-1] in ".,;:!?":
+                    url = url[:-1]
+                    continue
+                if url[-1] not in ")]}":
+                    break
+                closer = url[-1]
+                opener = {value: key for key, value in pairs.items()}[closer]
+                if url.count(closer) <= url.count(opener):
+                    break
+                url = url[:-1]
         urls.append(url)
     return urls
 
@@ -1665,7 +1715,7 @@ def main():
     if not client.config.token:
         raise SystemExit("Set DISCORD_BOT_TOKEN in the environment or .env before starting the bot.")
     configure_logging()
-    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    ImageFile.LOAD_TRUNCATED_IMAGES = False
     client.run(client.config.token)
 
 

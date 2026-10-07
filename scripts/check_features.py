@@ -8,7 +8,7 @@ import asyncio
 import contextlib
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, Mock, PropertyMock, patch
+from unittest.mock import ANY, AsyncMock, Mock, PropertyMock, patch
 
 import discord
 
@@ -148,7 +148,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
         context = str(self.create.call_args.kwargs["messages"])
         self.assertIn(body, self.create.call_args.kwargs["messages"][-1]["content"])
         self.assertIn("Extracted Text Content from message.txt", context)
-        message.reply.assert_awaited_once_with("Answer")
+        message.reply.assert_awaited_once_with("Answer", allowed_mentions=ANY)
         cursor = await self.client.db_conn.execute("SELECT content FROM chat_history ORDER BY id")
         saved = str(await cursor.fetchall())
         self.assertIn("message.txt", saved)
@@ -333,7 +333,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await a
             await asyncio.wait_for(b, 2)
-        second.reply.assert_awaited_once_with("Next answer")
+        second.reply.assert_awaited_once_with("Next answer", allowed_mentions=ANY)
 
 
 

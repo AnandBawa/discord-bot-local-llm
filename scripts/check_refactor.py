@@ -60,7 +60,7 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.bot, "load_dotenv", return_value=False) as load, \
                 patch.object(self.bot, "configure_logging") as logging_setup, \
                 patch.object(self.client, "run") as run, \
-                patch.object(ImageFile, "LOAD_TRUNCATED_IMAGES", False):
+                patch.object(ImageFile, "LOAD_TRUNCATED_IMAGES", True):
             with patch.dict(os.environ, {}, clear=True):
                 with self.assertRaises(SystemExit):
                     self.bot.main()
@@ -73,6 +73,7 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
             run.assert_called_once_with("synthetic")
             self.assertEqual(self.client.config.model, "configured")
             self.assertFalse(self.client.config.vision_enabled)
+            self.assertFalse(ImageFile.LOAD_TRUNCATED_IMAGES)
 
     async def test_literal_json_and_code_round_trip_as_text(self):
         for answer in ('[{"name":"Alice"}]', '{"key":true}', '[1,2]', '"quoted"', 'null', '```json\n[]\n```'):

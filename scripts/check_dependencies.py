@@ -36,7 +36,7 @@ class Channel:
     async def typing(self):
         yield
 
-    async def send(self, text):
+    async def send(self, text, **kwargs):
         self.messages.append(text)
 
 

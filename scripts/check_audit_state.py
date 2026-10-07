@@ -6,10 +6,11 @@ and the existing blocked-socket fixtures. Never reads .env or runtime data.
 """
 
 import asyncio
+import contextlib
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import aiosqlite
 import discord
@@ -102,6 +103,51 @@ class AuditStateChecks(unittest.IsolatedAsyncioTestCase):
         )
         return (await cursor.fetchone())[0]
 
+    async def test_generated_replies_restrict_mentions_in_serialized_discord_payloads(self):
+        transport = InteractionTransport(10)
+        payloads = []
+
+        async def send(channel_id, *, params):
+            payloads.append(dict(params.payload))
+            return transport.message(params.payload)
+
+        @contextlib.asynccontextmanager
+        async def typing(channel):
+            yield
+
+        def message(guild):
+            channel = self.sdk_interaction(guild=guild).channel
+            data = transport.message({"content": "Synthetic incoming message"})
+            data.update(author=USER, type=0)
+            return discord.Message(state=self.client._connection, channel=channel, data=data)
+
+        self.client.http.send_message = AsyncMock(side_effect=send)
+        mentions = "@everyone @here <@&123> <@456>"
+        with patch.object(self.bot, "safe_typing", typing), \
+                patch.object(self.bot, "can_read_history", return_value=True):
+            await self.bot.send_chunked_message(message(True), mentions)
+            await self.bot.send_chunked_message(message(True), "a " * 975 + mentions)
+            await self.bot.send_chunked_message(message(False), mentions)
+        self.assertEqual(len(payloads), 4)
+        for index, payload in enumerate(payloads):
+            self.assertEqual(payload["allowed_mentions"]["parse"], [])
+            self.assertFalse(payload["allowed_mentions"].get("users"))
+            self.assertEqual(payload["allowed_mentions"].get("replied_user", False), index < 2)
+            self.assertEqual("message_reference" in payload, index < 2)
+
+        token = async_context.set(transport)
+        try:
+            await self.bot.send_chunked_message(self.sdk_interaction(), mentions,
+                                                is_interaction_followup=True)
+        finally:
+            async_context.reset(token)
+        self.assertEqual(transport.sent[-1]["allowed_mentions"], {"parse": []})
+
+        with patch.object(self.bot, "can_read_history", return_value=False):
+            await self.bot.send_chunked_message(message(True), mentions)
+        self.assertEqual(payloads[-1]["allowed_mentions"]["parse"], [])
+        self.assertEqual(payloads[-1]["allowed_mentions"]["users"], [42])
+
     async def test_long_server_role_can_be_saved_and_viewed_in_full(self):
         transport = InteractionTransport(10)
         token = async_context.set(transport)
@@ -172,7 +218,7 @@ class AuditStateChecks(unittest.IsolatedAsyncioTestCase):
                         await self.bot.save_and_send_response(
                             other, "channel:20", "Independent input", "Independent answer",
                         )
-                        other.reply.assert_awaited_once_with("Independent answer")
+                        other.reply.assert_awaited_once_with("Independent answer", allowed_mentions=ANY)
                     finally:
                         release_delay.set()
                         await asyncio.wait_for(delivery, 2)
@@ -238,7 +284,7 @@ class AuditStateChecks(unittest.IsolatedAsyncioTestCase):
                 await self.bot.save_and_send_response(
                     message, key, "Accepted before failure", "Still a valid answer", versions[key],
                 )
-                message.reply.assert_awaited_once_with("Still a valid answer")
+                message.reply.assert_awaited_once_with("Still a valid answer", allowed_mentions=ANY)
                 self.assertEqual(await self.history_count(key), 4)
                 await self.client.db_conn.execute("DROP TRIGGER deferred_failure")
                 await self.client.db_conn.commit()

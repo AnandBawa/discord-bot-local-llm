@@ -16,7 +16,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 import discord
-from PIL import Image, PngImagePlugin
+from PIL import Image, ImageFile, PngImagePlugin
 
 import check_regressions as fixtures
 import check_features as feature_fixtures
@@ -638,6 +638,23 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             with self.subTest(expected=expected, width=width, limit=limit):
                 with self.assertRaisesRegex(self.bot.ImageGenerationError, expected):
                     self.bot.image_attachment(data, width, height, limit)
+
+    async def test_incomplete_generated_png_is_rejected_even_with_permissive_pillow(self):
+        source = self.png((1024, 1024))
+        for permissive in (False, True):
+            for data in (source[:len(source) // 2], source[:-12], source[:-4], source[:-1]):
+                with self.subTest(permissive=permissive, length=len(data)), \
+                        patch.object(ImageFile, "LOAD_TRUNCATED_IMAGES", permissive):
+                    with self.assertRaisesRegex(self.bot.ImageGenerationError, "unreadable"):
+                        self.bot.image_attachment(data, 1024, 1024, len(source))
+
+        # A real image request must report failure without publishing a partial image.
+        self.backend.generate.return_value = source[:len(source) // 2], 1.0
+        interaction = self.interaction()
+        await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
+        self.assertEqual(interaction.uploads, [])
+        self.assertIn("unreadable", interaction.progress.edit.call_args.kwargs["content"])
+        self.assert_slots_free()
 
     async def test_jpeg_fallback_fits_file_limit_preserves_dimensions_and_strips_metadata(self):
         source = self.png((128, 96), metadata=True, noise=True)
