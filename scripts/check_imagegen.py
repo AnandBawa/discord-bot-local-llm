@@ -516,7 +516,6 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(path == "/interrupt" for _, _, path, _ in self.calls))
 
     async def test_failed_image_cancellation_declines_chat_until_remote_job_finishes(self):
-        self.client.config.image_timeout = 0.025
         self.hold_image = True
         cancellations = []
 
@@ -527,7 +526,8 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             return await self.request(backend, method, path, **kwargs)
 
         self.service.request.side_effect = failed_cancel
-        with self.assertRaises(TimeoutError):
+        # Limit only the deliberate failure, not the successful recovery below.
+        with patch.object(self.client.config, "image_timeout", 0.025), self.assertRaises(TimeoutError):
             await self.service.generate("timed out", 64, 64)
         self.assertEqual(len(self.running), 1)
         self.assertIsNotNone(self.service.active_job)

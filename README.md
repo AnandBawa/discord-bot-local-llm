@@ -16,7 +16,7 @@ source venv_bot/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-These commands work in Linux/WSL. On Windows, activate with `venv_bot\Scripts\activate`.
+These commands work in Linux/WSL. In Windows Command Prompt, create the environment with `py -3.12 -m venv venv_bot`, then activate with `venv_bot\Scripts\activate` and run the same pip command.
 
 4. Create `.env` beside `bot.py`:
 
@@ -60,7 +60,7 @@ For chat, mention or reply to the bot in a server, or open its profile and **Mes
 
 Chat supports text/code, UTF-8 text files (including `message.txt`), text-based PDFs, public links, and images/supported stickers when vision is enabled. Attachments are limited to **10 MiB** each; PDFs to **15 pages**; extracted text to **40,000 characters** per document. Long text files produce a truncation notice. Source citations are requested only when you ask for them.
 
-PDF reading requires Linux/WSL. Each PDF runs separately with a **512 MiB memory limit**, **10 seconds of CPU time**, and a **15-second deadline**. Files that exceed these limits return an error; later uploads can still be processed.
+PDF reading works on Windows and Linux/WSL. Each PDF runs separately with a **512 MiB memory limit**, **10 seconds of CPU time** (user-mode time on Windows), and a **15-second deadline**. Files that exceed these limits return an error; later uploads can still be processed.
 
 People in one channel share its conversation; each thread and user's DM is separate. At 100 saved messages, the oldest 50 are discarded. `/clear` and persona changes remove saved context, not Discord messages. Replying to an old message can supply its text again. Original attachment contents are not retained for later turns; reattach a file when needed.
 

@@ -9,6 +9,7 @@ import asyncio
 import base64
 import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -189,17 +190,18 @@ class AuditMediaChecks(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(running, waiting, return_exceptions=True)
 
     async def test_pdf_child_limits_memory_cpu_and_text_before_returning(self):
-        self.use_worker(
-            "import json, resource\n"
-            f"worker = runpy.run_path({self.worker_path!r})\n"
-            "def inspect(*args):\n"
-            "    return json.dumps([resource.getrlimit(resource.RLIMIT_AS), resource.getrlimit(resource.RLIMIT_CPU)])\n"
-            "worker['main'].__globals__['extract_pdf_text'] = inspect\n"
-            "worker['main']()\n"
-        )
-        limits = json.loads(await self.bot.extract_pdf_text_async(b"synthetic"))
-        self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_MEMORY_LIMIT for limit in limits[0]))
-        self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_CPU_SECONDS for limit in limits[1]))
+        if sys.platform != "win32":  # Native Job Object checks live in check_pdf_limits.py.
+            self.use_worker(
+                "import json, resource\n"
+                f"worker = runpy.run_path({self.worker_path!r})\n"
+                "def inspect(*args):\n"
+                "    return json.dumps([resource.getrlimit(resource.RLIMIT_AS), resource.getrlimit(resource.RLIMIT_CPU)])\n"
+                "worker['main'].__globals__['extract_pdf_text'] = inspect\n"
+                "worker['main']()\n"
+            )
+            limits = json.loads(await self.bot.extract_pdf_text_async(b"synthetic"))
+            self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_MEMORY_LIMIT for limit in limits[0]))
+            self.assertTrue(all(0 < limit <= self.bot.pdf_worker.PDF_CPU_SECONDS for limit in limits[1]))
         self.use_worker(f"runpy.run_path({self.worker_path!r}, run_name='__main__')")
         with patch.object(self.bot, "MAX_TEXT_EXTRACTION_LENGTH", 20):
             text = await self.bot.extract_pdf_text_async(self.pdf("A long first page with text", "Second page"))
@@ -217,6 +219,7 @@ class AuditMediaChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.client.pdf_spawn)
         self.assertEqual(self.processes[-1].returncode, 0)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows Job Objects checked in check_pdf_limits.py")
     async def test_pdf_memory_and_cpu_limits_stop_child_and_allow_recovery(self):
         for kind in ("memory", "cpu"):
             with self.subTest(kind=kind):

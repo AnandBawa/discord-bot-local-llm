@@ -1,4 +1,4 @@
-# Pinned direct and transitive dependencies for CPython 3.12 on Linux.
+# Pinned direct and transitive dependencies for CPython 3.12 on Windows and Linux/WSL.
 # Install through requirements.txt; constraints do not install packages by themselves.
 
 aiohappyeyeballs==2.7.1

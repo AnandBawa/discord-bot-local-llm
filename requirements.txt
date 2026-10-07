@@ -1,4 +1,4 @@
-# Direct application dependencies for Python 3.12 on Linux.
+# Direct application dependencies for Python 3.12 on Windows and Linux/WSL.
 # constraints.txt pins their resolved dependency versions.
 -c constraints.txt
 
