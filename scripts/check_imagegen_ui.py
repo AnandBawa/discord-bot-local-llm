@@ -385,6 +385,35 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.backend.generate.assert_not_awaited()
         self.create.assert_not_awaited()
 
+    async def test_missing_workflow_nodes_name_expected_types_before_queuing(self):
+        cases = (
+            ("SaveImage", ("SaveImage",)),
+            ("CLIPTextEncode", ("CLIPTextEncode", "CLIPTextEncodeSDXL", "CLIPTextEncodeFlux")),
+            ("EmptyLatentImage", ("EmptyLatentImage", "EmptySD3LatentImage", "EmptyFlux2LatentImage")),
+            ("UNETLoader", ("UNETLoader", "CheckpointLoaderSimple")),
+        )
+        for kind, expected in cases:
+            with self.subTest(kind=kind):
+                graph = json.loads(json.dumps(fixtures.WORKFLOW_FIXTURE))
+                target = next(node for node in graph.values() if node["class_type"] == kind)
+                target["class_type"] = "UnsupportedNode"
+                if kind == "UNETLoader":
+                    target["inputs"].clear()
+                interaction = self.interaction()
+                modal = self.fill(self.bot.ImageGenerationModal(), width="1024", height="1024", prompt="A tree")
+                with patch.object(self.bot.Path, "read_text", return_value=json.dumps(graph)):
+                    await modal.on_submit(interaction)
+                reply = interaction.response.send_message.call_args
+                self.assertTrue(reply.kwargs["ephemeral"])
+                for node_type in expected:
+                    self.assertIn(node_type, reply.args[0])
+                interaction.response.defer.assert_not_awaited()
+                interaction.channel.send.assert_not_awaited()
+                self.assert_slots_free()
+        self.backend.generate.assert_not_awaited()
+        self.backend.request.assert_not_awaited()
+        self.create.assert_not_awaited()
+
     async def test_literal_prompt_and_expired_interaction_deliver_via_normal_message(self):
         interaction = self.interaction()
         literal = "  @everyone <@999> <@&123>\nA café in the rain.\n"

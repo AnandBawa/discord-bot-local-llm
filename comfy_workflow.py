@@ -15,6 +15,7 @@ TEXT_INPUTS = {
     "CLIPTextEncodeSD3": ("clip_l", "clip_g", "t5xxl"),
     "CLIPTextEncodeFlux": ("clip_l", "t5xxl"),
 }
+TEXT_NODE_HINT = "Expected a connected text encoder: " + ", ".join(TEXT_INPUTS) + "."
 LATENT_NODES = {"EmptyLatentImage", "EmptySD3LatentImage", "EmptyFlux2LatentImage"}
 CONDITION_INPUTS = {
     "conditioning", "conditioning_1", "conditioning_2",
@@ -30,9 +31,12 @@ def link(value):
 class ComfyWorkflow:
     def __init__(self, graph):
         if (not isinstance(graph, dict) or not graph
-                or any(not isinstance(node, dict) or not isinstance(node.get("class_type"), str)
-                       or not isinstance(node.get("inputs"), dict) for node in graph.values())):
+                or any(not isinstance(node, dict) or not isinstance(node.get("inputs"), dict)
+                       for node in graph.values())):
             raise WorkflowError("Export the workflow using ComfyUI's File → Export (API), then save it as workflow.json.")
+        for key, node in graph.items():
+            if not isinstance(node.get("class_type"), str) or not node["class_type"].strip():
+                raise WorkflowError(f"Workflow node {key!r} is missing class_type. Check that custom node in ComfyUI and export (API) again.")
         outputs = [key for key, node in graph.items() if node["class_type"] == "SaveImage"]
         if len(outputs) != 1:
             raise WorkflowError("The workflow needs exactly one SaveImage node as its final image output.")
@@ -64,7 +68,7 @@ class ComfyWorkflow:
         while pending:
             reference = pending.pop()
             if not link(reference):
-                raise WorkflowError("The sampler's conditioning must be connected to a supported text encoder.")
+                raise WorkflowError("The sampler's conditioning is not connected correctly. " + TEXT_NODE_HINT)
             key, port = reference
             if (key, port) in visited:
                 continue
@@ -76,6 +80,8 @@ class ComfyWorkflow:
                 continue
             if kind == "ConditioningZeroOut" and port == 0:
                 continue
+            if kind == "ReferenceLatent":
+                raise WorkflowError("Reference-image conditioning (ReferenceLatent) is unsupported. Use a text-to-image workflow for /imagegen.")
             if kind in {"ControlNetApplyAdvanced", "ControlNetApplySD3"} and port in (0, 1):
                 fields = ("positive" if port == 0 else "negative",)
             elif port == 0 and (kind.startswith("Conditioning")
@@ -84,7 +90,7 @@ class ComfyWorkflow:
             else:
                 fields = ()
             if not fields:
-                raise WorkflowError("Cannot follow the prompt through this conditioning node. Use a supported CLIP text-encoding path.")
+                raise WorkflowError("Cannot follow the prompt through this conditioning node. " + TEXT_NODE_HINT)
             pending.extend(inputs.get(name) for name in fields)
         return encoders
 
@@ -137,7 +143,7 @@ class ComfyWorkflow:
         positive, negative, _ = self.sampling_inputs()
         encoders = self.conditioning_encoders(positive)
         if len(encoders) != 1:
-            raise WorkflowError("Cannot identify one positive prompt encoder. Connect one supported CLIP text encoder to the sampler's positive input.")
+            raise WorkflowError("Cannot identify one positive prompt encoder for the sampler. " + TEXT_NODE_HINT)
         negative_encoders = self.conditioning_encoders(negative)
         if encoders & negative_encoders:
             raise WorkflowError("Positive and negative conditioning share a text encoder. Use separate encoders or zeroed negative conditioning.")
@@ -151,12 +157,12 @@ class ComfyWorkflow:
             if (source is None or value[1] != 0
                     or source["class_type"] not in {"PrimitiveString", "PrimitiveStringMultiline"}
                     or not isinstance(source["inputs"].get("value"), str)):
-                raise WorkflowError("The positive prompt needs editable text or a PrimitiveString input; custom text-processing paths are unsupported.")
+                raise WorkflowError("The positive prompt needs editable text or a PrimitiveString/PrimitiveStringMultiline node; custom text-processing paths are unsupported.")
         latents = [node for node in self.graph.values() if node["class_type"] in LATENT_NODES]
         if len(latents) != 1 or not {"width", "height"}.issubset(latents[0]["inputs"]):
-            raise WorkflowError("Cannot identify one image-size input. Use one EmptyLatentImage, EmptySD3LatentImage, or EmptyFlux2LatentImage node.")
+            raise WorkflowError("Cannot identify one image-size input. Expected one EmptyLatentImage, EmptySD3LatentImage, or EmptyFlux2LatentImage node with width and height inputs.")
         if self.model_name() is None:
-            raise WorkflowError("Cannot identify the image model. Use a model loader with an unet_name or ckpt_name input.")
+            raise WorkflowError("Cannot identify the image model. Expected a connected UNETLoader (unet_name), CheckpointLoaderSimple (ckpt_name), or equivalent model loader.")
         # Override only this encoder's text fields, preserving negative text even
         # when its encoder shares the original upstream string source.
         encoder["inputs"].update({name: prompt for name in text_fields})

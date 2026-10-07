@@ -240,6 +240,24 @@ class WorkflowChecks(unittest.TestCase):
         with self.assertRaisesRegex(WorkflowError, "custom text-processing"):
             ComfyWorkflow(graph).prepare("new", 1024, 1024)
 
+    def test_incomplete_api_export_identifies_missing_node_type(self):
+        for missing in (None, "", " "):
+            graph = self.graph()
+            graph["size"] = {"inputs": {"width": 1024}}
+            if missing is not None:
+                graph["size"]["class_type"] = missing
+            graph["232"]["inputs"]["width"] = ["size", 0]
+            with self.assertRaisesRegex(WorkflowError, "node 'size' is missing class_type"):
+                ComfyWorkflow(graph)
+
+    def test_reference_image_path_explains_text_to_image_limitation(self):
+        graph = self.graph()
+        graph["reference"] = {"class_type": "ReferenceLatent", "inputs": {
+            "conditioning": ["6", 0], "latent": ["232", 0]}}
+        graph["265"]["inputs"]["positive"] = ["reference", 0]
+        with self.assertRaisesRegex(WorkflowError, "Reference-image conditioning.*text-to-image"):
+            ComfyWorkflow(graph).prepare("new", 1024, 1024)
+
     def test_invalid_api_graphs_broken_links_and_cycles_are_rejected(self):
         for graph in ({}, [], {"nodes": []}, {"node": {"class_type": "SaveImage", "inputs": {}}}):
             with self.subTest(graph=graph), self.assertRaises(WorkflowError):
