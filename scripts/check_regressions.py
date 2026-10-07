@@ -8,6 +8,7 @@ No .env, Discord login, real model requests, or external socket connections.
 import asyncio
 import contextlib
 import importlib.util
+import json
 import logging
 import os
 from pathlib import Path
@@ -28,6 +29,16 @@ sys.path.insert(0, str(ROOT))
 SOCKET_CONNECT = socket.socket.connect
 START_CONNECTION = aiohappyeyeballs.start_connection
 
+# Minimal synthetic graph for offline tests; never read a user's local workflow.
+WORKFLOW_FIXTURE = {
+    "48": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "Synthetic prompt"}},
+    "232": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+    "316": {"class_type": "UNETLoader", "inputs": {"unet_name": "synthetic-model.safetensors"}},
+    "323": {"class_type": "VAEDecode", "inputs": {}},
+    "324": {"class_type": "ImageScaleBy", "inputs": {"image": ["323", 0], "scale_by": 0.5}},
+    "213": {"class_type": "SaveImage", "inputs": {"images": ["324", 0], "filename_prefix": "synthetic"}},
+}
+
 
 class BotChecks(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -46,6 +57,9 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         spec = importlib.util.spec_from_file_location("bot_regression_check", ROOT / "bot.py")
         self.bot = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.bot)
+        # Workflow paths are resolved beside __file__; point them at temporary data.
+        self.bot.__file__ = str(Path(self.directory.name) / "bot.py")
+        Path("workflow.json").write_text(json.dumps(WORKFLOW_FIXTURE), encoding="utf-8")
         self.client = self.bot.client
         self.client.lm_client = model
         self.client.db_lock = asyncio.Lock()

@@ -294,7 +294,7 @@ class ImageGeneration:
     def model_name():
         """Read the configured diffusion model without contacting ComfyUI."""
         try:
-            workflow = json.loads(Path(__file__).with_name("krea2.json").read_text(encoding="utf-8"))
+            workflow = json.loads(Path(__file__).with_name("workflow.json").read_text(encoding="utf-8"))
             loader = workflow["316"]
             name = loader["inputs"]["unet_name"]
             if loader["class_type"] == "UNETLoader" and isinstance(name, str) and name.strip():
@@ -309,7 +309,7 @@ class ImageGeneration:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 4000:
             raise ImageGenerationError("Enter an image prompt between 1 and 4000 characters.")
         try:
-            workflow = json.loads(Path(__file__).with_name("krea2.json").read_text(encoding="utf-8"))
+            workflow = json.loads(Path(__file__).with_name("workflow.json").read_text(encoding="utf-8"))
             required = {"48": "PrimitiveStringMultiline", "232": "EmptyLatentImage",
                         "213": "SaveImage"}
             if any(workflow[key]["class_type"] != kind for key, kind in required.items()):
@@ -318,7 +318,7 @@ class ImageGeneration:
             workflow["232"]["inputs"].update(width=width, height=height, batch_size=1)
             return workflow
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise ImageGenerationError("The bot's krea2.json workflow is missing or incompatible.") from exc
+            raise ImageGenerationError("The bot's workflow.json workflow is missing or incompatible.") from exc
 
     async def cancel_job(self):
         """The jobs API atomically cancels our ID, including the queued/running race."""
@@ -403,6 +403,7 @@ class ImageGeneration:
                     await self.require_comfy_idle()
                 await self.switch("comfyui")
                 await self.require_comfy_idle()
+                logging.info("Imagegen started | Size: %sx%s", width, height)
                 started = time.monotonic()
                 result = await self.execute(workflow)
                 duration = time.monotonic() - started
@@ -995,6 +996,12 @@ async def cmd_status(interaction: discord.Interaction):
     )
     await send_chunked_message(interaction, status, is_interaction_followup=True)
 
+def log_imagegen(interaction, event, *, level=logging.INFO):
+    """Record image activity without prompts, credentials, or raw backend errors."""
+    scope = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
+    logging.log(level, "Imagegen %s | User: %s | Conversation: %s", event, interaction.user.id, scope)
+
+
 def imagegen_permission_error(interaction):
     if client.shutting_down:
         return "The bot is shutting down. Please try again after it restarts."
@@ -1025,6 +1032,7 @@ class ImageGenerationModal(discord.ui.Modal, title="Generate an image (1K–2K)"
         try:
             width, height = int(self.width.value), int(self.height.value)
         except ValueError:
+            log_imagegen(interaction, "declined: dimensions must be whole numbers")
             await interaction.response.send_message("Enter positive whole numbers for width and height. Run /imagegen to try again.", ephemeral=True)
             return
         await run_imagegen(interaction, self.prompt.value, width, height)
@@ -1047,9 +1055,11 @@ def image_prompt_chunks(prompt, limit):
 
 
 async def run_imagegen(interaction, prompt, width, height):
+    log_imagegen(interaction, "request received")
     requested = (width, height)
     error = imagegen_permission_error(interaction)
     if error:
+        log_imagegen(interaction, f"declined: {error}")
         await interaction.response.send_message(error, ephemeral=True)
         return
     try:
@@ -1057,13 +1067,16 @@ async def run_imagegen(interaction, prompt, width, height):
         # Validate the workflow before claiming a slot or posting a progress message.
         client.imagegen.workflow(prompt, width, height)
     except ImageGenerationError as exc:
+        log_imagegen(interaction, "declined: invalid dimensions, prompt or workflow")
         await interaction.response.send_message(str(exc), ephemeral=True)
         return
     user_id = interaction.user.id
     if user_id in client.image_users:
+        log_imagegen(interaction, "declined: user already has a pending request")
         await interaction.response.send_message("You already have an image request waiting or running.", ephemeral=True)
         return
     if len(client.image_users) >= IMAGEGEN_MAX_PENDING:
+        log_imagegen(interaction, "declined: image queue is full")
         await interaction.response.send_message("The image queue is full. Please try again after a request finishes.", ephemeral=True)
         return
     client.image_users.add(user_id)
@@ -1075,6 +1088,7 @@ async def run_imagegen(interaction, prompt, width, height):
     label = f"<@{user_id}> · {width} × {height}"
     try:
         with client.imagegen.reserve("comfyui"):
+            log_imagegen(interaction, f"queued | Size: {width}x{height}")
             await interaction.response.defer(ephemeral=True, thinking=True)
             # Use a normal bot message: delivery/editing keeps working beyond the
             # interaction token's 15-minute lifetime, including time spent in the queue.
@@ -1084,6 +1098,7 @@ async def run_imagegen(interaction, prompt, width, height):
                 content=f"Image size: **{width} × {height}** · {width * height / 1_000_000:.2f} MP{adjusted}. Your image will appear here.",
             )
             data, duration = await client.imagegen.generate(prompt, width, height)
+            log_imagegen(interaction, f"generated in {duration:.1f}s | Size: {width}x{height}")
             data, filename = await asyncio.to_thread(image_attachment, data, width, height, interaction.filesize_limit)
             header = f"{label} · Generated in {duration:.1f}s\n"
             continuation = f"<@{user_id}> · Prompt (continued)\n"
@@ -1094,23 +1109,26 @@ async def run_imagegen(interaction, prompt, width, height):
                 await progress.edit(content=content, attachments=[attachment], suppress=True,
                                     allowed_mentions=discord.AllowedMentions.none())
             image_delivered = True
+            log_imagegen(interaction, "delivered")
             try:
                 for chunk in chunks[1:]:
                     await interaction.channel.send(continuation + chunk, suppress_embeds=True,
                                                    allowed_mentions=discord.AllowedMentions.none())
             except (Exception, asyncio.CancelledError) as exc:
+                log_imagegen(interaction, f"prompt continuation failed: {type(exc).__name__}", level=logging.WARNING)
                 with contextlib.suppress(Exception):
                     await progress.edit(content=content + warning, suppress=True,
                                         allowed_mentions=discord.AllowedMentions.none())
                 if isinstance(exc, asyncio.CancelledError):
                     raise
     except asyncio.CancelledError:
+        log_imagegen(interaction, "cancelled after image delivery" if image_delivered else "cancelled")
         if progress is not None and not image_delivered:
             with contextlib.suppress(discord.HTTPException):
                 await progress.edit(content=f"{label} — image generation stopped because the bot is shutting down.")
         raise
     except Exception as exc:
-        logging.warning("Image generation failed: %s", type(exc).__name__)
+        log_imagegen(interaction, f"failed: {type(exc).__name__}", level=logging.WARNING)
         if isinstance(exc, ImageGenerationError):
             detail = str(exc)
         elif isinstance(exc, TimeoutError):
@@ -1133,9 +1151,11 @@ async def run_imagegen(interaction, prompt, width, height):
 async def cmd_imagegen(interaction: discord.Interaction):
     error = imagegen_permission_error(interaction)
     if error:
+        log_imagegen(interaction, f"declined: {error}")
         await interaction.response.send_message(error, ephemeral=True)
         return
     await interaction.response.send_modal(ImageGenerationModal())
+    log_imagegen(interaction, "form opened")
 
 
 @tree.command(name="role", description="View or change the AI's personality for this channel or DM.")

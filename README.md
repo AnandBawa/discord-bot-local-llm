@@ -1,208 +1,95 @@
 # Discord AI Bot
 
-A Discord bot for chat and ComfyUI image generation in server channels, threads, and private DMs. Each channel, thread, and user DM has its own conversation history and persona, saved across restarts in SQLite. Chat uses the configured local OpenAI-compatible endpoint, with web search, text/PDF reading, and image analysis. There is no cloud model fallback.
+Chat and ComfyUI image generation in Discord channels, threads, and private DMs. Each conversation has its own persona and recent history, saved across restarts.
 
-## Key Features
+## Setup
 
-- **Saved Conversations:** SQLite keeps recent conversation text and the persona for each channel/thread and each user DM across restarts. Members in the same channel share its context; other channels, threads, and DMs stay separate. Attachment notes and assistant image descriptions persist; image bytes are sent only with the current request. No user profiles, fact extraction, semantic recall, or embedding model is used.
-- **Ordered Conversations:** Chat turns run in arrival order within each channel, thread, or DM. Different conversations can progress concurrently, sharing three chat processing slots across the whole bot.
-- **Single Chat Endpoint:** All chat requests use `LLM_BASE_URL` and `LLM_MODEL_NAME`. Failed requests report an error without switching providers. The chat SDK client uses a 2-second connection timeout, a 120-second read timeout, and no automatic SDK retries.
-- **Image Analysis:** Passes images and supported Discord stickers to a vision-capable chat model. Images use Pillow resizing; `VISION_ENABLED` controls whether visual input is sent to the model.
-- **Image Generation:** `/imagegen` collects dimensions and a prompt in one private form, then posts one image from the bundled Krea 2 ComfyUI workflow. The bot adjusts the size to the 1K–2K range described below and passes the prompt unchanged. While chat has work, image requests are declined; while images have work, chat is declined. Models unload only when switching between LM Studio and ComfyUI after the active work finishes.
-- **Autonomous Web Search:** Uses `ddgs` to find missing information, including when an uploaded document is insufficient. After at most three search rounds, the bot disables further searches and asks for a final answer using the available information, with any unverifiable details identified. If the model still produces no answer, the bot reports that it reached the search limit and could not complete an answer. Search terms and dates are preserved. Source URLs remain available to the model, but citations and source lists are requested only when the user explicitly asks for them in the current request (for example, “sources?” or “where did you get that?”). There is no automatic source footer. Ordinary website/download/code links can still be part of a requested answer.
-- **URL and Document Parsing:** Reads UTF-8 text attachments (including Discord `message.txt` uploads), extracts text from uploaded PDF files using PyMuPDF (`pymupdf`) and converts public URLs into readable Markdown using the Jina Reader API (`r.jina.ai`). URL downloads reject internal addresses, including redirect destinations. PDF parsing uses one isolated worker that starts on the first PDF; no extra configuration is needed.
-- **Logging:** Writes logs to `bot.log` and truncates long console messages. Logging limitations and retention concerns are recorded in the audit.
-- **Slash Commands:** `/help`, `/status`, `/role`, `/clear`, and `/imagegen`. Members can change their channel's shared persona; DM users control their own persona. In servers, `/clear` defaults to members with Manage Messages, subject to command settings. In a DM it clears only that user's conversation.
-- **Permission-Aware Replies:** Sends directly in DMs. In servers, uses native Discord replies when permitted and ordinary messages mentioning the requester otherwise. Reply context uses content already delivered or cached; fetching older messages requires Read Message History.
+Requires Python 3.12 and a running OpenAI-compatible chat endpoint. Image analysis needs a vision-capable model; web search needs tool calling.
 
-## Prerequisites
-
-- Python 3.12. The dependency snapshot is verified on Python 3.12 on Linux.
-- A Discord Bot Token (with the **Message Content Intent** enabled in the Discord Developer Portal). When creating the OAuth2 URL for bot invite, select **bot** and **application.commands** under **Scopes**, and **View Channels** and **Send Messages** under **Bot Permissions**. For threads/posts, also grant **Send Messages in Threads**. **Read Message History** enables native replies and fetching referenced messages; the bot falls back to ordinary messages when it is missing. Effective permissions include channel overrides. See [Discord's message permissions](https://docs.discord.com/developers/resources/message#create-message).
-- An active LLM API endpoint (defaults to a local instance running on `http://localhost:1234/v1`).
-- A chat model available in your local inference server. Enable JIT loading in LM Studio when using image generation; no text embedding model is needed.
-
-## Installation
-
-1. **Set up the project directory and virtual environment:**
+1. Create a Discord application and bot in the [Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent**. Invite it with the `bot` and `applications.commands` scopes.
+2. Grant **View Channel**, **Send Messages**, and **Send Messages in Threads** where needed. Image generation also needs **Attach Files**. **Read Message History** is optional and enables fetching referenced messages. Check channel overrides as well as server permissions.
+3. From the repository directory, create the environment and install dependencies:
 
 ```bash
 python3.12 -m venv venv_bot
-source venv_bot/bin/activate # On Windows use: venv_bot\Scripts\activate
-```
-
-2. **Install dependencies:**
-   Install the checked package versions and their resolved dependencies:
-
-```bash
-python -m pip install --upgrade pip
+source venv_bot/bin/activate
 python -m pip install -r requirements.txt
-python -m pip check
 ```
 
-`requirements.txt` retains the application versions checked on October 3, 2026. The October 4 simplification removes ChromaDB and the direct `requests` dependency, leaving eight application packages and 31 resolved pins in `constraints.txt`. Installing this smaller manifest into an existing environment does not uninstall its unused packages; they are no longer imported by the bot.
+These commands work in Linux/WSL. On Windows, activate with `venv_bot\Scripts\activate`.
 
-3. **Configure Environment Variables:**
-   Create a `.env` file in the root directory and populate it with your credentials:
+4. Create `.env` beside `bot.py`:
 
 ```env
-# Core Discord Setup
-
-DISCORD_BOT_TOKEN=your_discord_bot_token_here
-
-# Local LLM Setup
-
+DISCORD_BOT_TOKEN=your_discord_bot_token
 LLM_BASE_URL=http://localhost:1234/v1
 LLM_API_KEY=lm-studio
 LLM_MODEL_NAME=local-model
 VISION_ENABLED=True
-
-# ComfyUI Image Generation (Optional; blank disables it)
-# Use the Windows server address reachable from WSL, without /v1.
-
 COMFYUI_BASE_URL=
 IMAGEGEN_TIMEOUT=600
 ```
 
-Cloud fallback support has been removed. Old `FALLBACK_BASE_URL`, `FALLBACK_API_KEY`, and `FALLBACK_MODEL_NAME` entries are ignored and can be deleted from existing `.env` files. Restart the bot to load these changes.
-
-4. **Run the Bot:**
+Set `LLM_MODEL_NAME` to your model's identifier. Leave `COMFYUI_BASE_URL` blank for chat only. Then start the bot:
 
 ```bash
 python bot.py
 ```
 
-Startup loads `.env`, configures logging, and creates the configured chat client and storage connection. Importing `bot.py` registers the bot's handlers without reading `.env`, creating a log/database, constructing model clients, or connecting to Discord. Tests can supply configuration, model clients, and temporary storage paths directly.
+Restart after changing configuration or code. Startup syncs the slash commands.
 
-## Dependency Verification and Audit
+## Using the bot
 
-Run the isolated compatibility and regression checks:
+Mention the bot or reply to it in a server. For a private conversation, open its profile, choose **Message**, and send a normal message. Bot DM slash commands require a mutual server.
+
+| Command | Action |
+| --- | --- |
+| `/help` | Show usage instructions. |
+| `/status` | Show models, supported inputs, limits, and this conversation's history count. |
+| `/role` | View the current persona. Supply persona text to change it, or `clear` to reset it. Changes clear this conversation's history and require a public confirmation in servers. |
+| `/clear` | Clear this conversation's history, keeping its persona. Server access defaults to members with Manage Messages. |
+| `/imagegen` | Enter width, height, and prompt in one form. |
+
+Chat supports text/code, UTF-8 text files (including `message.txt`), text-based PDFs, public links, and images/supported stickers when vision is enabled. Attachments are limited to **10 MiB** each; PDFs to **15 pages**; extracted text to **40,000 characters** per document. Long text files produce a truncation notice. Source citations are requested only when you ask for them.
+
+People in one channel share its conversation; each thread and user's DM is separate. At 100 saved messages, the oldest 50 are discarded. `/clear` and persona changes remove saved context, not Discord messages. Replying to an old message can supply its text again. Original attachment contents are not retained for later turns; reattach a file when needed.
+
+## Image generation
+
+1. Start ComfyUI and confirm your complete workflow generates an image. Install all models and custom nodes it requires. The bot needs a recent ComfyUI server with client-supplied prompt IDs, the jobs cancellation API, and `PreviewAny`.
+2. Choose **File → Export (API)** in ComfyUI, then save the export as **`workflow.json` beside `bot.py`**. This is a local, ignored file and is not supplied in a clone. The [API export](https://github.com/Comfy-Org/ComfyUI/blob/master/script_examples/basic_api_example.py) contains node IDs with `class_type` and `inputs`; a normal editor export is not interchangeable.
+3. Check the node mappings below. Set `COMFYUI_BASE_URL` to the reachable server root, such as `http://localhost:8188`, without `/v1`.
+4. For model switching, keep LM Studio 0.4+ running with its native model-management API and **Just-in-Time loading** enabled. Use the native model `key` for `LLM_MODEL_NAME`. Disable idle unloading if models should stay loaded until a switch.
+5. Restart the bot, check `/status`, and use `/imagegen`. Try `1024` × `1024` with a short prompt.
+
+For ComfyUI on Windows and the bot in WSL, `localhost` must be reachable from WSL. Otherwise use the Windows host address and let ComfyUI listen on a reachable interface; see [WSL networking](https://learn.microsoft.com/en-us/windows/wsl/networking).
+
+The current adapter expects these mappings inside a complete, connected workflow:
+
+| Node ID | Class | Bot input/output |
+| --- | --- | --- |
+| `48` | `PrimitiveStringMultiline` | Writes the prompt to `inputs.value`, connected to positive text encoding. |
+| `232` | `EmptyLatentImage` | Sets `width`, `height`, and `batch_size` (1). |
+| `213` | `SaveImage` | Reads exactly one final image. |
+| `316` | `UNETLoader` | Reads `inputs.unet_name` for `/status`. |
+
+A different node layout needs adapter changes in `bot.py`; the bot does not automatically discover arbitrary prompt, size, or output nodes. Model, sampler, steps, LoRAs, and seed remain controlled by the workflow. Workflows requiring extra inputs, such as a reference image or mask, need additional bot support.
+
+The prompt is passed unchanged, up to **4,000 characters**. Dimensions are multiples of 16, with at least **1,048,576 total pixels** and at most **2048 per side**, preserving aspect ratio as closely as possible. For example, `512 × 512` becomes `1024 × 1024`, `1920 × 1080` becomes `1920 × 1088`, and `3840 × 2160` becomes `2048 × 1152`. Use a workflow/model compatible with these bounds. Its final output must match the selected dimensions; if its VAE doubles the size, keep a final 0.5 scaling node.
+
+The result includes the original prompt and image as spoilers, with dimensions and generation time visible. The bot shows a queue message while waiting. The timeout is per submitted workflow; it excludes the bot's queue wait.
+
+## Queues and local data
+
+All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted. Keep both model servers dedicated to the bot so it can coordinate GPU use.
+
+Conversations are stored in `bot_database.db`; activity is logged to `bot.log`. Credentials, workflows, images, logs, and databases are ignored by Git. Keep other personal material in `private/` or `local/`; Git cannot detect personal content inside an otherwise tracked file.
+
+## Checks
 
 ```bash
 python scripts/check_dependencies.py
-python scripts/check_regressions.py
-python scripts/check_features.py
-python scripts/check_refactor.py
-python scripts/check_imagegen.py
-python scripts/check_imagegen_ui.py
-python scripts/check_dms.py
-python scripts/check_audit_media.py
-python scripts/check_audit_state.py
+python -m unittest discover -s scripts -p 'check_*.py'
 ```
 
-The checks use synthetic messages, mocked API responses, temporary storage, and blocked external sockets (with a controlled loopback HTTP fixture for URL tests). They do not load `.env`, log in to Discord, or use real conversations or model endpoints.
-
-Coverage includes the five-command schema, SDK timeouts/tool calls, persisted history and personas across restart, legacy storage left unused, per-conversation history pruning and clearing, transaction rollback/cancellation, stale-turn invalidation, permission-aware delivery, search sources, media/PDF/text-file processing, and single-endpoint failure handling. Image checks cover the form, size bounds, unchanged prompts, channel/thread permissions, DM delivery, shared DM/server queue limits, attachment delivery, model handoffs, busy refusals, cancellation, and model aliases. DM checks also cover cross-channel and per-user isolation, saved personas/history, scoped commands, media, and mixed DM/server requests. They do not establish real GPU release, live permissions, or model quality.
-
-The [October 5 application audit](docs/AUDIT-2026-10-05.md) records ten findings at baseline `6f08bab`. Nine are now fixed, with 142 passing tests covering the original suite, the new failure cases, and subsequent persona/search-limit regressions. Context-overflow handling remains deferred at the owner's request; history is still limited by message count. The [dependency scan](docs/dependency-audit-2026-10-05.json) found no known advisory matches for the unchanged 31 pinned versions; the running environment and external model services were not inventoried.
-
-## Conversation Storage and Updating
-
-The bot stores recent messages and personas in `bot_database.db`. A message can still refer to something a member said in the saved conversation; the bot no longer extracts separate facts about that member. On reaching 100 saved user/assistant messages in a channel, thread, or DM, it deletes the oldest 50 there. `/clear` deletes only the current conversation; changing `/role` does the same while saving its new persona. Deleted context is not archived or summarized.
-
-The October 5 scope change starts each server channel/thread with a fresh history and neutral persona. Earlier server-wide rows remain in SQLite but are not used or copied into channels: their source channel was never stored. New channel/thread and DM histories and personas persist across subsequent restarts. Old fact tables and `chroma_storage` are left on disk but are no longer read, written, or used for replies. This update removes the feature, not that historical data. Existing logs are also retained. Old memory-related `.env` entries are ignored and can be removed: `EMB_MODEL_NAME`, `FALLBACK_EMB_API_KEY`, `MEMORY_DISTANCE_THRESHOLD`, and `BOT_OWNER_ID`.
-
-Restart the bot to load the new code and sync all five commands for server channels and bot DMs; no re-invite is needed where slash commands already work. If an unused embedding model is still loaded in LM Studio, unload it manually once: the bot now manages only its configured chat model and refuses to unload unrelated models before image generation.
-
-The [audit and improvement plan](docs/AUDIT.md) records findings, current conversation scopes, implemented fixes, and deferred improvements.
-
-## Bot Commands
-
-Use mentions/replies in a server, ordinary messages in a DM, or native Slash Commands (`/`).
-
-### General Chat
-
-- **`@BotName [message]`**: Chat or ask questions in a server channel/thread. The bot can analyze supported attachments and public links.
-- **Reply to the Bot**: A reply whose referenced message is delivered or cached is recognised without an extra tag. Tag the bot if the reference is unavailable. Without Read Message History, it can use its saved conversation but cannot fetch missing Discord messages or their attachments.
-
-Long messages uploaded as **`message.txt`** are supported. In a server, mention the bot in the message accompanying the file, or reply to the bot; in a DM, the file alone is enough. Files ending in `.txt` or marked by Discord as `text/*` are read as UTF-8, with an optional UTF-8 BOM. No file content is executed.
-
-Each file is limited to **10 MiB**, and only its first **40,000 characters** are sent to the model. For longer text, the bot sends a direct truncation notice before asking the model, once per request even when several files are shortened. Only the first 40,000 characters per file are read, with a `[Content Truncated]` marker in the model input; the remaining text is skipped. This is roughly 10,000 tokens for English prose, with the actual count depending on the model and content. The current-turn request includes the extracted text; saved history keeps the filename note and the bot's reply, so reattach the file for later questions requiring its original contents. Empty, unreadable, or failed downloads add explanatory notes for the model while valid companion input continues. Explanations of skipped files still depend on the model; the text-file truncation notice is sent directly by the bot.
-
-Unsupported file attachments and oversized supported files are skipped, with a note passed to the chat model; remaining text and supported attachments are processed normally. The explanation to the user depends on the model, so there is no guaranteed rejection message. Unsupported animated stickers are silently skipped; a mention with only such a sticker receives the generic `/help` greeting.
-
-### Private DMs
-
-Open the bot's Discord profile and choose **Message**, then send a normal message without mentioning it. Chat attachments, links, web search, and `/imagegen` use the same features as server chat. `/help`, `/status`, `/role`, and `/clear` also work in the DM. A DM's history and persona belong to that user and do not affect any server, channel, or other user.
-
-These are direct messages with the bot, not group DMs or commands from a user-installed app in someone else's DM. The bot registers commands for Discord's [server and bot-DM contexts](https://docs.discord.com/developers/interactions/application-commands#interaction-contexts). Users need a mutual server with the bot for its global DM commands. Server channel permission overrides do not apply inside a DM; Discord's DM availability/block settings still apply. Restarting the bot syncs the updated command contexts.
-
-### Slash Commands (`/`)
-
-- **`/help`**: Display the command guide (Ephemeral - only visible to you).
-- **`/status`**: Show ping, history for this channel/DM, chat and image models, supported inputs, and key limits. The chat line shows the configured chat model; it is not a live health check. The image line reads the configured name from **#316 Load Diffusion Model** in `krea2.json`, omitting the `.safetensors` extension, or shows **Off** when image generation is disabled. If the workflow/model cannot be read, it shows **Configured (model unavailable)**. Status makes no provider requests or model loads; image analysis and web search need a compatible chat model.
-- **`/imagegen`**: Enter width, height, and a prompt of up to 4000 characters in one form, then submit. The confirmation shows the chosen size and any adjustment; a queue message in the channel is replaced with the generated image and original prompt marked as Discord spoilers, with dimensions and generation time left visible. Available in DMs when ComfyUI is configured, and in servers where the bot has the needed channel permissions; see setup below.
-- **`/role`**: View or change the persona for this channel/thread or your DM. Changing it clears only that conversation. Type `clear` to restore the neutral default. Server changes keep the normal command-linked reply showing who used `/role` and the new persona. Before saving, the bot checks that Discord actually made the reply public; a private or failed reply leaves the persona and history unchanged. Long personas continue in additional public replies, all of which must succeed. This also applies to personally installed apps. DM changes stay private, and viewing a persona changes nothing. Each thread is independent of its parent channel; personas do not carry over.
-- **`/clear`**: Delete the current channel/thread or DM conversation, retaining its persona. It clears saved context, not Discord messages.
-
-Complete bot `/role` reply wrappers are unwrapped when reading a saved persona and before saving newly submitted persona text. This prevents an old “Saved persona and history cleared!” confirmation from appearing inside the current persona. Viewing `/role` remains read-only: it does not rewrite the stored value or clear history. The enclosed persona text is preserved.
-
-The queue for each channel, thread, or DM covers context loading, generation, saving, and reply delivery. Slow requests delay later turns in the same conversation. Clear and persona changes invalidate older running/queued turns before they save their answers. Already dispatched Discord messages are not retracted. The queue is in-process; waiting chat turns are not resumed after a restart.
-
-## Image Generation Setup
-
-1. Keep your working ComfyUI installation on Windows, with the models and custom nodes used by [krea2.json](krea2.json). Use a current ComfyUI server that supports client-supplied prompt IDs, `/api/jobs/{job_id}/cancel`, and the built-in `PreviewAny` node. The bot submits the API workflow directly; you do not need to queue it manually in the ComfyUI UI. See [ComfyUI's server API](https://docs.comfy.org/development/comfyui-server/comms_routes) and [job cancellation implementation](https://github.com/Comfy-Org/ComfyUI/blob/master/server.py).
-2. Set `COMFYUI_BASE_URL` in the bot's `.env` to the Windows server's root URL, for example `http://localhost:8188` **if that is its actual port and localhost is reachable from WSL**. Mirrored WSL networking supports Windows localhost; default NAT networking normally needs the Windows host IP and ComfyUI listening on a reachable interface. Use the same host arrangement that works for LM Studio, with ComfyUI's port. See [Microsoft's WSL networking guide](https://learn.microsoft.com/en-us/windows/wsl/networking).
-3. Run LM Studio's API server as well. Image generation requires its native model-management API (LM Studio 0.4 or newer), in addition to the existing `/v1` endpoint. Enable **Just-in-Time model loading** so chat requests can reload the configured model after images. Disable **Idle TTL / automatic unloading** if you want it to stay loaded until a switch. The bot unloads its configured chat model before images and frees ComfyUI models before returning to LM Studio. See [LM Studio model unloading](https://lmstudio.ai/docs/developer/rest/unload) and [JIT loading and TTL](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict).
-4. For server use, grant the bot **Attach Files**, **View Channel**, and **Send Messages** in the destination channel, or **Send Messages in Threads** inside a thread/post. **Read Message History is not required.** Effective channel overrides apply. A server administrator must grant missing permissions; DMs need no server permission changes. Restart the bot with `python bot.py` to register `/imagegen` in servers and bot DMs.
-
-For reliable reloads across bot restarts, use the chat model's native `key` from [LM Studio's `GET /api/v1/models`](https://lmstudio.ai/docs/developer/rest/list) for `LLM_MODEL_NAME`. A custom alias that is already loaded can be resolved while the bot runs, but that mapping is not saved across restarts. Keep your desired load settings saved in LM Studio for JIT loading.
-
-Enter positive whole numbers for width and height; larger requests such as 3840 × 2160 are accepted. The bot uses the agreed **1K–2K** sizing rules: a minimum area of **1024 × 1024 = 1,048,576 pixels**, a maximum of **2048 pixels per side**, and dimensions in **multiples of 16**. Small requests scale up and large requests scale down, keeping size and aspect ratio as close as these bounds allow. The minimum is total area: a portrait or landscape image may have one side below 1024. Very wide or tall requests may need a different aspect ratio to satisfy both limits. The chosen dimensions, megapixel count, and any adjustment appear in the private confirmation after you submit the form.
-
-| Requested size | Generation size | Total pixels |
-| --- | --- | --- |
-| 512 × 512 | 1024 × 1024 | 1,048,576 |
-| 1536 × 1024 | 1536 × 1024 | 1,572,864 |
-| 1920 × 1080 | 1920 × 1088 | 2,088,960 |
-| 1920 × 1088 | 1920 × 1088 | 2,088,960 |
-| 3840 × 2160 | 2048 × 1152 | 2,359,296 |
-| 2048 × 2048 | 2048 × 2048 | 4,194,304 |
-| 4096 × 4096 | 2048 × 2048 | 4,194,304 |
-
-The former 2-megapixel cap has been removed: **2048 × 2048** is allowed and contains about **4.19 MP**. This square size appears in [Krea's official Turbo example](https://github.com/krea-ai/krea-2#usage). These are the bot's agreed sizing rules; no model or sampler settings are changed to enforce them.
-
-The bot writes the unmodified prompt to **#48 Positive** and the calculated dimensions to **#232**, then reads the image from **#213 SaveImage**. The supplied 2× VAE decode is followed by **#324 ImageScaleBy at 0.5**, returning the decoded image to the selected size; the bot leaves these nodes unchanged. The workflow's model, LoRAs, sampler, and other generation settings remain in `krea2.json`. No chat-model request is used to rewrite the prompt or calculate the size. `VISION_ENABLED` affects image analysis, not generation.
-
-For example, a 1920 × 1088 latent target is decoded to 3840 × 2176, then halved to a saved 1920 × 1088 image. The size limits apply to the selected generation/final size; the intermediate VAE image is larger. This is the intended behavior of the workflow's [Wan2.1 upscaling VAE](https://huggingface.co/spacepxl/Wan2.1-VAE-upscale2x).
-
-Chat and images share one activity rule across **all channels, threads, servers, and DMs**. Running or queued chat turns decline `/imagegen` with **“Chat is active right now. Image generation is unavailable. Please try again later.”** Running or queued images decline new chat with **“Image generation is active right now. Chat is unavailable. Please try again later.”** Declined requests are not queued or saved to chat history. Chat uses only its configured endpoint, and image generation uses ComfyUI only. Activity covers the complete accepted turn, including preparation, queue waits, model switching, and delivery. Opening an image form alone does not reserve the GPU; availability is checked again at submission. A loaded but idle model does not block the other request type.
-
-Requests for the active type continue to queue. Images run one at a time, with at most **three accepted image requests total**, including the running image, across all servers and DMs, with one per user across both. A fourth image request receives a queue-full message. The bot holds the waiting images and submits each to ComfyUI in turn. Chat retains **three chat processing slots**; additional chat requests wait, with no separate waiting-queue cap. Turns within one channel, thread, or DM run one at a time; separate conversations can use the shared processing slots concurrently. DM support adds no separate queue or processing capacity.
-
-A local chat call already in progress blocks image admission, and cancellation retains that protection until the call finishes. When no work remains, the next accepted request can switch backends; repeated image or chat requests keep using their existing models. Keep these servers dedicated to the bot while it manages the shared GPU; independent manual requests cannot participate in its lock. The bot refuses to unload unrelated LM Studio models or interrupt unrelated ComfyUI jobs.
-
-The form is private; the finished message posts the original prompt as spoiler text and the image as a spoiler attachment. Dimensions and generation time remain visible. All image uploads are marked as spoilers, including JPEG fallback, so viewers can reveal them in Discord. The bot strips workflow metadata from the uploaded image, sends PNG when it fits the interaction's attachment limit (in a server or DM), and otherwise tries JPEG without reducing the selected dimensions. ComfyUI retains its own normal saved output. Image prompts/results are not added to the bot's conversation history.
-
-Long prompts continue in additional spoilered messages to fit [Discord's 2,000-character message limit](https://docs.discord.com/developers/resources/message#create-message), without truncation. Markdown in the prompt is displayed literally so it cannot break the surrounding spoiler; prompt mentions do not ping anyone, and link previews are suppressed. If a continuation cannot be sent, the image and first prompt part remain posted, and the bot attempts to add a notice.
-
-The finished message includes the workflow duration, for example `@member · 1920 × 1088 · Generated in 83.2s`. Timing starts when the bot submits the workflow to ComfyUI and ends when it detects completion. It includes any image-model loading performed by the workflow and completion-polling overhead, but excludes the bot's queue wait, the preceding model handoff, image download/conversion, and Discord upload.
-
-`IMAGEGEN_TIMEOUT` defaults to 600 seconds per submitted workflow; waiting behind other image requests is separate. Timed-out or interrupted jobs are cancelled by their own ID. If ComfyUI cannot confirm a submission/cancellation, the bot blocks another GPU handoff rather than risking overlapping models. Check the ComfyUI queue and connectivity before retrying. Waiting image requests are not persisted across bot restarts. Leave `COMFYUI_BASE_URL` blank to disable this feature.
-
-## Advanced Configuration
-
-You can adjust constants directly in the `GLOBAL STATE & CONFIGURATION` section of `bot.py`. Key settings include:
-
-**Model & Context Limits:**
-
-- `MAX_HISTORY_LENGTH` (Default: 100) - At this many saved messages in one channel/thread or DM, its oldest half are deleted.
-- `MAX_TOOL_ITERATIONS` (Default: 3) - Maximum tool-call rounds in one turn; each round may contain multiple searches. Once exhausted, one final model request has tools disabled and asks for an answer or a clear statement of what could not be verified.
-- `LLM_TEMPERATURE` (Default: 1.0) - Controls the creativity and randomness of standard chat responses.
-- `LLM_MAX_TOKENS` (Default: 4096) - Maximum token length for standard chat responses.
-
-**Hardware & Parsing Limits:**
-
-- `MAX_FILE_SIZE` (Default: 10 MiB) - Size limit for direct and replied-to image/PDF/text attachments and URL downloads.
-- `MAX_PDF_PAGES` (Default: 15) - Maximum pages read from a PDF.
-- `MAX_TEXT_EXTRACTION_LENGTH` (Default: 40000) - Character limit per text file or text extracted from each URL/PDF.
-- `MAX_IMAGE_DIMENSION` (Default: 1024) - Images are resized to this maximum width/height to save VRAM.
-- `IMAGE_COMPRESSION_QUALITY` (Default: 85) - Pillow JPEG compression quality.
-- `SCRAPER_TIMEOUT` (Default: 15) - Seconds to wait for web scraping or large native file downloads.
-- `WEB_SEARCH_MAX_RESULTS` (Default: 3) - Number of search result snippets pulled from DuckDuckGo.
-
-**Discord & System Limits:**
-
-- `DISCORD_CHUNK_LIMIT` (Default: 1980) - Max character limit per Discord message chunk.
-- `CHUNK_MESSAGE_DELAY` (Default: 1.5) - Seconds to wait between sending chunks to avoid rate limits.
-- `DEFAULT_PERSONA` - Fallback system prompt if no custom role is set for this channel/thread or DM.
+Checks use synthetic inputs, temporary storage, and mocked services. Technical findings and validation details are in [the audit](docs/AUDIT.md) and [application review](docs/AUDIT-2026-10-05.md).

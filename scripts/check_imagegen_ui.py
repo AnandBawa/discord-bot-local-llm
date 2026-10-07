@@ -620,7 +620,7 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                         interaction.response.send_modal.assert_not_awaited()
                     await self.bot.cmd_status.callback(interaction)
                     status = interaction.followup.send.call_args.args[0]
-                    model = json.loads((fixtures.ROOT / "krea2.json").read_text())["316"]["inputs"]["unet_name"]
+                    model = fixtures.WORKFLOW_FIXTURE["316"]["inputs"]["unet_name"]
                     self.assertIn("**Image model:** " + (f"`{model.removesuffix('.safetensors')}` (1K–2K)" if configured else "Off"), status)
             # Read the current workflow each time, and keep status available when it cannot be read.
             changed = json.dumps({"316": {"class_type": "UNETLoader", "inputs": {"unet_name": "different-model.safetensors"}}})
