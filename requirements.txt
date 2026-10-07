@@ -1,6 +1,5 @@
-# Application versions retained from the 2026-10-03 dependency snapshot.
-# User memory and embedding dependencies removed on 2026-10-04.
-# constraints.txt records their resolved dependencies for Python 3.12 on Linux.
+# Direct application dependencies for Python 3.12 on Linux.
+# constraints.txt pins their resolved dependency versions.
 -c constraints.txt
 
 aiosqlite==0.22.1

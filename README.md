@@ -1,10 +1,10 @@
-# Discord AI Bot
+# Locally Hosted Discord AI Bot
 
-Chat and ComfyUI image generation in Discord channels, threads, and private DMs. Each conversation has its own persona and recent history, saved across restarts.
+Host the bot and its AI models on your own hardware. Chat uses a locally running model server such as LM Studio, and image generation uses local ComfyUI. The bot works in Discord channels, threads, and private DMs, with a separate persona and saved conversation history for each.
 
 ## Setup
 
-Requires Python 3.12 and a running OpenAI-compatible chat endpoint. Image analysis needs a vision-capable model; web search needs tool calling.
+Requires Python 3.12 and a local model server with an OpenAI-compatible chat API. Image analysis needs a vision-capable model; web search needs tool calling. Discord and web features require an internet connection.
 
 1. Create a Discord application and bot in the [Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent**. Invite it with the `bot` and `applications.commands` scopes.
 2. Grant **View Channel**, **Send Messages**, and **Send Messages in Threads** where needed. Image generation also needs **Attach Files**. **Read Message History** is optional and enables fetching referenced messages. Check channel overrides as well as server permissions.
@@ -84,12 +84,3 @@ The result includes the original prompt and image as spoilers, with dimensions a
 All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted. Keep both model servers dedicated to the bot so it can coordinate GPU use.
 
 Conversations are stored in `bot_database.db`; activity is logged to `bot.log`. Credentials, workflows, images, logs, and databases are ignored by Git. Keep other personal material in `private/` or `local/`; Git cannot detect personal content inside an otherwise tracked file.
-
-## Checks
-
-```bash
-python scripts/check_dependencies.py
-python -m unittest discover -s scripts -p 'check_*.py'
-```
-
-Checks use synthetic inputs, temporary storage, and mocked services. Technical findings and validation details are in [the audit](docs/AUDIT.md) and [application review](docs/AUDIT-2026-10-05.md).

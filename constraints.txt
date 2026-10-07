@@ -1,6 +1,4 @@
-# Resolved application dependencies for CPython 3.12 on Linux.
-# Versions from the clean pip resolution on 2026-10-03; pruned on 2026-10-04
-# using installed metadata after removal of user memory and embeddings.
+# Pinned direct and transitive dependencies for CPython 3.12 on Linux.
 # Install through requirements.txt; constraints do not install packages by themselves.
 
 aiohappyeyeballs==2.7.1
