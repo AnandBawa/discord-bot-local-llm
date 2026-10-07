@@ -229,6 +229,8 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(modal.to_dict()["components"]), 3)
         self.assertEqual(modal.prompt.style, discord.TextStyle.paragraph)
         self.assertEqual((modal.prompt.min_length, modal.prompt.max_length), (1, 4000))
+        for field in (modal.width, modal.height, modal.prompt):
+            self.assertTrue(field.required)
         self.backend.generate.assert_not_awaited()
         opening.channel.send.assert_not_awaited()
         self.assert_slots_free()
@@ -270,7 +272,8 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                                     ((1920, 1088), (1920, 1088)), ((4096, 4096), (2048, 2048))):
             with self.subTest(requested=requested):
                 self.assertEqual(self.bot.image_resolution(*requested), expected)
-        for invalid in ("", "wide", "64.5", "1e3", "0", "-1", "-64"):
+        for invalid in ("", " ", "wide", "64.5", "1e3", "0", "-1", "-64", "+1024",
+                        "1_024", "1,024", "1024px", "1024 x 1024", "１０２４", "١٠٢٤", "123456789"):
             for field in ("width", "height"):
                 with self.subTest(field=field, value=invalid):
                     interaction = self.interaction()
@@ -281,8 +284,29 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(response.kwargs["ephemeral"])
                     self.assertIn("positive whole numbers", response.args[0])
                     self.assertNotIn("view", response.kwargs)
+                    interaction.response.defer.assert_not_awaited()
+                    interaction.channel.send.assert_not_awaited()
         self.backend.generate.assert_not_awaited()
         self.assert_slots_free()
+
+    async def test_form_accepts_plain_digits_with_surrounding_spaces(self):
+        interaction = self.interaction()
+        modal = self.fill(self.bot.ImageGenerationModal(), width=" 1024 ", height="001024", prompt="A tree")
+        await modal.on_submit(interaction)
+        self.backend.generate.assert_awaited_once_with("A tree", 1024, 1024)
+        self.assertEqual(len(interaction.uploads), 1)
+        self.assert_slots_free()
+
+    async def test_unexpected_image_error_mentions_only_enabled_servers(self):
+        self.backend.generate.side_effect = OSError("Synthetic connection failure")
+        for chat_enabled in (False, True):
+            self.client.config.base_url = "https://chat.invalid/v1" if chat_enabled else ""
+            interaction = self.interaction()
+            await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
+            response = interaction.progress.edit.call_args.kwargs["content"]
+            self.assertIn("ComfyUI", response)
+            self.assertEqual("LM Studio" in response, chat_enabled)
+            self.assert_slots_free()
 
     async def test_resolution_pixel_limits_idempotence_and_common_aspect_ratios(self):
         rng = random.Random(17)
@@ -623,7 +647,9 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
                     model = fixtures.WORKFLOW_FIXTURE["316"]["inputs"]["unet_name"]
                     self.assertIn("**Image model:** " + (f"`{model.removesuffix('.safetensors')}` (1K–2K)" if configured else "Off"), status)
             # Read the current workflow each time, and keep status available when it cannot be read.
-            changed = json.dumps({"316": {"class_type": "UNETLoader", "inputs": {"unet_name": "different-model.safetensors"}}})
+            changed = json.loads(json.dumps(fixtures.WORKFLOW_FIXTURE))
+            changed["316"]["inputs"]["unet_name"] = "different-model.safetensors"
+            changed = json.dumps(changed)
             cases = ((changed, "`different-model` (1K–2K)"),
                      ("{}", "Configured (model unavailable)"),
                      ("invalid JSON", "Configured (model unavailable)"),

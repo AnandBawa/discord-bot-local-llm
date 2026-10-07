@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import io
+import json
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -54,7 +56,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             job_id = body["prompt_id"]
             self.jobs[job_id] = copy.deepcopy(body["prompt"])
             self.running.append(job_id)
-            if "213" in body["prompt"]:
+            if any(node["class_type"] == "SaveImage" for node in body["prompt"].values()):
                 self.started.set()
             return {"prompt_id": job_id}
         if path.startswith("/history/"):
@@ -62,24 +64,27 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             workflow = self.jobs.get(job_id)
             if workflow is None:
                 return {}
-            if "213" in workflow and self.hold_image:
+            outputs = [key for key, node in workflow.items() if node["class_type"] == "SaveImage"]
+            if outputs and self.hold_image:
                 return {}
             if job_id in self.running:
                 self.running.remove(job_id)
-            if "213" not in workflow:
+            if not outputs:
                 self.barriers += 1
                 # The first completion can precede /free processing. Only the
                 # second one proves the worker has traversed that stage.
                 self.finished_free = self.barriers >= 2
                 outputs = {"2": {"text": ["barrier"]}}
             else:
-                outputs = {"213": {"images": [{"filename": job_id + ".png", "subfolder": "krea", "type": "output"}]},
+                outputs = {outputs[0]: {"images": [{"filename": job_id + ".png", "subfolder": "discord", "type": "output"}]},
                            "999": {"images": [{"filename": "wrong.png", "subfolder": "", "type": "output"}]}}
             return {job_id: {"status": {"completed": True, "status_str": "success"}, "outputs": outputs}}
         if path == "/view":
             job_id = params["filename"].removesuffix(".png")
             workflow = self.jobs[job_id]
-            width, height = (workflow["232"]["inputs"][name] for name in ("width", "height"))
+            latent = next(node for node in workflow.values() if node["class_type"] in
+                          {"EmptyLatentImage", "EmptySD3LatentImage", "EmptyFlux2LatentImage"})
+            width, height = (latent["inputs"][name] for name in ("width", "height"))
             output = io.BytesIO()
             with Image.new("RGB", (width, height), "blue") as image:
                 image.save(output, format="PNG")
@@ -97,7 +102,8 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
     async def test_workflow_uses_one_dynamic_resolution_and_literal_prompt(self):
         prompt = '  A sign saying "hello"\n{"48": "literal prompt text"} @everyone  '
         graph = self.service.workflow(prompt, 1080, 1920)
-        self.assertEqual(graph["48"]["inputs"]["value"], prompt)
+        self.assertEqual(graph["6"]["inputs"]["text"], prompt)
+        self.assertEqual(graph["7"], fixtures.WORKFLOW_FIXTURE["7"])
         self.assertEqual(graph["232"]["inputs"], {"width": 1088, "height": 1920, "batch_size": 1})
         self.assertEqual(graph["324"]["class_type"], "ImageScaleBy")
         self.assertEqual(graph["324"]["inputs"]["scale_by"], 0.5)
@@ -106,9 +112,9 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("height", graph["324"]["inputs"])
         self.assertEqual([nid for nid, node in graph.items() if node["class_type"] == "EmptyLatentImage"], ["232"])
         self.assertEqual(graph["213"]["inputs"]["images"], ["324", 0])
-        graph["48"]["inputs"]["value"] = "changed"
+        graph["6"]["inputs"]["text"] = "changed"
         next_graph = self.service.workflow("next", 64, 64)
-        self.assertEqual(next_graph["48"]["inputs"]["value"], "next")
+        self.assertEqual(next_graph["6"]["inputs"]["text"], "next")
         self.assertEqual(next_graph["323"], graph["323"])
         self.assertEqual(next_graph["324"], graph["324"])
 
@@ -119,11 +125,46 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             with Image.open(io.BytesIO(raw)) as picture:
                 self.assertEqual(picture.size, expected)
         submitted = [graph for graph in self.jobs.values() if "213" in graph]
-        self.assertEqual([graph["48"]["inputs"]["value"] for graph in submitted], ["first", "second\nexactly"])
+        self.assertEqual([graph["6"]["inputs"]["text"] for graph in submitted], ["first", "second\nexactly"])
         self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 1)
         self.assertFalse(any(path == "/free" for _, _, path, _ in self.calls))
         self.assertEqual(self.service.backend, "comfyui")
         self.create.assert_not_awaited()
+
+    async def test_arbitrary_node_ids_are_used_for_submission_status_and_output(self):
+        source = copy.deepcopy(fixtures.WORKFLOW_FIXTURE)
+        mapping = {key: str(index + 9000) for index, key in enumerate(source)}
+        graph = {}
+        for key, node in source.items():
+            for field, value in node["inputs"].items():
+                if isinstance(value, list) and len(value) == 2 and value[0] in mapping:
+                    node["inputs"][field] = [mapping[value[0]], value[1]]
+            graph[mapping[key]] = node
+        original = json.dumps(graph)
+        Path("workflow.json").write_text(original)
+        self.assertEqual(self.bot.ImageGeneration.model_name(), "synthetic-model")
+        raw, _ = await self.service.generate("new literal prompt", 1920, 1080)
+        submitted = next(iter(self.jobs.values()))
+        self.assertEqual(submitted[mapping["6"]]["inputs"]["text"], "new literal prompt")
+        self.assertEqual(submitted[mapping["7"]], graph[mapping["7"]])
+        self.assertTrue(submitted[mapping["213"]]["inputs"]["filename_prefix"].startswith("discord/discord_"))
+        with Image.open(io.BytesIO(raw)) as picture:
+            self.assertEqual(picture.size, (1920, 1088))
+        self.assertEqual(Path("workflow.json").read_text(), original)
+
+    async def test_incompatible_workflow_is_rejected_before_model_handoff(self):
+        for kind in ("SaveImage", "CLIPTextEncode", "EmptyLatentImage", "UNETLoader"):
+            with self.subTest(kind=kind):
+                graph = copy.deepcopy(fixtures.WORKFLOW_FIXTURE)
+                target = next(node for node in graph.values() if node["class_type"] == kind)
+                target["class_type"] = "UnsupportedNode"
+                if kind == "UNETLoader":
+                    target["inputs"].clear()
+                Path("workflow.json").write_text(json.dumps(graph))
+                with self.assertRaises(self.bot.ImageGenerationError):
+                    await self.service.generate("new", 1024, 1024)
+                self.service.request.assert_not_awaited()
+                self.assertEqual(self.service.backend, "lmstudio")
 
     async def test_generation_time_excludes_queue_handoff_and_download(self):
         clock = SimpleNamespace(now=0.0)
@@ -211,7 +252,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         finally:
             self.hold_image = False
             await asyncio.gather(*images)
-        self.assertEqual([graph["48"]["inputs"]["value"] for graph in self.jobs.values()], ["0", "1", "2"])
+        self.assertEqual([graph["6"]["inputs"]["text"] for graph in self.jobs.values()], ["0", "1", "2"])
         self.assertEqual(sum(path == "/models/unload" for _, _, path, _ in self.calls), 1)
         self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
         await self.bot.request_completion(messages=[])

@@ -217,8 +217,7 @@ bot.log
 test*
 
 # Local workflow and personal runtime files
-/krea2.json
-/workflow.json
+/*.[jJ][sS][oO][nN]
 /workflows/
 .env.*
 !.env.example

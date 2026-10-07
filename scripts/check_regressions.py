@@ -29,12 +29,18 @@ sys.path.insert(0, str(ROOT))
 SOCKET_CONNECT = socket.socket.connect
 START_CONNECTION = aiohappyeyeballs.start_connection
 
-# Minimal synthetic graph for offline tests; never read a user's local workflow.
+# Connected synthetic graph for offline tests; never read a user's local workflow.
 WORKFLOW_FIXTURE = {
     "48": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "Synthetic prompt"}},
+    "6": {"class_type": "CLIPTextEncode", "inputs": {"text": ["48", 0], "clip": ["317", 0]}},
+    "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "Synthetic negative", "clip": ["317", 0]}},
     "232": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
     "316": {"class_type": "UNETLoader", "inputs": {"unet_name": "synthetic-model.safetensors"}},
-    "323": {"class_type": "VAEDecode", "inputs": {}},
+    "317": {"class_type": "CLIPLoader", "inputs": {"clip_name": "synthetic-encoder.safetensors"}},
+    "210": {"class_type": "VAELoader", "inputs": {"vae_name": "synthetic-vae.safetensors"}},
+    "265": {"class_type": "KSampler", "inputs": {"model": ["316", 0], "positive": ["6", 0],
+            "negative": ["7", 0], "latent_image": ["232", 0], "steps": 8, "cfg": 1.0}},
+    "323": {"class_type": "VAEDecode", "inputs": {"samples": ["265", 0], "vae": ["210", 0]}},
     "324": {"class_type": "ImageScaleBy", "inputs": {"image": ["323", 0], "scale_by": 0.5}},
     "213": {"class_type": "SaveImage", "inputs": {"images": ["324", 0], "filename_prefix": "synthetic"}},
 }

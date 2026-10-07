@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import pymupdf
 from pdf_worker import extract_pdf_text
+from comfy_workflow import ComfyWorkflow, WorkflowError
 import aiohttp
 import discord
 from discord import app_commands
@@ -35,14 +36,20 @@ class Config:
     """Read configuration explicitly at startup; tests can pass an empty mapping."""
     def __init__(self, env):
         self.token = env.get("DISCORD_BOT_TOKEN", "")
-        self.base_url = env.get("LLM_BASE_URL", "http://localhost:1234/v1")
+        self.base_url = env.get("LLM_BASE_URL", "http://localhost:1234/v1").strip()
         self.api_key = env.get("LLM_API_KEY", "lm-studio")
         self.model = env.get("LLM_MODEL_NAME", "local-model")
         self.vision_enabled = env.get("VISION_ENABLED", "True").lower() in ("true", "1", "yes")
         self.comfy_url = env.get("COMFYUI_BASE_URL", "").strip().rstrip("/")
-        self.image_timeout = float(env.get("IMAGEGEN_TIMEOUT", "600"))
-        if not math.isfinite(self.image_timeout) or self.image_timeout <= 0:
-            raise ValueError("IMAGEGEN_TIMEOUT must be a positive number of seconds")
+        self.image_timeout = 600.0
+        if self.comfy_url:
+            self.image_timeout = float(env.get("IMAGEGEN_TIMEOUT", "600"))
+            if not math.isfinite(self.image_timeout) or self.image_timeout <= 0:
+                raise ValueError("IMAGEGEN_TIMEOUT must be a positive number of seconds")
+
+    @property
+    def chat_enabled(self):
+        return bool(self.base_url)
 
 
 class TerminalTruncatedFormatter(logging.Formatter):
@@ -245,7 +252,8 @@ class ImageGeneration:
         if backend == "comfyui":
             # Check the destination before unloading the working chat model.
             await self.require_comfy_idle()
-            await self.unload_lm()
+            if self.config.chat_enabled:
+                await self.unload_lm()
         else:
             if self.backend is None and not self.comfy_contacted:
                 try:
@@ -295,10 +303,7 @@ class ImageGeneration:
         """Read the configured diffusion model without contacting ComfyUI."""
         try:
             workflow = json.loads(Path(__file__).with_name("workflow.json").read_text(encoding="utf-8"))
-            loader = workflow["316"]
-            name = loader["inputs"]["unet_name"]
-            if loader["class_type"] == "UNETLoader" and isinstance(name, str) and name.strip():
-                return name.removesuffix(".safetensors")
+            return ComfyWorkflow(workflow).model_name()
         except (OSError, ValueError, KeyError, TypeError):
             pass
         return None
@@ -310,15 +315,11 @@ class ImageGeneration:
             raise ImageGenerationError("Enter an image prompt between 1 and 4000 characters.")
         try:
             workflow = json.loads(Path(__file__).with_name("workflow.json").read_text(encoding="utf-8"))
-            required = {"48": "PrimitiveStringMultiline", "232": "EmptyLatentImage",
-                        "213": "SaveImage"}
-            if any(workflow[key]["class_type"] != kind for key, kind in required.items()):
-                raise ValueError("unexpected workflow nodes")
-            workflow["48"]["inputs"]["value"] = prompt
-            workflow["232"]["inputs"].update(width=width, height=height, batch_size=1)
-            return workflow
+            return ComfyWorkflow(workflow).prepare(prompt, width, height)
+        except WorkflowError as exc:
+            raise ImageGenerationError(str(exc)) from exc
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise ImageGenerationError("The bot's workflow.json workflow is missing or incompatible.") from exc
+            raise ImageGenerationError("Could not read workflow.json. Save a ComfyUI API-format workflow beside bot.py.") from exc
 
     async def cancel_job(self):
         """The jobs API atomically cancels our ID, including the queued/running race."""
@@ -345,8 +346,9 @@ class ImageGeneration:
         job_id = str(uuid.uuid4())
         self.active_job = job_id
         self.submission_uncertain = True
-        if "213" in workflow:
-            workflow["213"]["inputs"]["filename_prefix"] = f"krea/discord_{job_id}"
+        for node in workflow.values():
+            if node.get("class_type") == "SaveImage":
+                node["inputs"]["filename_prefix"] = f"discord/discord_{job_id}"
 
         async def submit():
             try:
@@ -397,6 +399,7 @@ class ImageGeneration:
     async def generate(self, prompt, width, height):
         """Return image bytes and workflow seconds, excluding queue and image transfers."""
         workflow = self.workflow(prompt, width, height)
+        output_id = next(key for key, node in workflow.items() if node["class_type"] == "SaveImage")
         with self.reserve("comfyui"):
             async with self.entry:
                 if self.active_job is not None:
@@ -407,9 +410,9 @@ class ImageGeneration:
                 started = time.monotonic()
                 result = await self.execute(workflow)
                 duration = time.monotonic() - started
-                images = result.get("outputs", {}).get("213", {}).get("images", [])
+                images = result.get("outputs", {}).get(output_id, {}).get("images", [])
                 if len(images) != 1:
-                    raise ImageGenerationError("The workflow must produce one image at Save Image #213.")
+                    raise ImageGenerationError("The workflow must produce one image at its SaveImage output.")
                 output = images[0]
                 filename, subfolder = output.get("filename", ""), output.get("subfolder", "")
                 if (not isinstance(filename, str) or not filename.lower().endswith(".png")
@@ -471,7 +474,7 @@ class MyAIClient(discord.Client):
     async def setup_hook(self):
         self.db_lock = asyncio.Lock()
         self.llm_queue = asyncio.Semaphore(3)
-        if self.lm_client is None:
+        if self.config.chat_enabled and self.lm_client is None:
             self.lm_client = AsyncOpenAI(
                 base_url=self.config.base_url, api_key=self.config.api_key,
                 timeout=Timeout(120.0, connect=2.0), max_retries=0,
@@ -931,6 +934,8 @@ AVAILABLE_TOOLS = {"web_search": perform_web_search}
 
 async def request_completion(**kwargs):
     """Call the configured chat endpoint; callers own the LLM concurrency slot."""
+    if not client.config.chat_enabled:
+        raise RuntimeError("Chat is disabled on this bot.")
     access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
     async with access:
         model = client.imagegen.resolve_model(client.config.model) if client.imagegen else client.config.model
@@ -948,22 +953,28 @@ async def request_completion(**kwargs):
 
 @tree.command(name="help", description="Learn how to interact with the AI and view system limits.")
 async def cmd_help(interaction: discord.Interaction):
-    chat_help = ("• Send me a message here—no mention needed. Files and links work too."
-                 if interaction.guild_id is None else
-                 f"• **`@{client.user.name} [message]`** - Chat, ask questions, or analyze attached files and links.\n"
-                 "• **Reply to me** to continue; tag me if I cannot see the referenced message.")
-    help_text = f"""**How to interact with me:**
-{chat_help}
-Each channel, thread, and user DM has its own saved conversation and persona.
-
-**Slash Commands:**
-• **`/help`** - Display this guide.
-• **`/status`** - See chat and image models, supported inputs, and limits.
-• **`/imagegen`** - Enter dimensions and a prompt in one form (size adjusted to 1K–2K).
-• **`/role`** - View, change, or clear the persona here (resets this conversation).
-• **`/clear`** - Clear the saved conversation here, keeping its persona.
-"""
-    await interaction.response.send_message(help_text, ephemeral=True)
+    lines = ["**How to interact with me:**"]
+    if client.config.chat_enabled:
+        lines.append("• Send me a message here—no mention needed. Files and links work too."
+                     if interaction.guild_id is None else
+                     f"• **`@{client.user.name} [message]`** - Chat, ask questions, or analyze attached files and links.\n"
+                     "• **Reply to me** to continue; tag me if I cannot see the referenced message.")
+        lines.append("Each channel, thread, and user DM has its own saved conversation and persona.")
+    else:
+        lines.append("Chat is disabled on this bot.")
+    lines.extend([
+        "", "**Slash Commands:**",
+        "• **`/help`** - Display this guide.",
+        "• **`/status`** - See enabled features, models, and limits.",
+        "• **`/imagegen`** - Enter dimensions and a prompt in one form (size adjusted to 1K–2K)."
+        if client.config.comfy_url else "• **`/imagegen`** - Image generation is disabled on this bot.",
+    ])
+    if client.config.chat_enabled:
+        lines.extend([
+            "• **`/role`** - View, change, or clear the persona here (resets this conversation).",
+            "• **`/clear`** - Clear the saved conversation here, keeping its persona.",
+        ])
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @tree.command(name="status", description="See models, supported inputs, and limits.")
@@ -971,29 +982,34 @@ async def cmd_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     latency = client.latency
     ping = f"{round(latency * 1000)} ms" if math.isfinite(latency) else "Unavailable"
-    chat_model = client.config.model
-    async with client.db_lock:
-        cursor = await client.db_conn.execute(
-            "SELECT COUNT(*) FROM chat_history WHERE server_id = ?",
-            (conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id),),
+    status = f"**Bot status**\n• **Ping:** {ping}"
+    if client.config.chat_enabled:
+        async with client.db_lock:
+            cursor = await client.db_conn.execute(
+                "SELECT COUNT(*) FROM chat_history WHERE server_id = ?",
+                (conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id),),
+            )
+            history_length = (await cursor.fetchone())[0]
+        vision = "On" if client.config.vision_enabled else "Off"
+        status += (
+            f" | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
+            f"• **Chat model:** `{client.config.model}`\n"
+            "• **Inputs:** Text/code, text files/PDFs, public links\n"
+            f"• **Images/stickers:** {vision} | **Web search:** Available\n"
         )
-        history_length = (await cursor.fetchone())[0]
-    vision = "On" if client.config.vision_enabled else "Off"
+    else:
+        status += "\n• **Chat:** Disabled\n"
     imagegen = "Off"
     if client.config.comfy_url:
         image_model = ImageGeneration.model_name()
         imagegen = f"`{image_model}` (1K–2K)" if image_model else "Configured (model unavailable)"
-    status = (
-        "**Bot status**\n"
-        f"• **Ping:** {ping} | **History:** {history_length}/{MAX_HISTORY_LENGTH} messages\n"
-        f"• **Chat model:** `{chat_model}`\n"
-        "• **Inputs:** Text/code, text files/PDFs, public links\n"
-        f"• **Images/stickers:** {vision} | **Web search:** Available\n"
-        f"• **Image model:** {imagegen}\n"
-        f"• **Limits:** ~{MAX_FILE_SIZE / 1_000_000:.1f} MB per image/PDF/text file; "
-        f"{MAX_PDF_PAGES} PDF pages; {MAX_TEXT_EXTRACTION_LENGTH:,} characters per document\n"
-        "Image analysis and web search require a compatible chat model."
-    )
+    status += f"• **Image model:** {imagegen}\n"
+    if client.config.chat_enabled:
+        status += (
+            f"• **Limits:** ~{MAX_FILE_SIZE / 1_000_000:.1f} MB per image/PDF/text file; "
+            f"{MAX_PDF_PAGES} PDF pages; {MAX_TEXT_EXTRACTION_LENGTH:,} characters per document\n"
+            "Image analysis and web search require a compatible chat model."
+        )
     await send_chunked_message(interaction, status, is_interaction_followup=True)
 
 def log_imagegen(interaction, event, *, level=logging.INFO):
@@ -1029,12 +1045,12 @@ class ImageGenerationModal(discord.ui.Modal, title="Generate an image (1K–2K)"
         self.add_item(discord.ui.Label(text="Your prompt", component=self.prompt))
 
     async def on_submit(self, interaction):
-        try:
-            width, height = int(self.width.value), int(self.height.value)
-        except ValueError:
+        values = (self.width.value.strip(), self.height.value.strip())
+        if any(not re.fullmatch(r"[0-9]{1,8}", value) for value in values):
             log_imagegen(interaction, "declined: dimensions must be whole numbers")
             await interaction.response.send_message("Enter positive whole numbers for width and height. Run /imagegen to try again.", ephemeral=True)
             return
+        width, height = map(int, values)
         await run_imagegen(interaction, self.prompt.value, width, height)
 
 
@@ -1136,7 +1152,8 @@ async def run_imagegen(interaction, prompt, width, height):
         elif isinstance(exc, discord.HTTPException):
             detail = "I couldn't upload the image. Check send/attachment access and the attachment limit here."
         else:
-            detail = "Couldn't complete image generation. Check that ComfyUI and LM Studio's API servers are reachable."
+            servers = "ComfyUI and LM Studio" if client.config.chat_enabled else "ComfyUI"
+            detail = f"Couldn't complete image generation. Check the connection to {servers}."
         with contextlib.suppress(discord.HTTPException):
             if progress is not None:
                 await progress.edit(content=f"{label} — {detail}", allowed_mentions=discord.AllowedMentions.none())
@@ -1161,6 +1178,9 @@ async def cmd_imagegen(interaction: discord.Interaction):
 @tree.command(name="role", description="View or change the AI's personality for this channel or DM.")
 @app_commands.describe(prompt="The new persona (leave blank to view current, type 'clear' to reset)")
 async def cmd_role(interaction: discord.Interaction, prompt: str = None):
+    if not client.config.chat_enabled:
+        await interaction.response.send_message("Chat is disabled on this bot.", ephemeral=True)
+        return
     server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
     await interaction.response.defer(ephemeral=interaction.guild_id is None)
 
@@ -1242,6 +1262,9 @@ async def cmd_role(interaction: discord.Interaction, prompt: str = None):
 @tree.command(name="clear", description="Clear the saved conversation in this channel or DM.")
 @app_commands.default_permissions(manage_messages=True)
 async def cmd_clear(interaction: discord.Interaction):
+    if not client.config.chat_enabled:
+        await interaction.response.send_message("Chat is disabled on this bot.", ephemeral=True)
+        return
     server_id = conversation_key(interaction.guild_id, interaction.channel_id, interaction.user.id)
     await interaction.response.defer()
 
@@ -1561,6 +1584,13 @@ async def on_message(message):
     # Every direct message starts a turn; server chat requires a mention or reply.
     is_dm = isinstance(message.channel, discord.DMChannel)
     if message.author.bot or not (is_dm or (message.guild and (is_mention or is_reply_to_bot))):
+        return
+
+    if not client.config.chat_enabled:
+        notice = "Chat is disabled on this bot."
+        if client.config.comfy_url:
+            notice += " Use `/imagegen` to generate an image."
+        await reply_or_send(message, notice)
         return
 
     server_id = conversation_key(message.guild.id if message.guild else None, message.channel.id, message.author.id)
