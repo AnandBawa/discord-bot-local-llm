@@ -72,6 +72,10 @@ People in one channel share its conversation; each thread and user's DM is separ
 
 For ComfyUI on Windows and the bot in WSL, `localhost` must be reachable from WSL. Otherwise use the Windows host address and let ComfyUI listen on a reachable interface; see [WSL networking](https://learn.microsoft.com/en-us/windows/wsl/networking).
 
+For a minimal template, see [examples/workflow.example.json](examples/workflow.example.json). It uses built-in nodes and a standard checkpoint containing the model, CLIP, and VAE. Copy it to `workflow.json`, replace `YOUR_CHECKPOINT.safetensors` with an installed compatible checkpoint, and choose sampler settings suitable for that model. The example uses `1024 × 1024`; the bot replaces its positive prompt and dimensions for each request.
+
+GGUF workflows are supported with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) installed in ComfyUI. Export a working workflow using `UnetLoaderGGUF` or `UnetLoaderGGUFAdvanced` and its compatible text encoder/VAE nodes. The bot preserves model filenames and loader settings; `/status` hides the `.gguf` or `.safetensors` extension.
+
 Detection follows the connections leading to the saved image. **No node IDs need configuring.** The supported workflow has:
 
 - One standard `SaveImage` output producing one image.

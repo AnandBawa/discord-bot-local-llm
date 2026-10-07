@@ -132,11 +132,14 @@ class ComfyWorkflow:
                 pending.extend(sources)
                 continue
             loaders = [inputs.get(field) for field in ("unet_name", "ckpt_name")]
-            loaders = [name.strip().removesuffix(".safetensors")
-                       for name in loaders if isinstance(name, str) and name.strip()]
+            loaders = [name.strip() for name in loaders if isinstance(name, str) and name.strip()]
             if not loaders:
                 return None
-            names.extend(name for name in loaders if name not in names)
+            for name in loaders:
+                if name.lower().endswith((".safetensors", ".gguf")):
+                    name = name.rsplit(".", 1)[0]
+                if name not in names:
+                    names.append(name)
         return ", ".join(names) or None
 
     def prepare(self, prompt, width, height):
@@ -162,7 +165,7 @@ class ComfyWorkflow:
         if len(latents) != 1 or not {"width", "height"}.issubset(latents[0]["inputs"]):
             raise WorkflowError("Cannot identify one image-size input. Expected one EmptyLatentImage, EmptySD3LatentImage, or EmptyFlux2LatentImage node with width and height inputs.")
         if self.model_name() is None:
-            raise WorkflowError("Cannot identify the image model. Expected a connected UNETLoader (unet_name), CheckpointLoaderSimple (ckpt_name), or equivalent model loader.")
+            raise WorkflowError("Cannot identify the image model. Expected UNETLoader, UnetLoaderGGUF, UnetLoaderGGUFAdvanced, CheckpointLoaderSimple, or an equivalent loader with unet_name/ckpt_name connected to the sampler.")
         # Override only this encoder's text fields, preserving negative text even
         # when its encoder shares the original upstream string source.
         encoder["inputs"].update({name: prompt for name in text_fields})

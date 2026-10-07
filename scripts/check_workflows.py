@@ -104,6 +104,26 @@ class WorkflowChecks(unittest.TestCase):
         self.assertEqual(result["6"]["inputs"]["text"], "literal positive")
         self.assertEqual(workflow.model_name(), "checkpoint")
 
+    def test_gguf_loaders_preserve_filenames_and_advanced_settings(self):
+        for kind in ("UnetLoaderGGUF", "UnetLoaderGGUFAdvanced"):
+            for extension in ("gguf", "GGUF"):
+                with self.subTest(kind=kind, extension=extension):
+                    graph = self.graph()
+                    inputs = {"unet_name": f"synthetic-Q4_K_M.{extension}"}
+                    if kind == "UnetLoaderGGUFAdvanced":
+                        inputs.update(dequant_dtype="default", patch_dtype="target", patch_on_device=False)
+                    graph["316"] = {"class_type": kind, "inputs": inputs}
+                    graph["317"] = {"class_type": "DualCLIPLoaderGGUF", "inputs": {
+                        "clip_name1": "synthetic-clip.safetensors", "clip_name2": "synthetic-t5.gguf", "type": "flux"}}
+                    before = copy.deepcopy(graph)
+                    workflow = ComfyWorkflow(graph)
+                    result = workflow.prepare("new prompt", 1536, 1024)
+                    self.assertEqual(workflow.model_name(), "synthetic-Q4_K_M")
+                    self.assertEqual(result["6"]["inputs"]["text"], "new prompt")
+                    for key in ("7", "316", "317", "265", "323", "324"):
+                        self.assertEqual(result[key], before[key])
+                    self.assertEqual(graph, before)
+
     def test_flux_basic_guider_and_multi_field_encoder(self):
         graph = self.graph()
         graph["6"] = {"class_type": "CLIPTextEncodeFlux", "inputs": {

@@ -1,0 +1,66 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "YOUR_CHECKPOINT.safetensors"
+    },
+    "_meta": {"title": "Load checkpoint (model, CLIP and VAE)"}
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A peaceful mountain landscape at sunrise",
+      "clip": ["1", 1]
+    },
+    "_meta": {"title": "Positive prompt (replaced by the bot)"}
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": ["1", 1]
+    },
+    "_meta": {"title": "Negative prompt"}
+  },
+  "4": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {"title": "Image dimensions (set by the bot)"}
+  },
+  "5": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0],
+      "latent_image": ["4", 0],
+      "seed": 0,
+      "steps": 20,
+      "cfg": 7.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0
+    },
+    "_meta": {"title": "Generate latent image"}
+  },
+  "6": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["5", 0],
+      "vae": ["1", 2]
+    },
+    "_meta": {"title": "Decode image"}
+  },
+  "7": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["6", 0],
+      "filename_prefix": "discord-example"
+    },
+    "_meta": {"title": "Final image output"}
+  }
+}

@@ -152,6 +152,22 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(picture.size, (1920, 1088))
         self.assertEqual(Path("workflow.json").read_text(), original)
 
+    async def test_gguf_filename_and_loader_options_reach_comfyui_unchanged(self):
+        graph = copy.deepcopy(fixtures.WORKFLOW_FIXTURE)
+        graph["316"] = {"class_type": "UnetLoaderGGUFAdvanced", "inputs": {
+            "unet_name": "synthetic-Q4_K_M.gguf", "dequant_dtype": "default",
+            "patch_dtype": "target", "patch_on_device": False}}
+        original = json.dumps(graph)
+        Path("workflow.json").write_text(original)
+        self.assertEqual(self.bot.ImageGeneration.model_name(), "synthetic-Q4_K_M")
+        raw, _ = await self.service.generate("new literal prompt", 1024, 1024)
+        submitted = next(iter(self.jobs.values()))
+        self.assertEqual(submitted["316"], graph["316"])
+        self.assertEqual(submitted["6"]["inputs"]["text"], "new literal prompt")
+        with Image.open(io.BytesIO(raw)) as picture:
+            self.assertEqual(picture.size, (1024, 1024))
+        self.assertEqual(Path("workflow.json").read_text(), original)
+
     async def test_incompatible_workflow_is_rejected_before_model_handoff(self):
         for kind in ("SaveImage", "CLIPTextEncode", "EmptyLatentImage", "UNETLoader"):
             with self.subTest(kind=kind):
