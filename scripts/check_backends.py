@@ -1,5 +1,6 @@
 """Offline backend availability, Strata handoff, and optional authentication checks."""
 
+import asyncio
 import io
 import ssl
 from types import SimpleNamespace
@@ -42,13 +43,13 @@ class BackendChecks(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(previous=previous, error=type(error).__name__):
                     self.reset_service(previous)
                     self.service.request.side_effect = error
-                    for _ in range(2):
-                        result = await self.bot.request_completion(messages=[])
-                        self.assertIs(result, self.create.return_value)
-                    self.assertEqual(self.create.await_count, 2)
-                    self.assertEqual(self.service.request.await_count, 2)
-                    self.assertTrue(all(call.args == ("comfyui", "GET", "/queue")
-                                        for call in self.service.request.await_args_list))
+                    with patch.object(self.bot.logging, "info") as info:
+                        for _ in range(4):
+                            result = await self.bot.request_completion(messages=[])
+                            self.assertIs(result, self.create.return_value)
+                    self.assertEqual(self.create.await_count, 4)
+                    self.service.request.assert_awaited_once_with("comfyui", "GET", "/queue")
+                    info.assert_called_once_with("ComfyUI is offline; continuing with chat.")
                     self.assertEqual(self.service.backend, "lmstudio")
                     self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
@@ -69,51 +70,69 @@ class BackendChecks(unittest.IsolatedAsyncioTestCase):
                         with Image.open(io.BytesIO(data)) as image:
                             self.assertEqual(image.size, (1024, 1024))
                     probes = [call for call in self.service.request.await_args_list if call.args[0] != "comfyui"]
-                    self.assertEqual(len(probes), 2)
+                    self.assertEqual(len(probes), 1)
                     self.assertEqual(self.service.backend, "comfyui")
                     self.create.assert_not_awaited()
 
-    async def test_same_backend_rechecks_and_unloads_a_restarted_peer(self):
-        for active in ("lmstudio", "comfyui"):
-            for provider in ("lmstudio", "strata"):
-                with self.subTest(active=active, provider=provider):
-                    self.reset_service()
+    async def test_offline_chat_recovers_when_requested_then_unloads_for_images(self):
+        for provider in ("lmstudio", "strata"):
+            with self.subTest(provider=provider):
+                self.reset_service()
+                self.loaded = {"native-chat": []}
+                self.strata_loaded = False
+                offline = True
+
+                async def recovering(backend, method, path, **kwargs):
+                    if offline and backend != "comfyui":
+                        raise self.outages()[1]
+                    handler = self.strata_request if provider == "strata" else self.request
+                    return await handler(backend, method, path, **kwargs)
+
+                self.service.request.side_effect = recovering
+                await self.service.generate("While chat is offline", 1024, 1024)
+                offline = False
+                calls = len(self.service.request.await_args_list)
+                await self.service.generate("Chat server still unused", 1024, 1024)
+                self.assertTrue(all(call.args[0] == "comfyui"
+                                    for call in self.service.request.await_args_list[calls:]))
+
+                async def load_on_chat(**kwargs):
+                    self.assertTrue(self.finished_free)
                     self.loaded = {"native-chat": ["chat-alias"]}
                     self.strata_loaded = True
-                    offline = True
+                    return self.completion("Answer")
 
-                    async def recovering(backend, method, path, **kwargs):
-                        if offline and ((backend == "comfyui") == (active == "lmstudio")):
-                            raise self.outages()[1]
-                        handler = self.strata_request if provider == "strata" else self.request
-                        return await handler(backend, method, path, **kwargs)
+                self.create.side_effect = load_on_chat
+                await self.bot.request_completion(messages=[])
+                self.assertTrue(self.finished_free)
+                await self.service.generate("After using chat", 1024, 1024)
+                if provider == "strata":
+                    self.assertFalse(self.strata_loaded)
+                else:
+                    self.assertFalse(self.loaded["native-chat"])
+                releases = self.strata_releases
+                await self.service.generate("Same image backend", 1024, 1024)
+                self.assertEqual(self.strata_releases, releases)
 
-                    async def request_active():
-                        if active == "lmstudio":
-                            await self.bot.request_completion(messages=[])
-                        else:
-                            await self.service.generate("Synthetic", 1024, 1024)
+    async def test_comfy_recovery_is_checked_by_images_and_released_before_chat(self):
+        self.reset_service()
+        self.service.request.side_effect = self.outages()[1]
+        await self.bot.request_completion(messages=[])
+        self.service.request.side_effect = self.request
+        # Starting ComfyUI alone does not require another probe during chat.
+        await self.bot.request_completion(messages=[])
+        self.service.request.assert_awaited_once_with("comfyui", "GET", "/queue")
+        await self.service.generate("After ComfyUI starts", 1024, 1024)
+        self.assertEqual(self.service.backend, "comfyui")
+        self.assertFalse(self.loaded["native-chat"])
+        await self.bot.request_completion(messages=[])
+        self.assertTrue(self.finished_free)
+        self.assertEqual(self.service.backend, "lmstudio")
+        calls = self.service.request.await_count
+        await self.bot.request_completion(messages=[])
+        self.assertEqual(self.service.request.await_count, calls)
 
-                    self.service.request.side_effect = recovering
-                    await request_active()
-                    self.assertTrue(self.service.peer_offline)
-                    offline = False
-                    await request_active()
-                    self.assertFalse(self.service.peer_offline)
-                    if active == "lmstudio":
-                        self.assertTrue(self.finished_free)
-                    elif provider == "strata":
-                        self.assertFalse(self.strata_loaded)
-                    else:
-                        self.assertFalse(self.loaded["native-chat"])
-                    calls = len(self.service.request.await_args_list)
-                    releases = self.strata_releases
-                    await request_active()
-                    if active == "lmstudio":
-                        self.assertEqual(len(self.service.request.await_args_list), calls)
-                    self.assertEqual(self.strata_releases, releases)
-
-    async def test_chat_server_restart_between_images_is_checked_without_an_observed_outage(self):
+    async def test_repeated_images_do_not_probe_or_reload_the_released_chat_server(self):
         for provider in ("lmstudio", "strata"):
             with self.subTest(provider=provider):
                 self.reset_service()
@@ -121,15 +140,39 @@ class BackendChecks(unittest.IsolatedAsyncioTestCase):
                 self.strata_loaded = True
                 self.service.request.side_effect = self.strata_request if provider == "strata" else self.request
                 await self.service.generate("First image", 1024, 1024)
-                self.assertFalse(self.service.peer_offline)
-                self.loaded = {"native-chat": ["chat-alias"]}
-                self.strata_loaded = True  # Normal server startup may eagerly load.
-                await self.service.generate("After server restart", 1024, 1024)
+                self.assertEqual(self.service.backend, "comfyui")
+                calls = len(self.service.request.await_args_list)
+                await self.service.generate("Second image", 1024, 1024)
+                self.assertTrue(all(call.args[0] == "comfyui"
+                                    for call in self.service.request.await_args_list[calls:]))
                 if provider == "strata":
                     self.assertFalse(self.strata_loaded)
-                    self.assertEqual(self.strata_releases, 2)
+                    self.assertEqual(self.strata_releases, 1)
                 else:
                     self.assertFalse(self.loaded["native-chat"])
+
+    async def test_concurrent_chat_calls_share_one_offline_comfy_probe(self):
+        self.reset_service()
+        probing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def offline(backend, method, path, **kwargs):
+            probing.set()
+            await release.wait()
+            raise self.outages()[1]
+
+        self.service.request.side_effect = offline
+        calls = [asyncio.create_task(self.bot.request_completion(messages=[])) for _ in range(3)]
+        try:
+            await asyncio.wait_for(probing.wait(), 1)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*calls), 1)
+        finally:
+            release.set()
+            await asyncio.gather(*calls, return_exceptions=True)
+        self.service.request.assert_awaited_once_with("comfyui", "GET", "/queue")
+        self.assertEqual(self.create.await_count, 3)
+        self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
     async def test_offline_image_request_does_not_unload_chat_and_can_recover(self):
         for error in self.outages():

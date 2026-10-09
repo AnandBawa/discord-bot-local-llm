@@ -134,7 +134,6 @@ class ImageGeneration:
         self.chat_provider = "lmstudio"
         self.session = None
         self.backend = None
-        self.peer_offline = False
         self.unload_pending = set()
         self.entry = asyncio.Lock()
         self.work = {"lmstudio": 0, "comfyui": 0}
@@ -258,7 +257,7 @@ class ImageGeneration:
             if not self.can_skip_offline("chat", exc):
                 raise
             logging.info("Chat server is offline; continuing with image generation.")
-            return False
+            return
         provider = "Strata" if self.chat_provider == "strata" else "LM Studio"
         if other:
             raise ImageGenerationError(f"Another {provider} model is loaded. Unload it before generating images.")
@@ -283,7 +282,6 @@ class ImageGeneration:
                 if owned:
                     await asyncio.sleep(IMAGEGEN_POLL_INTERVAL)
         self.unload_pending.discard("chat")
-        return True
 
     async def unload_comfy(self):
         await self.require_comfy_idle()
@@ -303,31 +301,25 @@ class ImageGeneration:
         self.unload_pending.discard("comfyui")
 
     async def switch(self, backend):
-        # Chat servers may eagerly reload after a restart, even between two
-        # image requests. Check them before every image; already-unloaded models
-        # stay unloaded. ComfyUI itself starts without loading an image model.
-        if backend == "lmstudio" and self.backend == backend and not self.peer_offline:
+        # Retain the active mode, including when its unused peer is offline.
+        # Probe and release the other model only when changing modes.
+        if self.backend == backend:
             return
-        peer_offline = False
         if backend == "comfyui":
             # Check the destination before unloading the working chat model.
             await self.require_comfy_idle()
             if self.config.chat_enabled:
-                peer_offline = not await self.unload_chat()
+                await self.unload_chat()
         else:
             try:
                 await self.queue()
             except CONNECTION_UNAVAILABLE as exc:
                 if not self.can_skip_offline("comfyui", exc):
                     raise
-                peer_offline = True
                 logging.info("ComfyUI is offline; continuing with chat.")
             else:
                 await self.unload_comfy()
         self.backend = backend
-        # A restarted server can load its model immediately. Keep checking an
-        # offline peer until it responds and we have released its model.
-        self.peer_offline = peer_offline
 
     def busy_message(self, backend):
         other = "comfyui" if backend == "lmstudio" else "lmstudio"
