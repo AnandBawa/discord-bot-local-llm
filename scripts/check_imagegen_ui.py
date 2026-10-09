@@ -305,8 +305,15 @@ class ImagegenUIChecks(unittest.IsolatedAsyncioTestCase):
             await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
             response = interaction.progress.edit.call_args.kwargs["content"]
             self.assertIn("ComfyUI", response)
-            self.assertEqual("LM Studio" in response, chat_enabled)
+            self.assertEqual("chat server" in response, chat_enabled)
             self.assert_slots_free()
+
+    async def test_offline_image_server_gives_an_image_availability_message(self):
+        self.backend.generate.side_effect = self.bot.aiohttp.ConnectionTimeoutError("Offline")
+        interaction = self.interaction()
+        await self.bot.run_imagegen(interaction, "A tree", 1024, 1024)
+        self.assertIn("Image generation is unavailable", interaction.progress.edit.call_args.kwargs["content"])
+        self.assert_slots_free()
 
     async def test_resolution_pixel_limits_idempotence_and_common_aspect_ratios(self):
         rng = random.Random(17)

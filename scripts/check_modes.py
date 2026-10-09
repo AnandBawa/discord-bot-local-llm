@@ -261,7 +261,7 @@ class ImageOnlyChecks(unittest.IsolatedAsyncioTestCase):
             return await self.request(backend, method, path, **kwargs)
 
         self.service.request.side_effect = image_only_request
-        self.service.unload_lm = AsyncMock(side_effect=AssertionError("Image-only mode must not unload LM Studio"))
+        self.service.unload_chat = AsyncMock(side_effect=AssertionError("Image-only mode must not unload chat"))
 
     async def test_repeated_images_succeed_without_a_chat_client_or_lm_studio(self):
         for prompt in ("First image", "Second image"):
@@ -273,7 +273,7 @@ class ImageOnlyChecks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.loaded, {"unrelated-model": ["leave-running"]})
         self.assertTrue(self.calls)
         self.assertTrue(all(backend == "comfyui" for backend, _, _, _ in self.calls))
-        self.service.unload_lm.assert_not_awaited()
+        self.service.unload_chat.assert_not_awaited()
         self.create.assert_not_awaited()
 
     async def test_image_only_still_respects_existing_comfyui_jobs(self):
@@ -282,7 +282,7 @@ class ImageOnlyChecks(unittest.IsolatedAsyncioTestCase):
             await self.service.generate("Wait for the existing job", 1024, 1024)
         self.assertEqual(self.jobs, {})
         self.assertFalse(any(path == "/prompt" for _, _, path, _ in self.calls))
-        self.service.unload_lm.assert_not_awaited()
+        self.service.unload_chat.assert_not_awaited()
         self.create.assert_not_awaited()
 
 

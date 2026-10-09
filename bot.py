@@ -25,7 +25,7 @@ from discord import app_commands
 import aiosqlite
 from PIL import Image, ImageFile
 from ddgs import DDGS
-from openai import AsyncOpenAI, Timeout
+from openai import APIConnectionError, AsyncOpenAI, Timeout, omit
 from dotenv import load_dotenv
 
 # ==========================================
@@ -36,7 +36,7 @@ class Config:
     def __init__(self, env):
         self.token = env.get("DISCORD_BOT_TOKEN", "")
         self.base_url = env.get("LLM_BASE_URL", "http://localhost:1234/v1").strip()
-        self.api_key = env.get("LLM_API_KEY", "lm-studio")
+        self.api_key = env.get("LLM_API_KEY", "").strip()
         self.model = env.get("LLM_MODEL_NAME", "local-model")
         self.vision_enabled = env.get("VISION_ENABLED", "True").lower() in ("true", "1", "yes")
         self.comfy_url = env.get("COMFYUI_BASE_URL", "").strip().rstrip("/")
@@ -86,6 +86,7 @@ IMAGEGEN_MAX_PENDING = 3
 IMAGEGEN_POLL_INTERVAL = 1.0
 IMAGEGEN_SWITCH_TIMEOUT = 60.0
 IMAGEGEN_DOWNLOAD_LIMIT = 32 * 1024 * 1024
+CONNECTION_UNAVAILABLE = (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError)
 
 
 def image_resolution(width, height):
@@ -129,10 +130,12 @@ class ImageGeneration:
     def __init__(self, config):
         self.config = config
         self.comfy_url = config.comfy_url.rstrip("/")
-        self.lm_url = config.base_url.rstrip("/").removesuffix("/v1") + "/api/v1"
+        self.chat_url = config.base_url.rstrip("/").removesuffix("/v1")
+        self.chat_provider = "lmstudio"
         self.session = None
         self.backend = None
-        self.comfy_contacted = False
+        self.peer_offline = False
+        self.unload_pending = set()
         self.entry = asyncio.Lock()
         self.work = {"lmstudio": 0, "comfyui": 0}
         self.active_job = None
@@ -151,8 +154,10 @@ class ImageGeneration:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=30, connect=3),
             )
-        base = self.comfy_url if backend == "comfyui" else self.lm_url
-        headers = {"Authorization": f"Bearer {self.config.api_key}"} if backend == "lmstudio" else {}
+        base = {"comfyui": self.comfy_url, "lmstudio": self.chat_url + "/api/v1",
+                "strata": self.chat_url}[backend]
+        headers = ({"Authorization": f"Bearer {self.config.api_key}"}
+                   if backend != "comfyui" and self.config.api_key else {})
         async with self.session.request(method, base + path, json=body, params=params,
                                         headers=headers, allow_redirects=False) as response:
             if not 200 <= response.status < 300:
@@ -176,7 +181,6 @@ class ImageGeneration:
 
     async def queue(self):
         data = await self.request("comfyui", "GET", "/queue")
-        self.comfy_contacted = True
         if not isinstance(data, dict) or any(not isinstance(data.get(key), list)
                                              for key in ("queue_running", "queue_pending")):
             raise ImageGenerationError("ComfyUI returned an invalid queue response.")
@@ -216,22 +220,74 @@ class ImageGeneration:
                 target.append(instance_id)
         return owned, other
 
-    async def unload_lm(self):
-        owned, other = await self.loaded_lm_models()
+    async def loaded_chat_models(self):
+        if self.chat_provider == "lmstudio":
+            try:
+                return await self.loaded_lm_models()
+            except ImageGenerationError as exc:
+                if exc.status != 404:
+                    raise
+        # Strata's chat API is OpenAI-compatible; its model control API is not
+        # LM Studio's. Identify it before sending any model-unloading command.
+        try:
+            data = await self.request("strata", "GET", "/health")
+        except ImageGenerationError as exc:
+            if exc.status in (404, 405):
+                raise ImageGenerationError("Automatic model switching requires LM Studio 0.4+ or Strata.") from exc
+            raise
+        if (not isinstance(data, dict) or data.get("service") != "strata"
+                or type(data.get("loaded")) is not bool
+                or not isinstance(data.get("model"), str) or not data["model"]):
+            raise ImageGenerationError("Automatic model switching requires LM Studio 0.4+ or Strata.")
+        self.chat_provider = "strata"
+        if data["model"] != self.config.model:
+            return [], [data["model"]]
+        return ([data["model"]] if data["loaded"] else []), []
+
+    def can_skip_offline(self, backend, error):
+        # A failed connection to the unused service is allowed. Do not confuse
+        # TLS errors or an interrupted unload/unconfirmed job with a stopped server.
+        return (not isinstance(error, aiohttp.ClientSSLError)
+                and backend not in self.unload_pending
+                and self.active_job is None and not self.submission_uncertain)
+
+    async def unload_chat(self):
+        try:
+            owned, other = await self.loaded_chat_models()
+        except CONNECTION_UNAVAILABLE as exc:
+            if not self.can_skip_offline("chat", exc):
+                raise
+            logging.info("Chat server is offline; continuing with image generation.")
+            return False
+        provider = "Strata" if self.chat_provider == "strata" else "LM Studio"
         if other:
-            raise ImageGenerationError("Another LM Studio model is loaded. Unload it before generating images.")
-        for instance_id in owned:
-            await self.request("lmstudio", "POST", "/models/unload", body={"instance_id": instance_id})
+            raise ImageGenerationError(f"Another {provider} model is loaded. Unload it before generating images.")
+        if self.chat_provider == "strata":
+            self.unload_pending.add("chat")
+            # loaded=false also occurs while Strata is loading. /unload's busy
+            # check must succeed even then, before trusting the health state.
+            result = await self.request("strata", "POST", "/unload", body={})
+            if not isinstance(result, dict) or result.get("status") not in ("unloaded", "not loaded"):
+                raise ImageGenerationError("Strata did not confirm the model unload. Check its server before retrying.")
+            owned = [self.config.model]  # Always confirm state after the acknowledgement.
+        else:
+            if owned:
+                self.unload_pending.add("chat")
+            for instance_id in owned:
+                await self.request("lmstudio", "POST", "/models/unload", body={"instance_id": instance_id})
         async with asyncio.timeout(IMAGEGEN_SWITCH_TIMEOUT):
             while owned:
-                owned, other = await self.loaded_lm_models()
+                owned, other = await self.loaded_chat_models()
                 if other:
-                    raise ImageGenerationError("Another LM Studio model was loaded while switching to images.")
+                    raise ImageGenerationError(f"Another {provider} model was loaded while switching to images.")
                 if owned:
                     await asyncio.sleep(IMAGEGEN_POLL_INTERVAL)
+        self.unload_pending.discard("chat")
+        return True
 
     async def unload_comfy(self):
         await self.require_comfy_idle()
+        self.unload_pending.add("comfyui")
         await self.request("comfyui", "POST", "/free", body={"unload_models": True, "free_memory": True})
         # /free only queues flags. The worker publishes job history before it
         # processes those flags. Two sequential CPU-only completions establish
@@ -244,28 +300,34 @@ class ImageGeneration:
                     "2": {"class_type": "PreviewAny", "inputs": {"source": ["1", 0]}},
                 })
         await self.require_comfy_idle()
+        self.unload_pending.discard("comfyui")
 
     async def switch(self, backend):
-        if self.backend == backend:
+        # Chat servers may eagerly reload after a restart, even between two
+        # image requests. Check them before every image; already-unloaded models
+        # stay unloaded. ComfyUI itself starts without loading an image model.
+        if backend == "lmstudio" and self.backend == backend and not self.peer_offline:
             return
+        peer_offline = False
         if backend == "comfyui":
             # Check the destination before unloading the working chat model.
             await self.require_comfy_idle()
             if self.config.chat_enabled:
-                await self.unload_lm()
+                peer_offline = not await self.unload_chat()
         else:
-            if self.backend is None and not self.comfy_contacted:
-                try:
-                    await self.queue()
-                except aiohttp.ClientConnectorError as exc:
-                    # Only the initial refused connection can mean ComfyUI is
-                    # stopped. Once reachable, every unload step must succeed.
-                    if not isinstance(exc.os_error, ConnectionRefusedError):
-                        raise
-                    self.backend = backend
-                    return
-            await self.unload_comfy()
+            try:
+                await self.queue()
+            except CONNECTION_UNAVAILABLE as exc:
+                if not self.can_skip_offline("comfyui", exc):
+                    raise
+                peer_offline = True
+                logging.info("ComfyUI is offline; continuing with chat.")
+            else:
+                await self.unload_comfy()
         self.backend = backend
+        # A restarted server can load its model immediately. Keep checking an
+        # offline peer until it responds and we have released its model.
+        self.peer_offline = peer_offline
 
     def busy_message(self, backend):
         other = "comfyui" if backend == "lmstudio" else "lmstudio"
@@ -482,7 +544,7 @@ class MyAIClient(discord.Client):
         self.llm_queue = asyncio.Semaphore(3)
         if self.config.chat_enabled and self.lm_client is None:
             self.lm_client = AsyncOpenAI(
-                base_url=self.config.base_url, api_key=self.config.api_key,
+                base_url=self.config.base_url, api_key=self.config.api_key or "unused",
                 timeout=Timeout(120.0, connect=2.0), max_retries=0,
             )
         if self.config.comfy_url:
@@ -977,6 +1039,8 @@ async def request_completion(**kwargs):
     access = client.imagegen.local_request() if client.imagegen else contextlib.nullcontext()
     async with access:
         model = client.imagegen.resolve_model(client.config.model) if client.imagegen else client.config.model
+        if not client.config.api_key:
+            kwargs["extra_headers"] = {**kwargs.get("extra_headers", {}), "Authorization": omit}
         call = client.lm_client.chat.completions.create(model=model, **kwargs)
         response = await finish_model_call(call) if client.imagegen else await call
     usage = getattr(response, "usage", None)
@@ -1185,12 +1249,14 @@ async def run_imagegen(interaction, prompt, width, height):
         log_imagegen(interaction, f"failed: {type(exc).__name__}", level=logging.WARNING)
         if isinstance(exc, ImageGenerationError):
             detail = str(exc)
+        elif isinstance(exc, CONNECTION_UNAVAILABLE):
+            detail = "Image generation is unavailable right now. Check the local servers before retrying."
         elif isinstance(exc, TimeoutError):
             detail = "Image generation or model switching timed out. Check the local servers before retrying."
         elif isinstance(exc, discord.HTTPException):
             detail = "I couldn't upload the image. Check send/attachment access and the attachment limit here."
         else:
-            servers = "ComfyUI and LM Studio" if client.config.chat_enabled else "ComfyUI"
+            servers = "ComfyUI and the chat server" if client.config.chat_enabled else "ComfyUI"
             detail = f"Couldn't complete image generation. Check the connection to {servers}."
         with contextlib.suppress(discord.HTTPException):
             if progress is not None:
@@ -1587,7 +1653,13 @@ async def generate_ai_response(messages_to_send, message, has_media):
                 error = str(exc).lower()
                 logging.error("Generation error: %s", exc)
                 text = "Oops! I couldn't process that. Please check my terminal for details."
-                if has_media and any(word in error for word in ("400", "vision", "image")):
+                if isinstance(exc, APIConnectionError):
+                    text = "Chat is unavailable right now. Please try again when the chat server is running."
+                elif isinstance(exc, ImageGenerationError):
+                    text = str(exc)
+                elif isinstance(exc, CONNECTION_UNAVAILABLE):
+                    text = "I couldn't confirm the image model was released. Check ComfyUI before retrying chat."
+                elif has_media and any(word in error for word in ("400", "vision", "image")):
                     text = "⚠️ **Compatibility Error:** Your local AI model does not support image analysis."
                 await send_chunked_message(message, text)
                 return None

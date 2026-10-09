@@ -329,13 +329,13 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                 await self.service.generate("after cancelled chat", 64, 64)
                 self.assertEqual(self.service.work, {"lmstudio": 0, "comfyui": 0})
 
-    async def test_startup_only_ignores_an_initial_refused_connection(self):
+    async def test_offline_probe_is_optional_but_unload_failures_are_not(self):
         connection = SimpleNamespace(host="comfy.invalid", port=8188, ssl=False)
         refused = self.bot.aiohttp.ClientConnectorError(connection, ConnectionRefusedError(111, "refused"))
         for failed_path in ("/queue", "/free", "/prompt"):
             with self.subTest(failed_path=failed_path):
                 self.service.backend = None
-                self.service.comfy_contacted = False
+                self.service.unload_pending.clear()
                 self.create.reset_mock()
                 async def disconnected(backend, method, path, **kwargs):
                     if path == failed_path:
@@ -358,7 +358,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
         for failed_path in ("/free", "/prompt"):
             with self.subTest(failed_path=failed_path):
                 self.service.backend = None
-                self.service.comfy_contacted = False
+                self.service.unload_pending.clear()
                 self.service.active_job = None
                 self.service.submission_uncertain = False
                 async def disconnected(backend, method, path, **kwargs):
@@ -368,7 +368,7 @@ class ImageGenerationChecks(unittest.IsolatedAsyncioTestCase):
                 self.service.request.side_effect = disconnected
                 with self.assertRaises(self.bot.aiohttp.ClientConnectorError):
                     await self.bot.request_completion(messages=[])
-                self.assertTrue(self.service.comfy_contacted)
+                self.assertIn("comfyui", self.service.unload_pending)
                 self.service.request.side_effect = refused
                 with self.assertRaises(self.bot.aiohttp.ClientConnectorError):
                     await self.bot.request_completion(messages=[])

@@ -1,6 +1,6 @@
 # Locally Hosted Discord AI Bot
 
-Host the bot and its AI models on your own hardware. Enable chat through a local model server such as LM Studio, image generation through ComfyUI, or both. It works in Discord channels, threads, and private DMs; chat conversations have separate personas and saved histories.
+Host the bot and its AI models on your own hardware. Enable chat through a local model server such as LM Studio or Strata, image generation through ComfyUI, or both. It works in Discord channels, threads, and private DMs; chat conversations have separate personas and saved histories.
 
 ## Setup
 
@@ -23,7 +23,7 @@ These commands work in Linux/WSL. In Windows Command Prompt, create the environm
 ```env
 DISCORD_BOT_TOKEN=your_discord_bot_token
 LLM_BASE_URL=http://localhost:1234/v1
-LLM_API_KEY=lm-studio
+LLM_API_KEY=
 LLM_MODEL_NAME=local-model
 VISION_ENABLED=True
 COMFYUI_BASE_URL=
@@ -38,7 +38,9 @@ Choose your mode in `.env`:
 | Images only | Blank | ComfyUI server URL |
 | Both | Chat server URL, including `/v1` | ComfyUI server URL |
 
-Set `LLM_MODEL_NAME` when using chat. To disable chat, explicitly set `LLM_BASE_URL=`; omitting it uses the localhost default. Chat-only needs no workflow or ComfyUI. Image-only needs no chat server. Start the bot:
+Set `LLM_MODEL_NAME` when using chat. Leave `LLM_API_KEY` blank if the server does not require authentication. For Strata, use its OpenAI base URL, for example `http://127.0.0.1:8080/v1`. To disable chat, explicitly set `LLM_BASE_URL=`; omitting it uses the localhost default. Chat-only needs no workflow or ComfyUI. Image-only needs no chat server.
+
+With both URLs configured, chat works while ComfyUI is offline, and images work while the chat server is offline. Requesting the unavailable feature gives an error; start its server and retry without restarting the bot. Failed unloads or unconfirmed image jobs still block switching until resolved. Start the bot:
 
 ```bash
 python bot.py
@@ -69,7 +71,7 @@ People in one channel share its conversation; each thread and user's DM is separ
 1. Start ComfyUI and confirm your complete workflow generates an image. Install all models and custom nodes it requires. The bot needs a recent ComfyUI server with client-supplied prompt IDs, the jobs cancellation API, and `PreviewAny`.
 2. Choose **File → Export (API)** in ComfyUI, then save the export as **`workflow.json` beside `bot.py`**. This is a local, ignored file and is not supplied in a clone. The [API export](https://github.com/Comfy-Org/ComfyUI/blob/master/script_examples/basic_api_example.py) contains node IDs with `class_type` and `inputs`; a normal editor export is not interchangeable.
 3. Set `COMFYUI_BASE_URL` to the reachable server root, such as `http://localhost:8188`, without `/v1`. The bot discovers the workflow's node IDs automatically.
-4. **When both features are enabled**, keep LM Studio 0.4+ running with its native model-management API and **Just-in-Time loading** enabled. Use the native model `key` for `LLM_MODEL_NAME`. Disable idle unloading if models should stay loaded until a switch. Skip this step for image-only use.
+4. **When both features are enabled**, automatic model switching supports **LM Studio 0.4+** with **Just-in-Time loading**, or **Strata** with its `/health` and `/unload` APIs. Set `LLM_MODEL_NAME` to LM Studio's native model `key` or Strata's configured model name. The bot detects the server and confirms its chat model is unloaded before each image. Returning to chat releases ComfyUI's models; the chat server loads its model on demand. Disable idle unloading if models should stay loaded until a switch. Skip this step for image-only use.
 5. Restart the bot, check `/status`, and use `/imagegen`. Try `1024` × `1024` with a short prompt.
 
 For ComfyUI on Windows and the bot in WSL, `localhost` must be reachable from WSL. Otherwise use the Windows host address and let ComfyUI listen on a reachable interface; see [WSL networking](https://learn.microsoft.com/en-us/windows/wsl/networking).
@@ -93,6 +95,8 @@ The result includes the original prompt and image as spoilers, with dimensions a
 
 ## Queues and local data
 
-All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Each user can have **one pending or running image request** across all servers and DMs. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted. Keep both model servers dedicated to the bot so it can coordinate GPU use.
+All servers and DMs share **three chat processing slots** and an image queue of **three total requests**, including the running image. Each user can have **one pending or running image request** across all servers and DMs. Images run one at a time; a fourth is declined. Additional chat turns wait, with each conversation processed in order. Chat activity declines new image requests, and image activity declines new chat requests. An idle model switches only when the other request type is accepted.
+
+Keep both model servers dedicated to the bot. It treats connection failures to the unused service as offline; that does not prove its GPU memory is free. Avoid independently loading models during generation, including eager startup of a chat server. Strata's [lazy loading](https://github.com/dhoard/strata/blob/main/docs/DETAILS.md#start-the-api-without-loading-the-model) (`--lazy` or `"lazy_load": true`) lets its server start without loading the model.
 
 Conversations are stored in `bot_database.db`; activity is logged to `bot.log`. Credentials, workflows, images, logs, and databases are ignored by Git. Keep other personal material in `private/` or `local/`; Git cannot detect personal content inside an otherwise tracked file.

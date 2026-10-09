@@ -67,6 +67,7 @@ class BotChecks(unittest.IsolatedAsyncioTestCase):
         self.bot.__file__ = str(Path(self.directory.name) / "bot.py")
         Path("workflow.json").write_text(json.dumps(WORKFLOW_FIXTURE), encoding="utf-8")
         self.client = self.bot.client
+        self.client.config.api_key = "synthetic-test-key"
         self.client.lm_client = model
         self.client.db_lock = asyncio.Lock()
         self.client.llm_queue = asyncio.Semaphore(3)
