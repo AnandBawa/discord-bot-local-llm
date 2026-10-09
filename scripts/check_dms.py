@@ -311,7 +311,7 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
                 entered, peers_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
                 peer_count = 0
 
-                async def generate(context, message, has_media):
+                async def generate(context, message, has_media, *, conversation=None):
                     nonlocal peer_count
                     if message is first:
                         entered.set()
@@ -359,7 +359,7 @@ class DMChecks(unittest.IsolatedAsyncioTestCase):
         peer_count = 0
         second_context = []
 
-        async def generate(context, message, has_media):
+        async def generate(context, message, has_media, *, conversation=None):
             nonlocal peer_count
             if message is first:
                 entered.set()

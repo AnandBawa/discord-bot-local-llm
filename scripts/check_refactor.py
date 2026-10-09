@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import io
 import json
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -423,25 +424,184 @@ class RefactorChecks(unittest.IsolatedAsyncioTestCase):
                     next_turn = await self.bot.build_ai_context("channel:10", "Next question")
                     self.assertNotIn("The search limit for this reply", json.dumps(next_turn))
 
-    async def test_tool_limit_does_not_execute_provider_requests_after_final_attempt(self):
+    async def test_empty_final_answer_retries_without_changing_settings_or_context(self):
+        logging.disable(logging.NOTSET)  # The shared fixture normally suppresses logs.
+        private_reasoning = "PRIVATE_REASONING_SENTINEL"
+        extra_call = {"id": "unwanted", "type": "function", "function": {
+            "name": "web_search", "arguments": '{"query":"PRIVATE_QUERY_SENTINEL"}',
+        }}
+        cases = (
+            ({"content": None, "reasoning_content": private_reasoning}, "stop", 95),
+            ({"content": " \n", "tool_calls": [extra_call]}, "tool_calls", 95),
+            ({"content": "", "reasoning": private_reasoning}, "length", 4096),
+        )
+        payload = [
+            {"type": "text", "text": "PRIVATE_REQUEST_SENTINEL: Explain this image and include sources."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+        ]
+        result = "PRIVATE_RESULT_SENTINEL: Verified detail. URL: https://example.com/source"
+        expected = "The detail is verified. Source: https://example.com/source"
+        for empty_output, finish, completion_tokens in cases:
+            with self.subTest(finish=finish):
+                seen = []
+
+                async def respond(request):
+                    self.assertEqual(str(request.url), "https://primary.invalid/v1/chat/completions")
+                    body = json.loads(request.content)
+                    seen.append(body)
+                    turn = len(seen)
+                    if turn <= 3:
+                        output = {"role": "assistant", "content": None, "tool_calls": [
+                            {"id": f"search-{turn}-{i}", "type": "function", "function": {
+                                "name": "web_search", "arguments": json.dumps({"query": f"query-{turn}-{i}"}),
+                            }} for i in range(2)
+                        ]}
+                        reason = "tool_calls"
+                    elif turn == 4:
+                        output = {"role": "assistant", **empty_output}
+                        reason = finish
+                    else:
+                        self.assertEqual(turn, 5)
+                        # Even unsolicited calls alongside a usable answer must not run.
+                        output = {"role": "assistant", "content": expected, "tool_calls": [extra_call]}
+                        reason = "tool_calls"
+                    return httpx2.Response(200, json={
+                        "id": "synthetic", "object": "chat.completion", "created": 0, "model": body["model"],
+                        "choices": [{"index": 0, "message": output, "finish_reason": reason}],
+                        "usage": {"completion_tokens": completion_tokens, "prompt_tokens": 100,
+                                  "total_tokens": completion_tokens + 100},
+                    })
+
+                async with AsyncOpenAI(
+                    api_key="synthetic", base_url="https://primary.invalid/v1", max_retries=0,
+                    http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(respond)),
+                ) as primary:
+                    self.client.lm_client = primary
+                    await self.bot.cmd_role.callback(self.interaction(), "Test persona")
+                    search = AsyncMock(return_value=result)
+                    with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search), \
+                            patch.object(self.bot, "build_user_payloads", new=AsyncMock(return_value=(payload, "Original question"))), \
+                            patch.object(self.bot, "generate_ai_response", wraps=self.bot.generate_ai_response) as generate, \
+                            patch.object(self.bot, "send_chunked_message", new_callable=AsyncMock) as send, \
+                            self.assertLogs(level="WARNING") as logs:
+                        await self.bot.on_message(self.chat())
+
+                    self.assertEqual(search.await_count, 6)
+                    self.assertEqual(len(seen), 5)
+                    final, retry = seen[-2:]
+                    self.assertEqual({k: v for k, v in final.items() if k != "messages"},
+                                     {k: v for k, v in retry.items() if k != "messages"})
+                    self.assertEqual(retry["tool_choice"], "none")
+                    self.assertNotIn("tools", retry)
+                    self.assertNotIn("reasoning_effort", retry)
+                    self.assertEqual(retry["temperature"], self.bot.LLM_TEMPERATURE)
+                    self.assertEqual(retry["max_tokens"], self.bot.LLM_MAX_TOKENS)
+                    self.assertEqual(retry["messages"][:-1], final["messages"])
+                    self.assertEqual(retry["messages"][-1]["role"], "user")
+                    self.assertIn("request for sources", retry["messages"][-1]["content"])
+                    self.assertEqual(sum(m["role"] == "system" for m in retry["messages"]), 1)
+                    self.assertIn("Test persona", retry["messages"][0]["content"])
+                    self.assertIn("SOURCE DISPLAY RULE", retry["messages"][0]["content"])
+                    self.assertEqual(retry["messages"][1]["content"], payload)
+                    results = [m for m in retry["messages"] if m["role"] == "tool"]
+                    self.assertEqual(len(results), 6)
+                    self.assertTrue(all(m["content"] == result for m in results))
+                    wire = json.dumps(retry)
+                    self.assertNotIn(private_reasoning, wire)
+                    self.assertNotIn("PRIVATE_QUERY_SENTINEL", wire)
+                    self.assertEqual(len(logs.output), 1)
+                    self.assertIn(f"finish_reason={finish}", logs.output[0])
+                    self.assertIn(f"completion_tokens={completion_tokens}", logs.output[0])
+                    for field in ("content_chars=", "reasoning_chars=", "tool_calls="):
+                        self.assertIn(field, logs.output[0])
+                    self.assertNotIn("PRIVATE_", logs.output[0])
+                    send.assert_awaited_once()
+                    self.assertEqual(send.call_args.args[1], expected)
+                    original = generate.call_args.args[0]
+                    self.assertNotIn("The search limit", json.dumps(original))
+                    self.assertNotIn("Answer my original request now", json.dumps(original))
+                    cursor = await self.client.db_conn.execute("SELECT role, content FROM chat_history ORDER BY id")
+                    self.assertEqual(await cursor.fetchall(), [("user", "Original question"), ("assistant", expected)])
+                    next_turn = await self.bot.build_ai_context("channel:10", "Follow up")
+                    self.assertNotIn("Answer my original request now", json.dumps(next_turn))
+                    self.assertNotIn("The search limit", json.dumps(next_turn))
+
+    async def test_tool_limit_does_not_execute_calls_on_final_or_retry(self):
         call = SimpleNamespace(id="search", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
         for text, calls in ((None, [call]), ("", [call]), (" \n", [call]), (None, []), ("Partial answer.", [call])):
             with self.subTest(text=text, calls=bool(calls)):
                 self.create.reset_mock()
-                self.create.side_effect = [self.answer(None, [call]) for _ in range(3)] + [self.answer(text, calls)]
+                self.create.side_effect = [self.answer(None, [call]) for _ in range(3)] + [
+                    self.answer(text, calls), self.answer(text, calls),
+                ]
                 search = AsyncMock(return_value="No results")
-                with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+                with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search), \
+                        patch.object(self.bot, "send_chunked_message", new_callable=AsyncMock) as send:
                     answer = await self.bot.generate_ai_response([], self.chat(), False)
                 if text and text.strip():
                     self.assertEqual(answer, text)
+                    self.assertEqual(self.create.await_count, 4)
+                    send.assert_not_awaited()
                 else:
-                    self.assertEqual(answer, "⚠️ *I reached the search limit and couldn't complete an answer from the available results.*")
+                    self.assertIsNone(answer)
+                    self.assertEqual(self.create.await_count, 5)
+                    send.assert_awaited_once()
+                    self.assertIn("returned no answer after searching", send.call_args.args[1])
                 self.assertEqual(search.await_count, 3)
-                self.assertEqual(self.create.await_count, 4)
                 self.assertEqual(self.create.call_args.kwargs["tool_choice"], "none")
                 self.assertNotIn("tools", self.create.call_args.kwargs)
                 self.assertEqual(self.create.call_args.kwargs["messages"][0]["role"], "system")
-                self.assertEqual(self.create.call_args.kwargs["messages"][-1]["role"], "tool")
+
+    async def test_failed_final_retry_does_not_save_a_turn_or_retry_again(self):
+        call = SimpleNamespace(id="search", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
+        for last_response in (self.answer(None, [call]), RuntimeError("local unavailable")):
+            with self.subTest(last_response=type(last_response).__name__):
+                self.create.reset_mock()
+                self.create.side_effect = [self.answer(None, [call]) for _ in range(3)] + [
+                    self.answer(None), last_response,
+                ]
+                search = AsyncMock(return_value="No results")
+                with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search), \
+                        patch.object(self.bot, "send_chunked_message", new_callable=AsyncMock) as send:
+                    await self.bot.on_message(self.chat())
+                self.assertEqual(self.create.await_count, 5)
+                self.assertEqual(search.await_count, 3)
+                send.assert_awaited_once()
+                self.assertEqual(await self.count("chat_history"), 0)
+
+    async def test_final_retry_error_is_suppressed_after_clear_or_persona_change(self):
+        call = SimpleNamespace(id="search", function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'))
+        for prompt in (None, "New persona", "clear"):
+            for fail in (False, True):
+                with self.subTest(prompt=prompt, fail=fail):
+                    requests = 0
+
+                    async def respond(**kwargs):
+                        nonlocal requests
+                        requests += 1
+                        if requests <= 3:
+                            return self.answer(None, [call])
+                        if requests == 4:
+                            return self.answer(None)
+                        self.assertEqual(requests, 5)
+                        if prompt is None:
+                            await self.bot.cmd_clear.callback(self.interaction())
+                        else:
+                            await self.bot.cmd_role.callback(self.interaction(), prompt)
+                        if fail:
+                            raise RuntimeError("local unavailable")
+                        return self.answer(None)
+
+                    self.create.side_effect = respond
+                    message = self.chat()
+                    search = AsyncMock(return_value="No results")
+                    with patch.dict(self.bot.AVAILABLE_TOOLS, web_search=search):
+                        await self.bot.on_message(message)
+                    self.assertEqual(requests, 5)
+                    self.assertEqual(search.await_count, 3)
+                    message.reply.assert_not_awaited()
+                    message.channel.send.assert_not_awaited()
+                    self.assertEqual(await self.count("chat_history"), 0)
 
 
 if __name__ == "__main__":

@@ -266,7 +266,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             cursor = await self.client.db_conn.execute("SELECT content FROM chat_history WHERE server_id = ? ORDER BY id", (server,))
             contexts.setdefault(server, []).append([row[0] for row in await cursor.fetchall()])
             return []
-        async def generate(messages, message, *args):
+        async def generate(messages, message, *args, **kwargs):
             if message is first:
                 entered.set()
                 await release.wait()
@@ -293,7 +293,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
             with self.subTest(prompt=prompt):
                 first, second = self.chat(), self.chat(author=84)
                 entered, release = asyncio.Event(), asyncio.Event()
-                async def generate(*args):
+                async def generate(*args, **kwargs):
                     entered.set()
                     await release.wait()
                     return "Old answer"
@@ -319,7 +319,7 @@ class FeatureChecks(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_turn_releases_server_for_next_request(self):
         first, second = self.chat(), self.chat(author=84)
         entered = asyncio.Event()
-        async def generate(messages, message, *args):
+        async def generate(messages, message, *args, **kwargs):
             if message is first:
                 entered.set()
                 await asyncio.Event().wait()

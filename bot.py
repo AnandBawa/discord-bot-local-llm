@@ -1594,7 +1594,21 @@ def merge_history(messages):
     return merged
 
 
-async def generate_ai_response(messages_to_send, message, has_media):
+def log_empty_final_answer(response, attempt):
+    """Record completion metadata without logging prompts, answers, or reasoning."""
+    choice = response.choices[0]
+    output = choice.message
+    reasoning = getattr(output, "reasoning_content", None) or getattr(output, "reasoning", None)
+    logging.warning(
+        "Empty final answer (%s): finish_reason=%s content_chars=%d reasoning_chars=%d "
+        "tool_calls=%d completion_tokens=%s",
+        attempt, getattr(choice, "finish_reason", None), len(output.content or ""),
+        len(reasoning) if isinstance(reasoning, str) else 0, len(output.tool_calls or []),
+        getattr(getattr(response, "usage", None), "completion_tokens", None),
+    )
+
+
+async def generate_ai_response(messages_to_send, message, has_media, *, conversation=None):
     async with safe_typing(message.channel):
         async with client.llm_queue:
             try:
@@ -1627,9 +1641,30 @@ async def generate_ai_response(messages_to_send, message, has_media):
                     response_message = response.choices[0].message
                     calls = response_message.tool_calls
                     if final_attempt:
+                        if not (response_message.content or "").strip():
+                            log_empty_final_answer(response, "initial")
+                            # Keep the completed tool exchanges, but do not carry forward
+                            # hidden reasoning or more tool calls from the empty response.
+                            response = await request_completion(
+                                messages=[*messages_to_send, {"role": "user", "content": (
+                                    "Answer my original request now using the information already available. "
+                                    "Preserve its requirements, including any request for sources or a specific format. "
+                                    "Return a written answer, not another tool call. If the information is "
+                                    "insufficient, state what could not be verified. "
+                                    "Follow the existing source-display rules."
+                                )}],
+                                temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS,
+                                tool_choice="none",
+                            )
+                            response_message = response.choices[0].message
                         if (response_message.content or "").strip():
                             return response_message.content
-                        return "⚠️ *I reached the search limit and couldn't complete an answer from the available results.*"
+                        log_empty_final_answer(response, "retry")
+                        await send_chunked_message(
+                            message, "⚠️ *The chat model returned no answer after searching, even after a retry. Please try again.*",
+                            conversation=conversation,
+                        )
+                        return None
                     if not calls:
                         break
                     msg_dump = response_message.model_dump(exclude_none=True)
@@ -1653,7 +1688,7 @@ async def generate_ai_response(messages_to_send, message, has_media):
                     text = "I couldn't confirm the image model was released. Check ComfyUI before retrying chat."
                 elif has_media and any(word in error for word in ("400", "vision", "image")):
                     text = "⚠️ **Compatibility Error:** Your local AI model does not support image analysis."
-                await send_chunked_message(message, text)
+                await send_chunked_message(message, text, conversation=conversation)
                 return None
 
 
@@ -1766,7 +1801,9 @@ async def handle_server_message(message, server_id, conversation_version):
     has_media = bool(image_attachments or valid_stickers)
 
     start_time = datetime.now()
-    final_reply = await generate_ai_response(messages_to_send, message, has_media)
+    final_reply = await generate_ai_response(
+        messages_to_send, message, has_media, conversation=(server_id, conversation_version),
+    )
 
     if final_reply:
         duration = (datetime.now() - start_time).total_seconds()
